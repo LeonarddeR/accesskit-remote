@@ -9,6 +9,7 @@
 
 pub mod mapping;
 mod mirror;
+pub mod reconcile;
 mod source;
 
 pub use source::AtspiSource;

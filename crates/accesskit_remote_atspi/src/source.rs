@@ -5,13 +5,14 @@
 
 use crate::mapping::{build_window_update, NodeIdMap};
 use crate::mirror::{self, BridgeResult};
+use crate::reconcile::{reconcile_windows, WindowKey};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
 use atspi::events::object::ChildrenChangedEvent;
 use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
 use atspi::object_ref::ObjectRefOwned;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -201,34 +202,48 @@ impl Mirror {
         let discovered = mirror::discover_windows(conn).await?;
         let mut out = Vec::new();
         let mut focus = None;
-        for mut window in discovered {
-            let id = WindowId(self.next_id);
-            self.next_id += 1;
-            window.descriptor.id = id;
-
-            let (nodes, objects_by_path) = mirror::walk_window(conn, &window.root).await?;
-            if nodes.is_empty() {
-                continue;
+        for window in discovered {
+            let active = window.active;
+            if let Some((descriptor, update)) = self.add_discovered(conn, window).await? {
+                if active {
+                    focus = Some(descriptor.id);
+                }
+                out.push((descriptor, update));
             }
-            let mut ids = NodeIdMap::new();
-            let update = build_window_update(&nodes, &mut ids);
-            let objects = index_objects(&nodes, &ids, &objects_by_path);
-
-            if window.active {
-                focus = Some(id);
-            }
-            out.push((window.descriptor, update));
-            self.windows.push(WindowState {
-                id,
-                root: window.root,
-                ids,
-                objects,
-            });
         }
         if focus.is_none() {
             focus = self.windows.first().map(|w| w.id);
         }
         Ok((out, focus))
+    }
+
+    /// Walks a freshly discovered frame, allocates its window id, records its
+    /// state, and returns the descriptor plus initial tree. Returns `Ok(None)`
+    /// — tracking nothing — when the frame walks empty, so a not-yet-ready
+    /// window is retried on the next event rather than announced broken.
+    async fn add_discovered(
+        &mut self,
+        conn: &AccessibilityConnection,
+        window: mirror::DiscoveredWindow,
+    ) -> BridgeResult<Option<(WindowDescriptor, accesskit::TreeUpdate)>> {
+        let (nodes, objects_by_path) = mirror::walk_window(conn, &window.root).await?;
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+        let id = WindowId(self.next_id);
+        self.next_id += 1;
+        let mut descriptor = window.descriptor;
+        descriptor.id = id;
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&nodes, &mut ids);
+        let objects = index_objects(&nodes, &ids, &objects_by_path);
+        self.windows.push(WindowState {
+            id,
+            root: window.root,
+            ids,
+            objects,
+        });
+        Ok(Some((descriptor, update)))
     }
 
     /// Performs an action on its target object, then re-walks that window and
@@ -246,16 +261,19 @@ impl Mirror {
         self.rewalk(conn, msg.window).await
     }
 
-    /// Reflects an AT-SPI event: re-walks the affected window(s) so app-driven
-    /// changes (and toolkit updates that lag an action's immediate re-walk)
-    /// surface. `children-changed` fires on a deep node, so its window is
-    /// matched by sender (app); window events fire on the frame, matched by
-    /// its exact path.
+    /// Reflects an AT-SPI event. A toplevel add/remove (see
+    /// [`is_window_lifecycle_event`]) triggers a full [`reconcile`](Self::reconcile).
+    /// Otherwise the event re-walks the affected window(s): a deep
+    /// `children-changed` is matched to its window by sender (app); an
+    /// activate/deactivate is matched to the frame by sender and path.
     async fn handle_atspi_event(
         &mut self,
         conn: &AccessibilityConnection,
         event: Event,
     ) -> Vec<SourceEvent> {
+        if is_window_lifecycle_event(&event) {
+            return self.reconcile(conn).await;
+        }
         let targets: Vec<WindowId> = match &event {
             Event::Object(ObjectEvents::ChildrenChanged(_)) => {
                 let sender = event.sender();
@@ -304,6 +322,66 @@ impl Mirror {
         let update = build_window_update(&nodes, &mut state.ids);
         state.objects = index_objects(&nodes, &state.ids, &objects_by_path);
         Some(SourceEvent::TreeUpdate { window, update })
+    }
+
+    /// Reconciles the tracked window set against a fresh discovery: drops and
+    /// announces vanished toplevels, walks and announces newly visible ones.
+    /// Focus is left to the client, which nulls its own reference when a
+    /// focused window is removed (node-level focus is deferred; see item #2).
+    async fn reconcile(&mut self, conn: &AccessibilityConnection) -> Vec<SourceEvent> {
+        let discovered = match mirror::discover_windows(conn).await {
+            Ok(discovered) => discovered,
+            Err(_) => return Vec::new(),
+        };
+        let tracked: Vec<WindowKey> = self.windows.iter().map(|w| window_key(&w.root)).collect();
+        let fresh: Vec<WindowKey> = discovered.iter().map(|w| window_key(&w.root)).collect();
+        let diff = reconcile_windows(&tracked, &fresh);
+
+        let mut out = Vec::new();
+        // Resolve removal ids before mutating so the indices do not shift.
+        let removed: Vec<WindowId> = diff.removed.iter().map(|&i| self.windows[i].id).collect();
+        self.windows.retain(|w| !removed.contains(&w.id));
+        out.extend(removed.into_iter().map(SourceEvent::WindowRemoved));
+
+        let added: HashSet<usize> = diff.added.into_iter().collect();
+        for (index, window) in discovered.into_iter().enumerate() {
+            if !added.contains(&index) {
+                continue;
+            }
+            if let Ok(Some((descriptor, tree))) = self.add_discovered(conn, window).await {
+                out.push(SourceEvent::WindowAdded { descriptor, tree });
+            }
+        }
+        out
+    }
+}
+
+/// The reconcile identity of a toplevel frame: its application's unique bus
+/// name plus the frame's object path.
+fn window_key(root: &ObjectRefOwned) -> WindowKey {
+    WindowKey {
+        bus_name: root.name().map(|name| name.as_str().to_owned()).unwrap_or_default(),
+        path: root.path_as_str().to_owned(),
+    }
+}
+
+/// The AT-SPI root object path. Each application exposes its root accessible
+/// here and the desktop registry exposes the application list here, so a
+/// `children-changed` at this path is a toplevel add or an application removal.
+const ATSPI_ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
+
+/// Whether an event signals that a toplevel window was added or removed, as
+/// opposed to a change within an existing window. GTK4 does not emit
+/// `window:create`/`window:destroy` in this environment; it reports toplevel
+/// lifecycle as `children-changed` on [`ATSPI_ROOT_PATH`]. The window
+/// create/destroy variants are honored too for toolkits that do emit them.
+fn is_window_lifecycle_event(event: &Event) -> bool {
+    match event {
+        Event::Window(WindowEvents::Create(_) | WindowEvents::Destroy(_)) => true,
+        Event::Object(ObjectEvents::ChildrenChanged(_)) => {
+            event.path().as_str() == ATSPI_ROOT_PATH
+        }
+        _ => false,
     }
 }
 
