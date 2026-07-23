@@ -3,15 +3,17 @@
 //! and the [`Mirror`] state; the sync side talks to it over channels —
 //! actions in via a tokio channel, tree events out via a std channel.
 
-use crate::mapping::{build_window_update, NodeIdMap};
+use crate::focus::FocusTracker;
+use crate::mapping::{build_window_update, focus_update, NodeIdMap};
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
-use atspi::events::object::ChildrenChangedEvent;
+use atspi::events::object::{ChildrenChangedEvent, StateChangedEvent};
 use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
 use atspi::object_ref::ObjectRefOwned;
+use atspi::State;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
@@ -166,10 +168,14 @@ async fn bridge_main(
 }
 
 /// Subscribes to the AT-SPI events that drive passive tree reflection:
-/// structural `children-changed` and window lifecycle/activation.
+/// structural `children-changed`, window lifecycle/activation, and
+/// `state-changed` (filtered to `:focused` in the handler). The coarse
+/// `state-changed` rule also delivers unrelated state changes; the handler
+/// discards them in O(1) and never re-walks on them.
 async fn register_events(conn: &AccessibilityConnection) -> BridgeResult<()> {
     conn.register_event::<ChildrenChangedEvent>().await?;
     conn.register_event::<WindowEvents>().await?;
+    conn.register_event::<StateChangedEvent>().await?;
     Ok(())
 }
 
@@ -179,6 +185,7 @@ async fn register_events(conn: &AccessibilityConnection) -> BridgeResult<()> {
 struct Mirror {
     windows: Vec<WindowState>,
     next_id: u64,
+    focus: FocusTracker,
 }
 
 struct WindowState {
@@ -186,6 +193,9 @@ struct WindowState {
     root: ObjectRefOwned,
     ids: NodeIdMap,
     objects: HashMap<accesskit::NodeId, ObjectRefOwned>,
+    /// The node this window last reported as focused, kept live so partial
+    /// (focus-only, and later caret) deltas can carry a non-stale `focus`.
+    focus: accesskit::NodeId,
 }
 
 impl Mirror {
@@ -193,6 +203,7 @@ impl Mirror {
         Self {
             windows: Vec::new(),
             next_id: 1,
+            focus: FocusTracker::default(),
         }
     }
 
@@ -214,6 +225,7 @@ impl Mirror {
         if focus.is_none() {
             focus = self.windows.first().map(|w| w.id);
         }
+        self.focus = FocusTracker::new(focus);
         Ok((out, focus))
     }
 
@@ -242,6 +254,7 @@ impl Mirror {
             root: window.root,
             ids,
             objects,
+            focus: update.focus,
         });
         Ok(Some((descriptor, update)))
     }
@@ -263,9 +276,12 @@ impl Mirror {
 
     /// Reflects an AT-SPI event. A toplevel add/remove (see
     /// [`is_window_lifecycle_event`]) triggers a full [`reconcile`](Self::reconcile).
+    /// A `state-changed:focused` gain emits a node-level focus delta without a
+    /// re-walk (see [`handle_focus_change`](Self::handle_focus_change)).
     /// Otherwise the event re-walks the affected window(s): a deep
     /// `children-changed` is matched to its window by sender (app); an
-    /// activate/deactivate is matched to the frame by sender and path.
+    /// activate/deactivate is matched to the frame by sender and path and also
+    /// advances window-level focus.
     async fn handle_atspi_event(
         &mut self,
         conn: &AccessibilityConnection,
@@ -274,6 +290,14 @@ impl Mirror {
         if is_window_lifecycle_event(&event) {
             return self.reconcile(conn).await;
         }
+        if let Event::Object(ObjectEvents::StateChanged(ev)) = &event {
+            if ev.state == State::Focused {
+                let enabled = ev.enabled;
+                return self.handle_focus_change(conn, &event, enabled).await;
+            }
+        }
+        let activation = matches!(&event, Event::Window(WindowEvents::Activate(_)));
+        let deactivation = matches!(&event, Event::Window(WindowEvents::Deactivate(_)));
         let targets: Vec<WindowId> = match &event {
             Event::Object(ObjectEvents::ChildrenChanged(_)) => {
                 let sender = event.sender();
@@ -298,6 +322,69 @@ impl Mirror {
             _ => Vec::new(),
         };
         let mut out = Vec::new();
+        for window in &targets {
+            if let Some(source_event) = self.rewalk(conn, *window).await {
+                out.push(source_event);
+            }
+        }
+        // Window-level focus follows activation, emitted after the re-walk's
+        // update so the client has the fresh tree before focus moves to it.
+        for window in &targets {
+            let change = if activation {
+                self.focus.focus(*window)
+            } else if deactivation {
+                self.focus.deactivate(*window)
+            } else {
+                None
+            };
+            if let Some(change) = change {
+                out.push(SourceEvent::FocusChanged(change));
+            }
+        }
+        out
+    }
+
+    /// Reflects an AT-SPI focus state change. A focus *gain* resolves the
+    /// emitting object to its window and node and emits a focus-only
+    /// `TreeUpdate` (no re-walk), plus a window-level `FocusChanged` when the
+    /// focused window changed. A focus *loss* (`enabled == false`) is ignored:
+    /// `TreeUpdate.focus` is mandatory, so "nothing focused" is expressed only
+    /// at window level (via deactivate) and by the consumer's host-focus gating.
+    /// When the object has not been walked yet, the owning app's windows are
+    /// re-walked so a fresh tree carries `State::Focused`.
+    async fn handle_focus_change(
+        &mut self,
+        conn: &AccessibilityConnection,
+        event: &Event,
+        enabled: bool,
+    ) -> Vec<SourceEvent> {
+        if !enabled {
+            return Vec::new();
+        }
+        let sender = event.sender();
+        let path = event.path();
+        if let Some((window, node)) =
+            resolve_focus_target(&self.windows, sender.as_str(), path.as_str())
+        {
+            if let Some(state) = self.windows.iter_mut().find(|w| w.id == window) {
+                state.focus = node;
+            }
+            let mut out = vec![SourceEvent::TreeUpdate {
+                window,
+                update: focus_update(node),
+            }];
+            if let Some(change) = self.focus.focus(window) {
+                out.push(SourceEvent::FocusChanged(change));
+            }
+            return out;
+        }
+        let targets: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|w| w.root.name().is_some_and(|n| n.as_str() == sender.as_str()))
+            .map(|w| w.id)
+            .collect();
+        let mut out = Vec::new();
         for window in targets {
             if let Some(source_event) = self.rewalk(conn, window).await {
                 out.push(source_event);
@@ -321,13 +408,14 @@ impl Mirror {
         let state = &mut self.windows[index];
         let update = build_window_update(&nodes, &mut state.ids);
         state.objects = index_objects(&nodes, &state.ids, &objects_by_path);
+        state.focus = update.focus;
         Some(SourceEvent::TreeUpdate { window, update })
     }
 
     /// Reconciles the tracked window set against a fresh discovery: drops and
     /// announces vanished toplevels, walks and announces newly visible ones.
-    /// Focus is left to the client, which nulls its own reference when a
-    /// focused window is removed (node-level focus is deferred; see item #2).
+    /// A removed window is dropped from the focus tracker; the client nulls its
+    /// own focus reference on `WindowRemoved`, so no `FocusChanged` is emitted.
     async fn reconcile(&mut self, conn: &AccessibilityConnection) -> Vec<SourceEvent> {
         let discovered = match mirror::discover_windows(conn).await {
             Ok(discovered) => discovered,
@@ -341,6 +429,9 @@ impl Mirror {
         // Resolve removal ids before mutating so the indices do not shift.
         let removed: Vec<WindowId> = diff.removed.iter().map(|&i| self.windows[i].id).collect();
         self.windows.retain(|w| !removed.contains(&w.id));
+        for &id in &removed {
+            self.focus.remove(id);
+        }
         out.extend(removed.into_iter().map(SourceEvent::WindowRemoved));
 
         let added: HashSet<usize> = diff.added.into_iter().collect();
@@ -385,6 +476,26 @@ fn is_window_lifecycle_event(event: &Event) -> bool {
     }
 }
 
+/// Resolves a focus event's sender bus name and object path to the window and
+/// node it belongs to. The node must exist in the window's *current* tree
+/// (`objects`, rebuilt on every walk) — not merely its append-only id map — so
+/// a node pruned since it was first seen is never targeted; an unknown focus id
+/// is fatal to a consumer applying the update. Sender plus path also pins the
+/// correct window when one app owns several.
+fn resolve_focus_target(
+    windows: &[WindowState],
+    sender: &str,
+    path: &str,
+) -> Option<(WindowId, accesskit::NodeId)> {
+    windows.iter().find_map(|w| {
+        if !w.root.name().is_some_and(|n| n.as_str() == sender) {
+            return None;
+        }
+        let id = w.ids.get(path)?;
+        w.objects.contains_key(&id).then_some((w.id, id))
+    })
+}
+
 /// Builds the node-id → object map used to route actions back to AT-SPI.
 fn index_objects(
     nodes: &[crate::mapping::MirrorNode],
@@ -398,4 +509,87 @@ fn index_objects(
         }
     }
     objects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atspi::object_ref::ObjectRef;
+    use atspi::zbus::names::UniqueName;
+    use atspi::zbus::zvariant::ObjectPath;
+
+    /// Builds a one-node `WindowState`: the window root plus a single node whose
+    /// id is allocated in `ids` and, when `walked`, present in `objects`.
+    fn window_state(
+        id: u64,
+        sender: &'static str,
+        root_path: &'static str,
+        node_path: &'static str,
+        walked: bool,
+    ) -> WindowState {
+        let root = ObjectRef::new_owned(
+            UniqueName::from_static_str_unchecked(sender),
+            ObjectPath::from_static_str_unchecked(root_path),
+        );
+        let mut ids = NodeIdMap::new();
+        let node_id = ids.id_for(node_path);
+        let mut objects = HashMap::new();
+        if walked {
+            objects.insert(
+                node_id,
+                ObjectRef::new_owned(
+                    UniqueName::from_static_str_unchecked(sender),
+                    ObjectPath::from_static_str_unchecked(node_path),
+                ),
+            );
+        }
+        WindowState {
+            id: WindowId(id),
+            root,
+            ids,
+            objects,
+            focus: node_id,
+        }
+    }
+
+    #[test]
+    fn resolves_by_sender_and_path() {
+        let windows = vec![window_state(1, ":1.1", "/win/1", "/win/1/node", true)];
+        let node = windows[0].ids.get("/win/1/node").unwrap();
+        assert_eq!(
+            resolve_focus_target(&windows, ":1.1", "/win/1/node"),
+            Some((WindowId(1), node))
+        );
+    }
+
+    #[test]
+    fn same_path_under_a_different_sender_does_not_match() {
+        let windows = vec![window_state(1, ":1.1", "/win/1", "/shared/node", true)];
+        assert_eq!(resolve_focus_target(&windows, ":1.2", "/shared/node"), None);
+    }
+
+    #[test]
+    fn multi_window_same_app_resolves_to_the_owning_window() {
+        let windows = vec![
+            window_state(1, ":1.1", "/win/1", "/win/1/node", true),
+            window_state(2, ":1.1", "/win/2", "/win/2/node", true),
+        ];
+        let node2 = windows[1].ids.get("/win/2/node").unwrap();
+        assert_eq!(
+            resolve_focus_target(&windows, ":1.1", "/win/2/node"),
+            Some((WindowId(2), node2))
+        );
+    }
+
+    #[test]
+    fn path_absent_from_current_objects_does_not_resolve() {
+        let windows = vec![window_state(1, ":1.1", "/win/1", "/win/1/gone", false)];
+        assert_eq!(resolve_focus_target(&windows, ":1.1", "/win/1/gone"), None);
+    }
+
+    #[test]
+    fn unknown_path_does_not_resolve() {
+        let windows = vec![window_state(1, ":1.1", "/win/1", "/win/1/node", true)];
+        assert_eq!(resolve_focus_target(&windows, ":1.1", "/win/1/other"), None);
+    }
 }

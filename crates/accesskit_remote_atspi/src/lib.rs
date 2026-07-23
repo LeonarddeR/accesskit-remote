@@ -7,6 +7,7 @@
 //! value/state events are re-read live before being applied.
 #![cfg(target_os = "linux")]
 
+mod focus;
 pub mod mapping;
 mod mirror;
 pub mod reconcile;

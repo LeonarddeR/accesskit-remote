@@ -149,6 +149,18 @@ pub fn build_window_update(nodes: &[MirrorNode], ids: &mut NodeIdMap) -> TreeUpd
     }
 }
 
+/// A focus-only delta: moves focus to `focus` without touching any node. The
+/// target must already exist in the window's tree; `tree` is `None` because no
+/// structural change accompanies it.
+pub fn focus_update(focus: NodeId) -> TreeUpdate {
+    TreeUpdate {
+        nodes: Vec::new(),
+        tree: None,
+        tree_id: TreeId::ROOT,
+        focus,
+    }
+}
+
 fn build_node(node: &MirrorNode, ids: &mut NodeIdMap, walked: &HashSet<&str>) -> Node {
     let role = map_role(node.role);
     let mut out = Node::new(role);
