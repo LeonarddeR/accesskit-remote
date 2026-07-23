@@ -10,4 +10,7 @@ authors.workspace = true
 [dependencies]
 accesskit.workspace = true
 accesskit_remote.workspace = true
-accesskit_remote_transport.workspace = true
+
+[dev-dependencies]
+accesskit_remote_server.workspace = true
+serde_json.workspace = true

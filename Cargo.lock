@@ -36,7 +36,8 @@ version = "0.1.0"
 dependencies = [
  "accesskit",
  "accesskit_remote",
- "accesskit_remote_transport",
+ "accesskit_remote_server",
+ "serde_json",
 ]
 
 [[package]]
