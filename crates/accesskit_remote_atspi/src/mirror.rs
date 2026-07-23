@@ -10,7 +10,9 @@ use atspi::connection::AccessibilityConnection;
 use atspi::object_ref::ObjectRefOwned;
 use atspi::proxy::accessible::ObjectRefExt;
 use atspi::proxy::action::ActionProxy;
+use atspi::proxy::application::ApplicationProxy;
 use atspi::proxy::component::ComponentProxy;
+use atspi::zbus::fdo::DBusProxy;
 use atspi::zbus::names::BusName;
 use atspi::{Interface, Role, State, StateSet};
 use std::collections::{HashMap, VecDeque};
@@ -48,13 +50,7 @@ pub async fn discover_windows(conn: &AccessibilityConnection) -> BridgeResult<Ve
             continue;
         };
         let app_name = app.name().await.unwrap_or_default();
-        let app_info = AppInfo {
-            name: app_name,
-            app_id: None,
-            pid: None,
-            toolkit: None,
-            toolkit_version: None,
-        };
+        let app_info = read_app_info(zconn, &app_ref, app_name).await;
         let frames = app.get_children().await.unwrap_or_default();
         for frame_ref in frames {
             if frame_ref.is_null() {
@@ -84,6 +80,46 @@ pub async fn discover_windows(conn: &AccessibilityConnection) -> BridgeResult<Ve
         }
     }
     Ok(windows)
+}
+
+/// Reads an application's identity: toolkit name and version from its
+/// `Application` interface, pid from the a11y bus's `org.freedesktop.DBus`.
+/// Pieces that cannot be read are left `None`.
+async fn read_app_info(
+    zconn: &atspi::zbus::Connection,
+    app_ref: &ObjectRefOwned,
+    name: String,
+) -> AppInfo {
+    let mut info = AppInfo {
+        name,
+        ..AppInfo::default()
+    };
+    let bus_name: BusName = match app_ref.name() {
+        Some(unique) => unique.clone().into(),
+        None => return info,
+    };
+    let app = async {
+        ApplicationProxy::builder(zconn)
+            .destination(bus_name.clone())?
+            .path(app_ref.path())?
+            .build()
+            .await
+    }
+    .await
+    .ok();
+    if let Some(app) = app {
+        info.toolkit = non_empty(app.toolkit_name().await);
+        info.toolkit_version = non_empty(app.version().await);
+    }
+    if let Ok(dbus) = DBusProxy::new(zconn).await {
+        info.pid = dbus.get_connection_unix_process_id(bus_name).await.ok();
+    }
+    info
+}
+
+/// Maps a successful but empty property read to `None`.
+fn non_empty<E>(result: Result<String, E>) -> Option<String> {
+    result.ok().filter(|value| !value.is_empty())
 }
 
 /// Walks the subtree rooted at `root`, breadth first, into flat

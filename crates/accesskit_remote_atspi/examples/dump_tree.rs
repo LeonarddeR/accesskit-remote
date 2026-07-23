@@ -17,10 +17,14 @@ fn main() {
     println!("focused window: {focus:?}");
     println!("discovered {} window(s):", windows.len());
     for (descriptor, update) in &windows {
+        let app = &descriptor.app;
         println!(
-            "  window {} | app {:?} | title {:?} | {} nodes",
+            "  window {} | app {:?} pid={:?} toolkit={:?} {:?} | title {:?} | {} nodes",
             descriptor.id.0,
-            descriptor.app.name,
+            app.name,
+            app.pid,
+            app.toolkit,
+            app.toolkit_version,
             descriptor.title,
             update.nodes.len(),
         );
