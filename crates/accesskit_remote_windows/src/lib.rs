@@ -9,12 +9,15 @@
 //! a RAIL window inside the RDP client.
 #![cfg(target_os = "windows")]
 
+mod visible;
+
 use accesskit_remote::WindowId;
 use accesskit_remote_client::ClientConnection;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub use accesskit_windows::HWND;
+pub use visible::{delta_message, install_visible_adapter, post_delta, uninstall_visible_adapter};
 
 pub type SharedClient = Arc<Mutex<ClientConnection>>;
 
@@ -56,9 +59,9 @@ impl RemoteWindowBinding {
     }
 }
 
-struct SnapshotActivation {
-    window: WindowId,
-    client: SharedClient,
+pub(crate) struct SnapshotActivation {
+    pub(crate) window: WindowId,
+    pub(crate) client: SharedClient,
 }
 
 impl accesskit::ActivationHandler for SnapshotActivation {
@@ -67,9 +70,9 @@ impl accesskit::ActivationHandler for SnapshotActivation {
     }
 }
 
-struct ForwardActions {
-    window: WindowId,
-    actions: Sender<OutgoingAction>,
+pub(crate) struct ForwardActions {
+    pub(crate) window: WindowId,
+    pub(crate) actions: Sender<OutgoingAction>,
 }
 
 impl accesskit::ActionHandler for ForwardActions {

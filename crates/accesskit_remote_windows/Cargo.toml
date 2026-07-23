@@ -12,8 +12,14 @@ accesskit.workspace = true
 accesskit_remote.workspace = true
 accesskit_remote_client.workspace = true
 accesskit_windows.workspace = true
+tracing.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
+accesskit_remote_server.workspace = true
 accesskit_remote_transport.workspace = true
 uuid.workspace = true
 windows = { workspace = true, features = [

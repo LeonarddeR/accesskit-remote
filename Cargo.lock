@@ -100,8 +100,10 @@ dependencies = [
  "accesskit",
  "accesskit_remote",
  "accesskit_remote_client",
+ "accesskit_remote_server",
  "accesskit_remote_transport",
  "accesskit_windows",
+ "tracing",
  "uuid",
  "windows",
 ]
