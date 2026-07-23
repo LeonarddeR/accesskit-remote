@@ -14,7 +14,11 @@ crate-type = ["cdylib", "staticlib"]
 accesskit_remote_client.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+accesskit.workspace = true
+accesskit_remote.workspace = true
+accesskit_remote_transport.workspace = true
 accesskit_remote_windows.workspace = true
+uuid.workspace = true
 windows-core.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
@@ -27,6 +31,9 @@ features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
 ]
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]

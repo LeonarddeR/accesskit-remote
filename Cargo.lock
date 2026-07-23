@@ -60,7 +60,10 @@ dependencies = [
 name = "accesskit_remote_dvc_plugin"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
+ "accesskit_remote",
  "accesskit_remote_client",
+ "accesskit_remote_transport",
  "accesskit_remote_windows",
  "libloading",
  "parking_lot",
@@ -68,6 +71,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "windows",
  "windows-core",
 ]

@@ -10,10 +10,12 @@
 //! the [`IWTSPlugin`] instances the DLL implements.
 #![cfg(target_os = "windows")]
 
+pub mod association;
 mod chain_load;
 mod channel;
 mod listener;
 mod plugin;
+pub mod transport;
 
 use core::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
