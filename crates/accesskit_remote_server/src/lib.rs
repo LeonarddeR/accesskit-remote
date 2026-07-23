@@ -26,6 +26,50 @@ pub struct WindowDescriptor {
     pub app: AppInfo,
 }
 
+/// An incremental change reported by a tree source after initial state.
+#[derive(Debug)]
+pub enum SourceEvent {
+    WindowAdded {
+        descriptor: WindowDescriptor,
+        tree: accesskit::TreeUpdate,
+    },
+    WindowRemoved(WindowId),
+    TreeUpdate {
+        window: WindowId,
+        update: accesskit::TreeUpdate,
+    },
+    FocusChanged(Option<WindowId>),
+}
+
+/// A provider of accessibility trees: the demo source, the AT-SPI mirror,
+/// or any future platform reader. The source owns authoritative state;
+/// incremental changes are drained with
+/// [`poll_events`](TreeSource::poll_events).
+pub trait TreeSource {
+    fn initial_state(
+        &mut self,
+    ) -> (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
+    fn perform(&mut self, window: WindowId, request: &accesskit::ActionRequest);
+    fn poll_events(&mut self) -> Vec<SourceEvent>;
+}
+
+/// Applies a drained [`SourceEvent`] to an established connection.
+pub fn apply_source_event(
+    server: &mut ServerConnection,
+    event: SourceEvent,
+) -> Result<(), ServerError> {
+    match event {
+        SourceEvent::WindowAdded { descriptor, tree } => {
+            let id = descriptor.id;
+            server.announce_window(&descriptor)?;
+            server.send_tree_update(id, tree)
+        }
+        SourceEvent::WindowRemoved(id) => server.remove_window(id),
+        SourceEvent::TreeUpdate { window, update } => server.send_tree_update(window, update),
+        SourceEvent::FocusChanged(window) => server.send_focus(window),
+    }
+}
+
 #[derive(Debug)]
 pub enum ServerEvent {
     Established,
