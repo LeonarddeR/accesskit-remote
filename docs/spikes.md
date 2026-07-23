@@ -104,6 +104,43 @@ Verified empirically (2026-07-23) and against the local WSLg clone at
   registration presumably still applies there (rd_pipe's daily mechanism);
   the plugin crate should support both registration modes.
 
+## Spike 1b — msrdc's own UIA on RAIL windows: none (field is clear)
+
+Inspected the live RAIL window with System.Windows.Automation
+(2026-07-23): `UiaHasServerSideProvider(hwnd) == FALSE`, no UIA children,
+bare `ControlType.Pane` with `FrameworkId=Win32` (the default MSAA proxy)
+and only the style-derived Transform pattern. msrdc implements no
+accessibility on RAIL windows — which is why WSLg apps are silent for
+screen readers today. Our subclassing adapter therefore has no
+`WM_GETOBJECT` competition; anything we expose is pure addition.
+
+## Spike 2c — hvsocket end-to-end: verified working
+
+Live test (2026-07-23): python `AF_VSOCK` listener on port 52000 in the
+Debian **user** distro; Windows side connected with a .NET socket
+(`AddressFamily` 34, `HV_PROTOCOL_RAW`=1, sockaddr_hv = family(2) +
+reserved(2) + VmId GUID(16) + ServiceId GUID(16)), service GUID from the
+template `<port as 8 hex digits>-facb-11e6-bd58-64006a7986d3`. Echo
+round-trip succeeded; guest saw the peer as CID 2 (host).
+
+- **No `GuestCommunicationServices` registry registration was needed** for
+  the host→guest direction.
+- **The WSL VM ID changes on every VM boot** (observed two different GUIDs
+  in one day), so it must be parsed from the msrdc command line (`/v:`) at
+  runtime — never cached.
+- The user distro can bind vsock directly; the system distro is not
+  involved. This validates the phase 1 out-of-band transport exactly as
+  designed.
+
+## WSLg reliability quirks observed
+
+- msrdc exits when the last GUI app closes; WSLGd restarts it on demand.
+  A toplevel created while the RDP connection is down/cycling may never be
+  remoted (no RAIL window until the app recreates its window), while the
+  same app started with the connection up maps fine — and then in VAIL
+  mode (no `[WARN:COPY MODE]` title prefix). The client plugin must treat
+  "AT-SPI window exists but no RAIL HWND (yet)" as a normal state.
+
 ## Environment notes
 
 - The WSL distro cold-starts on first `wsl.exe` call; WSLg (weston + msrdc)
