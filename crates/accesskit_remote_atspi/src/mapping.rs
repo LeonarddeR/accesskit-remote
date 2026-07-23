@@ -4,7 +4,7 @@
 
 use accesskit::{Node, NodeId, Tree, TreeId, TreeUpdate};
 use atspi::{Role, State, StateSet};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Assigns stable, sequential AccessKit [`NodeId`]s to AT-SPI object paths
 /// within one window. The same path always maps to the same id for the life
@@ -130,6 +130,7 @@ fn is_clickable_role(role: Role) -> bool {
 ///
 /// Panics if `nodes` is empty.
 pub fn build_window_update(nodes: &[MirrorNode], ids: &mut NodeIdMap) -> TreeUpdate {
+    let walked: HashSet<&str> = nodes.iter().map(|node| node.path.as_str()).collect();
     let root_id = ids.id_for(&nodes[0].path);
     let mut out = Vec::with_capacity(nodes.len());
     let mut focus = root_id;
@@ -138,7 +139,7 @@ pub fn build_window_update(nodes: &[MirrorNode], ids: &mut NodeIdMap) -> TreeUpd
         if node.focused {
             focus = id;
         }
-        out.push((id, build_node(node, ids)));
+        out.push((id, build_node(node, ids, &walked)));
     }
     TreeUpdate {
         nodes: out,
@@ -148,7 +149,7 @@ pub fn build_window_update(nodes: &[MirrorNode], ids: &mut NodeIdMap) -> TreeUpd
     }
 }
 
-fn build_node(node: &MirrorNode, ids: &mut NodeIdMap) -> Node {
+fn build_node(node: &MirrorNode, ids: &mut NodeIdMap, walked: &HashSet<&str>) -> Node {
     let role = map_role(node.role);
     let mut out = Node::new(role);
     if !node.name.is_empty() {
@@ -158,7 +159,12 @@ fn build_node(node: &MirrorNode, ids: &mut NodeIdMap) -> Node {
             out.set_label(node.name.clone());
         }
     }
-    let children: Vec<NodeId> = node.children.iter().map(|p| ids.id_for(p)).collect();
+    let children: Vec<NodeId> = node
+        .children
+        .iter()
+        .filter(|path| walked.contains(path.as_str()))
+        .map(|path| ids.id_for(path))
+        .collect();
     if !children.is_empty() {
         out.set_children(children);
     }
@@ -272,5 +278,28 @@ mod tests {
         let mut ids = NodeIdMap::new();
         let update = build_window_update(&[root, button], &mut ids);
         assert_eq!(update.focus, ids.get("/button").unwrap());
+    }
+
+    #[test]
+    fn child_refs_to_unwalked_paths_are_dropped() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/present".into(), "/cutoff".into()];
+        let present = leaf("/present", Role::Button, "here");
+
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[root, present], &mut ids);
+
+        assert_eq!(ids.get("/cutoff"), None, "no id allocated for an unwalked path");
+        let root_id = ids.get("/win").unwrap();
+        let present_id = ids.get("/present").unwrap();
+        let (_, root_node) = update.nodes.iter().find(|(id, _)| *id == root_id).unwrap();
+        assert_eq!(root_node.children().to_vec(), vec![present_id]);
+
+        let present_ids: HashSet<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+        for (_, node) in &update.nodes {
+            for child in node.children() {
+                assert!(present_ids.contains(child), "child {child:?} has no node");
+            }
+        }
     }
 }
