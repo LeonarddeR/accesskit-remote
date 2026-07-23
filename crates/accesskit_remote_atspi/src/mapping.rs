@@ -83,6 +83,9 @@ pub struct TextNodeCache {
     pub element_children: Vec<NodeId>,
     pub runs: Vec<(NodeId, Node)>,
     pub layout: Vec<TextRunLayout>,
+    /// Whether the node's role has a caret, so a later refresh re-reads the
+    /// caret and selection instead of leaving them cleared.
+    pub caret_enabled: bool,
 }
 
 /// Translates an AT-SPI [`Role`] into the nearest AccessKit role.
@@ -105,6 +108,13 @@ pub fn map_role(role: Role) -> accesskit::Role {
         Role::Text => A::MultilineTextInput,
         Role::Entry => A::TextInput,
         Role::PasswordText => A::PasswordInput,
+        Role::Terminal => A::Terminal,
+        Role::DocumentFrame
+        | Role::DocumentText
+        | Role::DocumentWeb
+        | Role::DocumentEmail
+        | Role::DocumentSpreadsheet
+        | Role::DocumentPresentation => A::Document,
         Role::List => A::List,
         Role::ListItem => A::ListItem,
         Role::ListBox => A::ListBox,
@@ -160,11 +170,39 @@ fn is_clickable_role(role: Role) -> bool {
     )
 }
 
-/// Whether a role's AT-SPI `Text` interface should be mirrored into synthesized
-/// text runs. Narrowed to editable text roles; static text (labels, documents)
-/// keeps its name→value mapping for now.
-pub fn is_text_input_role(role: Role) -> bool {
+/// Whether a role is an editable text field.
+fn is_editable_text_role(role: Role) -> bool {
     matches!(role, Role::Text | Role::Entry | Role::PasswordText)
+}
+
+/// Whether a role is static text: a label, terminal, or document.
+fn is_static_text_role(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Label
+            | Role::Terminal
+            | Role::DocumentFrame
+            | Role::DocumentText
+            | Role::DocumentWeb
+            | Role::DocumentEmail
+            | Role::DocumentSpreadsheet
+            | Role::DocumentPresentation
+    )
+}
+
+/// Whether a node with this role and child structure has its AT-SPI `Text`
+/// interface mirrored into synthesized [`Role::TextRun`] children. Editable
+/// roles always qualify; static text roles qualify only when they have no
+/// element children.
+pub fn reads_text_runs(role: Role, has_element_children: bool) -> bool {
+    is_editable_text_role(role) || (is_static_text_role(role) && !has_element_children)
+}
+
+/// Whether a text role has a user-movable caret whose position and selection are
+/// mirrored. Editable fields and terminals do; static labels and documents do
+/// not, so their runs carry no [`TextSelection`].
+pub fn has_text_caret(role: Role) -> bool {
+    is_editable_text_role(role) || role == Role::Terminal
 }
 
 /// Truncates `text` to at most [`MAX_TEXT_CHARS`] code points, returning a
@@ -442,6 +480,7 @@ fn build_node(
                 element_children,
                 runs: runs.clone(),
                 layout,
+                caret_enabled: has_text_caret(node.role),
             };
             BuiltNode { container, runs, cache: Some(cache) }
         }
@@ -494,6 +533,21 @@ mod tests {
         assert_eq!(map_role(Role::Button), accesskit::Role::Button);
         assert_eq!(map_role(Role::PageTab), accesskit::Role::Tab);
         assert_eq!(map_role(Role::Separator), accesskit::Role::GenericContainer);
+    }
+
+    #[test]
+    fn map_role_covers_terminal_and_document() {
+        assert_eq!(map_role(Role::Terminal), accesskit::Role::Terminal);
+        for role in [
+            Role::DocumentFrame,
+            Role::DocumentText,
+            Role::DocumentWeb,
+            Role::DocumentEmail,
+            Role::DocumentSpreadsheet,
+            Role::DocumentPresentation,
+        ] {
+            assert_eq!(map_role(role), accesskit::Role::Document, "{role:?}");
+        }
     }
 
     #[test]
@@ -582,6 +636,40 @@ mod tests {
             for child in node.children() {
                 assert!(present_ids.contains(child), "child {child:?} has no node");
             }
+        }
+    }
+
+    #[test]
+    fn reads_text_runs_editable_always_static_only_as_leaf() {
+        // Editable text roles get runs regardless of child structure.
+        for role in [Role::Text, Role::Entry, Role::PasswordText] {
+            assert!(reads_text_runs(role, false), "{role:?} leaf");
+            assert!(reads_text_runs(role, true), "{role:?} with children");
+        }
+        // Static text roles get runs only as leaves; a structured document
+        // keeps its element children instead of also emitting the whole text flat.
+        for role in [
+            Role::Label,
+            Role::Terminal,
+            Role::DocumentText,
+            Role::DocumentWeb,
+        ] {
+            assert!(reads_text_runs(role, false), "{role:?} leaf");
+            assert!(!reads_text_runs(role, true), "{role:?} with children");
+        }
+        // Non-text roles never get runs.
+        for role in [Role::Button, Role::Panel, Role::Frame] {
+            assert!(!reads_text_runs(role, false), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn has_text_caret_only_for_editable_and_terminal() {
+        for role in [Role::Text, Role::Entry, Role::PasswordText, Role::Terminal] {
+            assert!(has_text_caret(role), "{role:?}");
+        }
+        for role in [Role::Label, Role::DocumentText, Role::DocumentWeb, Role::Button] {
+            assert!(!has_text_caret(role), "{role:?}");
         }
     }
 
@@ -753,6 +841,39 @@ mod tests {
         let root2 = leaf("/win", Role::Frame, "w");
         build_window_update(&[root2], &mut ids, &mut caches);
         assert!(!caches.contains_key("/doc"), "cache pruned when node absent");
+    }
+
+    #[test]
+    fn text_cache_records_caret_enabled_per_role() {
+        let mut editable = leaf("/e", Role::Text, "");
+        editable.text = Some(TextState { text: "x".into(), caret: Some(1), selection: None });
+        let mut label = leaf("/l", Role::Label, "hi");
+        label.text = Some(TextState { text: "hi".into(), caret: None, selection: None });
+
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        build_window_update(&[editable, label], &mut ids, &mut caches);
+
+        assert!(caches.get("/e").unwrap().caret_enabled, "editable text has a caret");
+        assert!(!caches.get("/l").unwrap().caret_enabled, "static label has none");
+    }
+
+    #[test]
+    fn static_label_with_text_keeps_value_and_gains_runs() {
+        let mut label = leaf("/l", Role::Label, "Status: OK");
+        label.text = Some(TextState { text: "Status: OK".into(), caret: None, selection: None });
+
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[label], &mut ids, &mut HashMap::new());
+        let (_, node) = &update.nodes[0];
+
+        assert_eq!(node.value(), Some("Status: OK"), "label keeps its name in value");
+        assert_eq!(node.label(), None);
+        assert_eq!(node.children().len(), 1, "one run for single-line text");
+        let run = node.children()[0];
+        let (_, run_node) = update.nodes.iter().find(|(id, _)| *id == run).unwrap();
+        assert_eq!(run_node.role(), accesskit::Role::TextRun);
+        assert_eq!(run_node.value(), Some("Status: OK"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! run on the bridge thread's tokio runtime; they hold no long-lived state of
 //! their own (the [`crate::source`] `Mirror` owns that).
 
-use crate::mapping::{clamp_text, is_text_input_role, MirrorNode, TextState, MAX_TEXT_CHARS};
+use crate::mapping::{clamp_text, has_text_caret, reads_text_runs, MirrorNode, TextState, MAX_TEXT_CHARS};
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
 use atspi::connection::AccessibilityConnection;
@@ -152,13 +152,6 @@ pub async fn walk_window(
         let actionable = interfaces
             .as_ref()
             .is_some_and(|set| set.contains(Interface::Action));
-        let text = if is_text_input_role(role)
-            && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
-        {
-            read_text_state(zconn, &obj).await
-        } else {
-            None
-        };
         let mut children = Vec::new();
         for child in proxy.get_children().await.unwrap_or_default() {
             if child.is_null() {
@@ -167,6 +160,13 @@ pub async fn walk_window(
             children.push(child.path_as_str().to_owned());
             queue.push_back(child);
         }
+        let text = if reads_text_runs(role, !children.is_empty())
+            && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
+        {
+            read_text_state(zconn, &obj, has_text_caret(role)).await
+        } else {
+            None
+        };
         nodes.push(MirrorNode {
             path: path.clone(),
             role,
@@ -183,13 +183,15 @@ pub async fn walk_window(
 }
 
 /// Reads the AT-SPI `Text` interface of `obj`: its text (capped at
-/// [`MAX_TEXT_CHARS`] code points), caret offset, and first selection. All
-/// offsets are Unicode scalar value (code point) indices. Returns `None` if the
-/// text itself cannot be read; caret and selection degrade to `None`
+/// [`MAX_TEXT_CHARS`] code points) and, when `with_caret`, its caret offset and
+/// first selection. All offsets are Unicode scalar value (code point) indices.
+/// With `with_caret` false the caret and selection stay `None`. Returns `None`
+/// if the text itself cannot be read; caret and selection degrade to `None`
 /// individually.
 pub async fn read_text_state(
     zconn: &atspi::zbus::Connection,
     obj: &ObjectRefOwned,
+    with_caret: bool,
 ) -> Option<TextState> {
     let name: BusName = obj.name()?.clone().into();
     let path = obj.path().clone();
@@ -208,14 +210,17 @@ pub async fn read_text_state(
     let text = clamp_text(&raw).to_owned();
     let len = text.chars().count();
 
-    let caret = proxy
-        .caret_offset()
-        .await
-        .ok()
-        .filter(|&offset| offset >= 0)
-        .map(|offset| (offset as usize).min(len));
-
-    let selection = read_first_selection(&proxy, len).await;
+    let (caret, selection) = if with_caret {
+        let caret = proxy
+            .caret_offset()
+            .await
+            .ok()
+            .filter(|&offset| offset >= 0)
+            .map(|offset| (offset as usize).min(len));
+        (caret, read_first_selection(&proxy, len).await)
+    } else {
+        (None, None)
+    };
 
     Some(TextState { text, caret, selection })
 }
