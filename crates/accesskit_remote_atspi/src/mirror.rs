@@ -267,3 +267,29 @@ pub async fn perform(
     }
     Ok(())
 }
+
+/// Sets the caret or selection on a text object via its AT-SPI `Text` interface.
+/// A collapsed range (`anchor == focus`) moves the caret; a real range sets
+/// selection slot 0 with `start < end`. Offsets are code-point indices.
+pub async fn set_text_selection(
+    conn: &AccessibilityConnection,
+    target: &ObjectRefOwned,
+    anchor: usize,
+    focus: usize,
+) -> BridgeResult<()> {
+    let zconn = conn.connection();
+    let name: BusName = target.name().ok_or("null text selection target")?.clone().into();
+    let path = target.path().clone();
+    let proxy = TextProxy::builder(zconn)
+        .destination(name)?
+        .path(path)?
+        .build()
+        .await?;
+    if anchor == focus {
+        proxy.set_caret_offset(focus as i32).await?;
+    } else {
+        let (start, end) = (anchor.min(focus), anchor.max(focus));
+        proxy.set_selection(0, start as i32, end as i32).await?;
+    }
+    Ok(())
+}

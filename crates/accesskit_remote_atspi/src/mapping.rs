@@ -265,6 +265,20 @@ pub fn text_position(layout: &[TextRunLayout], offset: usize) -> TextPosition {
     }
 }
 
+/// Maps a [`TextPosition`] (a run's [`NodeId`] plus a code-point index within it)
+/// back to a global code-point offset within `layout` — the inverse of
+/// [`text_position`]. Returns `None` when the run id is not one of `layout`'s.
+pub fn text_offset(layout: &[TextRunLayout], position: &TextPosition) -> Option<usize> {
+    let mut offset = 0;
+    for run in layout {
+        if run.id == position.node {
+            return Some(offset + position.character_index);
+        }
+        offset += run.chars;
+    }
+    None
+}
+
 /// Builds the [`TextSelection`] for a text node from its caret and selection.
 /// A caret alone is a degenerate selection (anchor == focus); with a real
 /// selection the caret marks the focus end, so its direction is recovered.
@@ -648,6 +662,25 @@ mod tests {
         // End of document clamps to the last run's end.
         assert_eq!(text_position(&layout, 5), TextPosition { node: r1, character_index: 2 });
         assert_eq!(text_position(&layout, 99), TextPosition { node: r1, character_index: 2 });
+    }
+
+    #[test]
+    fn text_offset_is_the_inverse_of_text_position() {
+        let mut ids = NodeIdMap::new();
+        let (_, layout) = build_text_runs("/doc", "ab\ncd", &mut ids);
+        let total: usize = layout.iter().map(|r| r.chars).sum();
+        // Round-trips at the start, an interior offset, a run boundary, and the
+        // end-of-text boundary (where off-by-one bugs live).
+        for k in [0usize, 1, 3, total] {
+            assert_eq!(
+                text_offset(&layout, &text_position(&layout, k)),
+                Some(k),
+                "round-trip at offset {k}"
+            );
+        }
+        // A run id absent from the layout resolves to nothing.
+        let bogus = TextPosition { node: NodeId(9999), character_index: 0 };
+        assert_eq!(text_offset(&layout, &bogus), None);
     }
 
     #[test]

@@ -12,5 +12,5 @@ accesskit.workspace = true
 accesskit_remote.workspace = true
 accesskit_remote_server.workspace = true
 atspi.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["time"] }
 tokio-stream = "0.1"

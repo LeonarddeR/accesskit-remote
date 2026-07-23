@@ -4,15 +4,17 @@
 //! actions in via a tokio channel, tree events out via a std channel.
 
 use crate::focus::FocusTracker;
-use crate::mapping::{build_window_update, focus_update, rebuild_text_node, NodeIdMap, TextNodeCache};
+use crate::mapping::{
+    build_window_update, focus_update, rebuild_text_node, text_offset, NodeIdMap, TextNodeCache,
+};
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
 use atspi::events::object::{
-    ChildrenChangedEvent, StateChangedEvent, TextCaretMovedEvent, TextChangedEvent,
-    TextSelectionChangedEvent,
+    ActiveDescendantChangedEvent, ChildrenChangedEvent, StateChangedEvent, TextCaretMovedEvent,
+    TextChangedEvent, TextSelectionChangedEvent,
 };
 use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
 use atspi::object_ref::ObjectRefOwned;
@@ -20,16 +22,26 @@ use atspi::State;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::StreamExt;
 
+/// How often the mirror reconciles its tracked window set against a fresh
+/// discovery, catching lifecycle signals the reactive path may have missed (a
+/// window that becomes visible without re-signaling, or an app that dies without
+/// a root removal).
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
-/// An action to perform, routed from the sync side to the bridge thread.
+/// An action to perform, routed from the sync side to the bridge thread. `data`
+/// carries the [`accesskit::Action::SetTextSelection`] payload; it is `None` for
+/// actions that take none.
 struct PerformMsg {
     window: WindowId,
     action: accesskit::Action,
     node: accesskit::NodeId,
+    data: Option<accesskit::TextSelection>,
 }
 
 /// A [`TreeSource`] that mirrors the live AT-SPI accessibility tree.
@@ -85,10 +97,15 @@ impl TreeSource for AtspiSource {
     }
 
     fn perform(&mut self, window: WindowId, request: &accesskit::ActionRequest) {
+        let data = match &request.data {
+            Some(accesskit::ActionData::SetTextSelection(selection)) => Some(selection.clone()),
+            _ => None,
+        };
         let _ = self.actions.send(PerformMsg {
             window,
             action: request.action,
             node: request.target_node,
+            data,
         });
     }
 
@@ -143,6 +160,8 @@ async fn bridge_main(
 
     let events = event_conn.event_stream();
     tokio::pin!(events);
+    let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
+    reconcile_timer.tick().await; // Drop the immediate first tick; the initial enumeration just ran.
     'pump: loop {
         tokio::select! {
             action = actions_rx.recv() => match action {
@@ -166,20 +185,29 @@ async fn bridge_main(
                 Some(Err(_)) => {}
                 None => break 'pump,
             },
+            _ = reconcile_timer.tick() => {
+                for source_event in mirror.reconcile(&conn).await {
+                    if events_tx.send(source_event).is_err() {
+                        break 'pump;
+                    }
+                }
+            }
         }
     }
 }
 
 /// Subscribes to the AT-SPI events that drive passive tree reflection:
 /// structural `children-changed`, window lifecycle/activation, `state-changed`
-/// (filtered to `:focused` in the handler), and the text events that move the
-/// caret or change text/selection. The coarse `state-changed` rule also
-/// delivers unrelated state changes; the handler discards them in O(1). Text
-/// events re-query a single node and never re-walk.
+/// (filtered to `:focused` in the handler), `active-descendant-changed` (focus
+/// moving within a container), and the text events that move the caret or change
+/// text/selection. The coarse `state-changed` rule also delivers unrelated state
+/// changes; the handler discards them in O(1). Text events re-query a single
+/// node and never re-walk.
 async fn register_events(conn: &AccessibilityConnection) -> BridgeResult<()> {
     conn.register_event::<ChildrenChangedEvent>().await?;
     conn.register_event::<WindowEvents>().await?;
     conn.register_event::<StateChangedEvent>().await?;
+    conn.register_event::<ActiveDescendantChangedEvent>().await?;
     conn.register_event::<TextCaretMovedEvent>().await?;
     conn.register_event::<TextChangedEvent>().await?;
     conn.register_event::<TextSelectionChangedEvent>().await?;
@@ -272,24 +300,46 @@ impl Mirror {
     }
 
     /// Performs an action on its target object, then re-walks that window and
-    /// returns the resulting full-tree update.
+    /// returns the resulting full-tree update. `SetTextSelection` resolves its
+    /// anchor/focus run positions against the target's text-node layout into
+    /// global AT-SPI offsets (the run ids live in the layout, never in
+    /// `objects`, so only the container node routes through `objects`).
     async fn handle_action(
         &mut self,
         conn: &AccessibilityConnection,
         msg: PerformMsg,
     ) -> Option<SourceEvent> {
-        let target = {
+        let (target, selection) = {
             let window = self.windows.iter().find(|w| w.id == msg.window)?;
-            window.objects.get(&msg.node)?.clone()
+            let target = window.objects.get(&msg.node)?.clone();
+            let selection = if msg.action == accesskit::Action::SetTextSelection {
+                let sel = msg.data.as_ref()?;
+                let cache = window.text.get(target.path_as_str())?;
+                let anchor = text_offset(&cache.layout, &sel.anchor)?;
+                let focus = text_offset(&cache.layout, &sel.focus)?;
+                Some((anchor, focus))
+            } else {
+                None
+            };
+            (target, selection)
         };
-        mirror::perform(conn, &target, msg.action).await.ok()?;
+        match selection {
+            Some((anchor, focus)) => {
+                mirror::set_text_selection(conn, &target, anchor, focus).await.ok()?;
+            }
+            None => {
+                mirror::perform(conn, &target, msg.action).await.ok()?;
+            }
+        }
         self.rewalk(conn, msg.window).await
     }
 
     /// Reflects an AT-SPI event. A toplevel add/remove (see
     /// [`is_window_lifecycle_event`]) triggers a full [`reconcile`](Self::reconcile).
-    /// A `state-changed:focused` gain emits a node-level focus delta without a
-    /// re-walk (see [`handle_focus_change`](Self::handle_focus_change)).
+    /// A `state-changed:focused` gain, or an `active-descendant-changed` moving
+    /// focus within a container, emits a node-level focus delta without a re-walk
+    /// (see [`handle_focus_change`](Self::handle_focus_change) and
+    /// [`handle_active_descendant`](Self::handle_active_descendant)).
     /// Otherwise the event re-walks the affected window(s): a deep
     /// `children-changed` is matched to its window by sender (app); an
     /// activate/deactivate is matched to the frame by sender and path and also
@@ -307,6 +357,10 @@ impl Mirror {
                 let enabled = ev.enabled;
                 return self.handle_focus_change(conn, &event, enabled).await;
             }
+        }
+        if let Event::Object(ObjectEvents::ActiveDescendantChanged(ev)) = &event {
+            let sender = event.sender();
+            return self.handle_active_descendant(sender.as_str(), ev.descendant.path_as_str());
         }
         match &event {
             Event::Object(ObjectEvents::TextCaretMoved(ev)) => {
@@ -390,17 +444,7 @@ impl Mirror {
         if let Some((window, node)) =
             resolve_focus_target(&self.windows, sender.as_str(), path.as_str())
         {
-            if let Some(state) = self.windows.iter_mut().find(|w| w.id == window) {
-                state.focus = node;
-            }
-            let mut out = vec![SourceEvent::TreeUpdate {
-                window,
-                update: focus_update(node),
-            }];
-            if let Some(change) = self.focus.focus(window) {
-                out.push(SourceEvent::FocusChanged(change));
-            }
-            return out;
+            return self.emit_node_focus(window, node);
         }
         let targets: Vec<WindowId> = self
             .windows
@@ -413,6 +457,41 @@ impl Mirror {
             if let Some(source_event) = self.rewalk(conn, window).await {
                 out.push(source_event);
             }
+        }
+        out
+    }
+
+    /// Reflects an `active-descendant-changed`: focus moving among a container's
+    /// descendants (lists, trees, combo boxes). Resolves the new descendant to
+    /// its window and node by the emitting app's bus name and the descendant's
+    /// object path, and emits a node-level focus delta. A descendant absent from
+    /// the current tree resolves to nothing and emits nothing — an unknown focus
+    /// id is fatal to a consumer. Item selection *state* is not forwarded here;
+    /// that stays governed by re-walks.
+    fn handle_active_descendant(
+        &mut self,
+        sender: &str,
+        descendant_path: &str,
+    ) -> Vec<SourceEvent> {
+        match resolve_focus_target(&self.windows, sender, descendant_path) {
+            Some((window, node)) => self.emit_node_focus(window, node),
+            None => Vec::new(),
+        }
+    }
+
+    /// Emits a node-level focus move: keeps the window's live `focus` in step,
+    /// emits a focus-only delta (no re-walk), and a window-level `FocusChanged`
+    /// when the focused window changed.
+    fn emit_node_focus(&mut self, window: WindowId, node: accesskit::NodeId) -> Vec<SourceEvent> {
+        if let Some(state) = self.windows.iter_mut().find(|w| w.id == window) {
+            state.focus = node;
+        }
+        let mut out = vec![SourceEvent::TreeUpdate {
+            window,
+            update: focus_update(node),
+        }];
+        if let Some(change) = self.focus.focus(window) {
+            out.push(SourceEvent::FocusChanged(change));
         }
         out
     }
@@ -659,5 +738,41 @@ mod tests {
     fn unknown_path_does_not_resolve() {
         let windows = vec![window_state(1, ":1.1", "/win/1", "/win/1/node", true)];
         assert_eq!(resolve_focus_target(&windows, ":1.1", "/win/1/other"), None);
+    }
+
+    fn mirror_with(windows: Vec<WindowState>) -> Mirror {
+        Mirror {
+            windows,
+            next_id: 100,
+            focus: FocusTracker::new(None),
+        }
+    }
+
+    #[test]
+    fn active_descendant_emits_a_focus_only_delta_and_window_focus() {
+        let win = window_state(1, ":1.1", "/win/1", "/win/1/item", true);
+        let node = win.ids.get("/win/1/item").unwrap();
+        let mut mirror = mirror_with(vec![win]);
+
+        let out = mirror.handle_active_descendant(":1.1", "/win/1/item");
+
+        assert_eq!(out.len(), 2, "a focus-only delta plus a window focus change");
+        match &out[0] {
+            SourceEvent::TreeUpdate { window, update } => {
+                assert_eq!(*window, WindowId(1));
+                assert!(update.nodes.is_empty(), "focus-only delta touches no nodes");
+                assert_eq!(update.focus, node);
+            }
+            _ => panic!("expected a TreeUpdate"),
+        }
+        assert!(matches!(out[1], SourceEvent::FocusChanged(Some(WindowId(1)))));
+        assert_eq!(mirror.windows[0].focus, node, "window focus advanced to the descendant");
+    }
+
+    #[test]
+    fn active_descendant_absent_from_the_tree_emits_nothing() {
+        let win = window_state(1, ":1.1", "/win/1", "/win/1/item", true);
+        let mut mirror = mirror_with(vec![win]);
+        assert!(mirror.handle_active_descendant(":1.1", "/win/1/gone").is_empty());
     }
 }
