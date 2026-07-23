@@ -160,6 +160,53 @@ for the build-up.
   plugin + windows crates). Commits 0bce2b3 (pump), step-3/4 commits
   (visible adapter, rail hook), plus docs.
 
+- **Focus & caret/text-selection forwarding.** Node focus and caret now flow
+  end to end as ordinary tree updates (no protocol change).
+  - *Focus* (mirror): the event connection subscribes to `object:state-changed`;
+    a `:focused` gain resolves the emitting object to its window+node
+    (`resolve_focus_target`, gated on the node still being in the current
+    `objects` map) and emits a focus-only `TreeUpdate` (`{nodes:[], focus}`) with
+    no re-walk, plus a deduped window-level `FocusChanged` via a pure
+    `FocusTracker`. Window activate/deactivate also advance window focus.
+    `WindowState.focus` is kept live from every build so partial (focus/caret)
+    deltas never revert focus. Registration matches Orca
+    (`P:\A11y\orca` event_manager.py: `state-changed:focused` with `detail1` ==
+    `enabled`; Orca doesn't use legacy `focus:`).
+  - *Focus → UIA* (Windows): `post_focus(hwnd, is_focused)` mirrors
+    `post_delta`, driving the visible adapter's `update_window_focus_state` on
+    the window's own thread — required because the consumer only raises UIA
+    focus events while it believes the window is host-focused, and a RAIL window
+    never gets its own `WM_SETFOCUS`. The plugin's `Registry` tracks the focused
+    remote window and posts unfocus/focus on `FocusChanged`; `try_attach` seeds
+    `is_focused` from a remote focus that arrived before the window attached.
+  - *Caret/text* (mirror): the walk reads the AT-SPI `Text` interface for
+    text-input roles into synthesized `Role::TextRun` children (one per hard
+    line; `character_lengths` = per-code-point UTF-8 byte lengths; ids
+    `"path#runN"`) plus a `TextSelection` on the container (caret = the
+    selection focus end; code-point offsets). `text-caret-moved`/`text-changed`/
+    `text-selection-changed` re-query just that node and emit a minimal delta
+    (`rebuild_text_node`) — never a re-walk. `accesskit_windows` exposes the UIA
+    Text pattern automatically, so no Windows-side caret code.
+  - **Verification.** Pure logic is unit-tested (focus + 13 text tests in the
+    mirror; 5 Registry focus tests in the plugin). Live-verified where the
+    environment allows: `visible_demo` — a UIA `SetFocus` round-tripped a
+    focus-only delta and UIA `FocusedElement` tracked it (the provider raises
+    `UIA_AutomationFocusChangedEventId` on that path, confirmed in
+    `accesskit_windows` `focus_moved`); `dump_tree` — gnome-text-editor's
+    `MultilineTextInput` gained TextRun children + a caret `TextSelection` read
+    from the Text interface; `caret_reflect` — editing the document emitted
+    `text-changed` → a 3-node delta (container + two runs) carrying the new text
+    with no re-walk. **Environment caveat:** headless WSL has no window manager,
+    so GTK4 emits **no** `state-changed:focused` or `window:activate` (only
+    `children-changed` and object state changes like Pressed/Indeterminate) —
+    the same class of gap as `window:create/destroy`. Focus events are expected
+    on the msrdc/RAIL path (which *does* deliver `window:activate`) and remain
+    to be exercised interactively there. GTK's `SetCaretOffset` is `NotSupported`
+    over AT-SPI, so caret motion can't be driven headlessly; `text-changed`
+    (which *does* fire) exercises the identical `refresh_text` handler.
+    Commits 150f4cb (focus emit), 6becbb4 (post_focus), c9c8ee8 (plugin route),
+    4d5933a (TextRun synth), cd5c039 (Text reads), 43a2923 (text events).
+
 ## Remaining
 
 1. **Periodic reconcile** (mirror): window add/remove now reconciles on
@@ -169,16 +216,24 @@ for the build-up.
    add event fired after the window was visible in every trial), but it is the
    residual race Orca's ~60s reconciliation covers; a periodic reconcile is
    future work. See `P:\a11y\orca`.
-2. **Node-level focus**: deferred from passive events to avoid a
-   `state-changed` re-walk storm; today only window activate/deactivate
-   re-walks the frame. The action's immediate re-walk still covers state-only
-   results, so it stays even though passive re-walks now cover structure.
+2. **Node-level focus**: ~~deferred from passive events~~ **done** — a
+   `state-changed:focused` gain now emits a focus-only delta with no re-walk
+   (see the focus/caret milestone above). The re-walk-storm concern is avoided
+   because the handler filters in O(1) and never re-walks on state changes.
 3. **Coalesce children-changed bursts**: New Tab fires ~28 full re-walks in 8s
    before settling. Full-tree re-walks are convergent, so this is a cost, not
    a correctness, issue; debounce is a future optimization.
 4. **`probe` example** has the same latent hvsocket receive-timeout bug the
    `viewer` had (fixed in 18542fd); apply the same `ConnectionAborted`-retry
    if probe is ever driven over hvsocket.
+5. **Focus/caret follow-ups** (v1 shipped above): (a) subscribe
+   `object:active-descendant-changed` for focus moving among a container's
+   descendants (lists/trees/combos), as Orca does; (b) map UIA
+   `Action::SetTextSelection` → AT-SPI `set_caret_offset`/selection so the caret
+   can be driven from Windows; (c) give `Role::Label`/`Document`/`Terminal` text
+   runs too (currently gated to editable text-input roles); (d) geometry
+   (`character_positions`/`widths`) for magnifiers; (e) a `GetForegroundWindow`
+   gate on `post_focus(true)` if RAIL testing shows Narrator/NVDA focus theft.
 
 ## Notes / corrections
 
@@ -202,10 +257,11 @@ for the build-up.
    the mirror fills pid/toolkit but not the desktop-file id, so association
    disambiguation-by-app-id never engages; same-title windows across apps stay
    unmatched. Plumb the app id through `AppInfo` on the Linux side.
-3. **Window focus → UIA**: `ClientEvent::FocusChanged` is logged but not yet
-   forwarded to bound adapters (`update_window_focus_state` runs only off the
-   window's own WM_SETFOCUS/KILLFOCUS). Wire remote focus into the adapter for
-   correct focus tracking across RAIL windows.
+3. **Window focus → UIA**: **done** — `ClientEvent::FocusChanged` now routes
+   through `Registry::focus_changed` to `post_focus` on the bound RAIL windows
+   (see the focus/caret milestone above). Local WM_SETFOCUS/KILLFOCUS handling
+   stays (last-writer-wins). Still to exercise interactively on the RAIL path,
+   where GTK actually emits focus events (headless WSL does not).
 4. **Registration UX**: production install still manual (HKLM
    `OptionalAddIns\WSLDVC_PRIVATE` + `.wslgconfig`); consider a small installer
    or DllInstall-style helper later. The debug DLL is currently registered on
