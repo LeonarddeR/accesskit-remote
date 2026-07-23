@@ -775,4 +775,19 @@ mod tests {
         let mut mirror = mirror_with(vec![win]);
         assert!(mirror.handle_active_descendant(":1.1", "/win/1/gone").is_empty());
     }
+
+    #[test]
+    fn active_descendant_in_the_focused_window_dedups_the_window_focus() {
+        let win = window_state(1, ":1.1", "/win/1", "/win/1/item", true);
+        let node = win.ids.get("/win/1/item").unwrap();
+        let mut mirror = Mirror {
+            windows: vec![win],
+            next_id: 100,
+            focus: FocusTracker::new(Some(WindowId(1))),
+        };
+        let out = mirror.handle_active_descendant(":1.1", "/win/1/item");
+        assert_eq!(out.len(), 1, "an already-focused window emits only the focus delta");
+        assert!(matches!(&out[0], SourceEvent::TreeUpdate { .. }));
+        assert_eq!(mirror.windows[0].focus, node);
+    }
 }

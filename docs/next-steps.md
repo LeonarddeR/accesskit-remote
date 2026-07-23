@@ -240,10 +240,16 @@ for the build-up.
 1. **Periodic reconcile** (mirror): ~~future work~~ **done** — a 60s
    `tokio::time::interval` arm in `bridge_main` now drives the idempotent
    `Mirror::reconcile` (see the milestone above), the safety net Orca's ~60s
-   reconciliation provides. A window that becomes Showing+Visible *without*
-   re-signaling, or an app that dies without a root `remove`, is now caught within
-   60s rather than missed until the next root event. The only residual window is
-   the ≤60s gap between ticks. See `P:\a11y\orca`.
+   reconciliation provides. The timer firing and driving `reconcile` to completion
+   is smoke-verified (ran past the 60s tick with no bridge-thread panic — a tokio
+   `interval` panics rather than silently no-ops if the time driver is off — and
+   no spurious churn in steady state); `reconcile`'s own add/remove detection is
+   covered by the `reconcile_windows` unit tests plus the reactive-path proof
+   (`window_lifecycle`). By composition, a window that becomes Showing+Visible
+   *without* re-signaling — or an app that dies without a root `remove` — is caught
+   at the next tick rather than missed indefinitely. The timer-driven *detection*
+   was not isolated in test (the reactive path catches window changes first), and
+   the residual window is the ≤60s gap between ticks. See `P:\a11y\orca`.
 2. **Node-level focus**: ~~deferred from passive events~~ **done** — a
    `state-changed:focused` gain now emits a focus-only delta with no re-walk
    (see the focus/caret milestone above). The re-walk-storm concern is avoided
