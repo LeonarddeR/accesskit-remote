@@ -8,11 +8,14 @@ use crate::mirror::{self, BridgeResult};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
+use atspi::events::object::ChildrenChangedEvent;
+use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
 use atspi::object_ref::ObjectRefOwned;
 use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio_stream::StreamExt;
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
@@ -106,8 +109,22 @@ async fn bridge_main(
             return;
         }
     };
-    let mut mirror = Mirror::new(conn);
-    let snapshot = match mirror.enumerate().await {
+    // A dedicated connection carries the event stream. Its MessageStream must
+    // not share a connection with method calls: a full event broadcast would
+    // stall that connection's socket reader and deadlock in-flight replies.
+    let event_conn = match mirror::connect().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            let _ = init_tx.send(Err(format!("connect events: {e}")));
+            return;
+        }
+    };
+    if let Err(e) = register_events(&event_conn).await {
+        let _ = init_tx.send(Err(format!("register events: {e}")));
+        return;
+    }
+    let mut mirror = Mirror::new();
+    let snapshot = match mirror.enumerate(&conn).await {
         Ok(snapshot) => snapshot,
         Err(e) => {
             let _ = init_tx.send(Err(format!("enumerate: {e}")));
@@ -118,19 +135,47 @@ async fn bridge_main(
         return;
     }
 
-    while let Some(msg) = actions_rx.recv().await {
-        if let Some(event) = mirror.handle_action(msg).await {
-            if events_tx.send(event).is_err() {
-                break;
-            }
+    let events = event_conn.event_stream();
+    tokio::pin!(events);
+    'pump: loop {
+        tokio::select! {
+            action = actions_rx.recv() => match action {
+                Some(msg) => {
+                    if let Some(event) = mirror.handle_action(&conn, msg).await {
+                        if events_tx.send(event).is_err() {
+                            break 'pump;
+                        }
+                    }
+                }
+                None => break 'pump,
+            },
+            item = events.next() => match item {
+                Some(Ok(event)) => {
+                    for source_event in mirror.handle_atspi_event(&conn, event).await {
+                        if events_tx.send(source_event).is_err() {
+                            break 'pump;
+                        }
+                    }
+                }
+                Some(Err(_)) => {}
+                None => break 'pump,
+            },
         }
     }
 }
 
-/// Authoritative mirror state: the connection plus one [`WindowState`] per
-/// discovered toplevel frame, keyed so re-walks reuse stable node ids.
+/// Subscribes to the AT-SPI events that drive passive tree reflection:
+/// structural `children-changed` and window lifecycle/activation.
+async fn register_events(conn: &AccessibilityConnection) -> BridgeResult<()> {
+    conn.register_event::<ChildrenChangedEvent>().await?;
+    conn.register_event::<WindowEvents>().await?;
+    Ok(())
+}
+
+/// Authoritative mirror state: one [`WindowState`] per discovered toplevel
+/// frame, keyed so re-walks reuse stable node ids. The connection is owned by
+/// the bridge and passed in, so its event stream can borrow it alongside.
 struct Mirror {
-    conn: AccessibilityConnection,
     windows: Vec<WindowState>,
     next_id: u64,
 }
@@ -143,9 +188,8 @@ struct WindowState {
 }
 
 impl Mirror {
-    fn new(conn: AccessibilityConnection) -> Self {
+    fn new() -> Self {
         Self {
-            conn,
             windows: Vec::new(),
             next_id: 1,
         }
@@ -153,8 +197,8 @@ impl Mirror {
 
     /// Discovers every visible frame, walks each into a tree, and returns the
     /// initial snapshot (windows with full trees, plus the focused window).
-    async fn enumerate(&mut self) -> BridgeResult<Snapshot> {
-        let discovered = mirror::discover_windows(&self.conn).await?;
+    async fn enumerate(&mut self, conn: &AccessibilityConnection) -> BridgeResult<Snapshot> {
+        let discovered = mirror::discover_windows(conn).await?;
         let mut out = Vec::new();
         let mut focus = None;
         for mut window in discovered {
@@ -162,7 +206,7 @@ impl Mirror {
             self.next_id += 1;
             window.descriptor.id = id;
 
-            let (nodes, objects_by_path) = mirror::walk_window(&self.conn, &window.root).await?;
+            let (nodes, objects_by_path) = mirror::walk_window(conn, &window.root).await?;
             if nodes.is_empty() {
                 continue;
             }
@@ -189,20 +233,66 @@ impl Mirror {
 
     /// Performs an action on its target object, then re-walks that window and
     /// returns the resulting full-tree update.
-    async fn handle_action(&mut self, msg: PerformMsg) -> Option<SourceEvent> {
+    async fn handle_action(
+        &mut self,
+        conn: &AccessibilityConnection,
+        msg: PerformMsg,
+    ) -> Option<SourceEvent> {
         let target = {
             let window = self.windows.iter().find(|w| w.id == msg.window)?;
             window.objects.get(&msg.node)?.clone()
         };
-        mirror::perform(&self.conn, &target, msg.action).await.ok()?;
-        self.rewalk(msg.window).await
+        mirror::perform(conn, &target, msg.action).await.ok()?;
+        self.rewalk(conn, msg.window).await
+    }
+
+    /// Reflects an AT-SPI event: re-walks the affected window(s) so app-driven
+    /// changes (and toolkit updates that lag an action's immediate re-walk)
+    /// surface. `children-changed` fires on a deep node, so its window is
+    /// matched by sender (app); window events fire on the frame, matched by
+    /// its exact path.
+    async fn handle_atspi_event(
+        &mut self,
+        conn: &AccessibilityConnection,
+        event: Event,
+    ) -> Vec<SourceEvent> {
+        let targets: Vec<WindowId> = match &event {
+            Event::Object(ObjectEvents::ChildrenChanged(_)) => {
+                let sender = event.sender();
+                self.windows
+                    .iter()
+                    .filter(|w| w.root.name().is_some_and(|n| n.as_str() == sender.as_str()))
+                    .map(|w| w.id)
+                    .collect()
+            }
+            Event::Window(WindowEvents::Activate(_) | WindowEvents::Deactivate(_)) => {
+                let path = event.path();
+                self.windows
+                    .iter()
+                    .filter(|w| w.root.path_as_str() == path.as_str())
+                    .map(|w| w.id)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for window in targets {
+            if let Some(source_event) = self.rewalk(conn, window).await {
+                out.push(source_event);
+            }
+        }
+        out
     }
 
     /// Re-walks one window and rebuilds its tree, reusing its stable id map.
-    async fn rewalk(&mut self, window: WindowId) -> Option<SourceEvent> {
+    async fn rewalk(
+        &mut self,
+        conn: &AccessibilityConnection,
+        window: WindowId,
+    ) -> Option<SourceEvent> {
         let index = self.windows.iter().position(|w| w.id == window)?;
         let root = self.windows[index].root.clone();
-        let (nodes, objects_by_path) = mirror::walk_window(&self.conn, &root).await.ok()?;
+        let (nodes, objects_by_path) = mirror::walk_window(conn, &root).await.ok()?;
         if nodes.is_empty() {
             return None;
         }
