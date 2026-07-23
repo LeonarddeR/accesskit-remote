@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut stream = connect(&args)?;
+    let (mut stream, hvsocket) = connect(&args)?;
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let mut client = ClientConnection::new("probe");
@@ -28,12 +28,7 @@ fn main() -> std::io::Result<()> {
         let chunk = match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => &buf[..n],
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
+            Err(e) if is_retryable_read(&e, hvsocket) => continue,
             Err(e) => return Err(e),
         };
         for event in client.handle_input(chunk).map_err(std::io::Error::other)? {
@@ -92,11 +87,15 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn connect(args: &[String]) -> std::io::Result<accesskit_remote_transport::Socket> {
+/// Connects and reports whether the transport is hvsocket, whose read
+/// timeout surfaces as `ConnectionAborted` rather than
+/// `WouldBlock`/`TimedOut`.
+fn connect(args: &[String]) -> std::io::Result<(accesskit_remote_transport::Socket, bool)> {
     match args.first().map(String::as_str) {
         Some("--tcp") | None => {
             let port: u16 = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(4750);
-            accesskit_remote_transport::tcp::connect_local(port).map(Into::into)
+            let socket = accesskit_remote_transport::tcp::connect_local(port)?;
+            Ok((socket.into(), false))
         }
         #[cfg(windows)]
         Some("--hvsocket") => {
@@ -106,8 +105,17 @@ fn connect(args: &[String]) -> std::io::Result<accesskit_remote_transport::Socke
                 .parse::<uuid::Uuid>()
                 .expect("invalid VM ID");
             let port: u32 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(4750);
-            accesskit_remote_transport::hvsocket::connect(vm_id, port)
+            Ok((accesskit_remote_transport::hvsocket::connect(vm_id, port)?, true))
         }
         Some(other) => Err(std::io::Error::other(format!("unknown mode: {other}"))),
     }
+}
+
+/// Whether a read error is a timeout to retry rather than a dead
+/// connection. hvsocket surfaces receive timeouts as `ConnectionAborted`.
+fn is_retryable_read(err: &std::io::Error, hvsocket: bool) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) || (hvsocket && err.kind() == std::io::ErrorKind::ConnectionAborted)
 }
