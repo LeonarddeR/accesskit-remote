@@ -3,7 +3,7 @@
 //! run on the bridge thread's tokio runtime; they hold no long-lived state of
 //! their own (the [`crate::source`] `Mirror` owns that).
 
-use crate::mapping::MirrorNode;
+use crate::mapping::{clamp_text, is_text_input_role, MirrorNode, TextState, MAX_TEXT_CHARS};
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
 use atspi::connection::AccessibilityConnection;
@@ -12,6 +12,7 @@ use atspi::proxy::accessible::ObjectRefExt;
 use atspi::proxy::action::ActionProxy;
 use atspi::proxy::application::ApplicationProxy;
 use atspi::proxy::component::ComponentProxy;
+use atspi::proxy::text::TextProxy;
 use atspi::zbus::fdo::DBusProxy;
 use atspi::zbus::names::BusName;
 use atspi::{Interface, Role, State, StateSet};
@@ -147,11 +148,17 @@ pub async fn walk_window(
         let role = proxy.get_role().await.unwrap_or(Role::Invalid);
         let name = proxy.name().await.unwrap_or_default();
         let states = proxy.get_state().await.unwrap_or_else(|_| StateSet::empty());
-        let actionable = proxy
-            .get_interfaces()
-            .await
-            .map(|set| set.contains(Interface::Action))
-            .unwrap_or(false);
+        let interfaces = proxy.get_interfaces().await.ok();
+        let actionable = interfaces
+            .as_ref()
+            .is_some_and(|set| set.contains(Interface::Action));
+        let text = if is_text_input_role(role)
+            && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
+        {
+            read_text_state(zconn, &obj).await
+        } else {
+            None
+        };
         let mut children = Vec::new();
         for child in proxy.get_children().await.unwrap_or_default() {
             if child.is_null() {
@@ -168,11 +175,65 @@ pub async fn walk_window(
             focused: states.contains(State::Focused),
             actionable,
             children,
-            text: None,
+            text,
         });
         objects.insert(path, obj);
     }
     Ok((nodes, objects))
+}
+
+/// Reads the AT-SPI `Text` interface of `obj`: its text (capped at
+/// [`MAX_TEXT_CHARS`] code points), caret offset, and first selection. All
+/// offsets are Unicode scalar value (code point) indices. Returns `None` if the
+/// text itself cannot be read; caret and selection degrade to `None`
+/// individually.
+pub async fn read_text_state(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Option<TextState> {
+    let name: BusName = obj.name()?.clone().into();
+    let path = obj.path().clone();
+    let proxy = TextProxy::builder(zconn)
+        .destination(name)
+        .ok()?
+        .path(path)
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+
+    let count = proxy.character_count().await.ok()?.max(0);
+    let capped = count.min(MAX_TEXT_CHARS as i32);
+    let raw = proxy.get_text(0, capped).await.ok()?;
+    let text = clamp_text(&raw).to_owned();
+    let len = text.chars().count();
+
+    let caret = proxy
+        .caret_offset()
+        .await
+        .ok()
+        .filter(|&offset| offset >= 0)
+        .map(|offset| (offset as usize).min(len));
+
+    let selection = read_first_selection(&proxy, len).await;
+
+    Some(TextState { text, caret, selection })
+}
+
+/// Reads the first AT-SPI text selection as a normalized `(start, end)` with
+/// `start < end`; `None` when there is no non-degenerate selection.
+async fn read_first_selection(proxy: &TextProxy<'_>, len: usize) -> Option<(usize, usize)> {
+    if proxy.get_n_selections().await.ok()? <= 0 {
+        return None;
+    }
+    let (start, end) = proxy.get_selection(0).await.ok()?;
+    if start < 0 || end < 0 {
+        return None;
+    }
+    let start = (start as usize).min(len);
+    let end = (end as usize).min(len);
+    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    (lo != hi).then_some((lo, hi))
 }
 
 /// Performs an AccessKit action on an AT-SPI object: `Click` invokes the

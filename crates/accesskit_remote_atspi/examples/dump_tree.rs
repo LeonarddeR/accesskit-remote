@@ -31,12 +31,21 @@ fn main() {
         for (id, node) in update.nodes.iter() {
             let text = node.value().or_else(|| node.label());
             let clickable = node.supports_action(accesskit::Action::Click);
-            if text.is_some() || clickable {
+            let is_run = node.role() == accesskit::Role::TextRun;
+            let selection = node.text_selection().map(|s| {
+                (
+                    (s.anchor.node.0, s.anchor.character_index),
+                    (s.focus.node.0, s.focus.character_index),
+                )
+            });
+            if text.is_some() || clickable || is_run || selection.is_some() {
                 println!(
-                    "      node {} {:?} click={} {:?}",
+                    "      node {} {:?} click={} runs={} sel={:?} {:?}",
                     id.0,
                     node.role(),
                     clickable,
+                    node.children().len(),
+                    selection,
                     text,
                 );
             }
