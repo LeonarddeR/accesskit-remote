@@ -6,7 +6,9 @@
 
 mod demo;
 
-use accesskit_remote_server::{ServerConnection, ServerError, ServerEvent};
+use accesskit_remote_server::{
+    apply_source_event, ServerConnection, ServerError, ServerEvent, TreeSource,
+};
 use accesskit_remote_transport::Socket;
 use demo::DemoSource;
 use std::io::{self, Read, Write};
@@ -100,7 +102,7 @@ fn serve(stream: Socket) -> io::Result<()> {
 
 fn pump(
     server: &mut ServerConnection,
-    source: &mut DemoSource,
+    source: &mut dyn TreeSource,
     rx: &mpsc::Receiver<Vec<u8>>,
     writer: &mut Socket,
 ) -> io::Result<()> {
@@ -115,6 +117,10 @@ fn pump(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
+        if let Err(e) = drain_source(server, source) {
+            let _ = writer.write_all(&server.take_output());
+            return Err(io::Error::other(e));
+        }
         let out = server.take_output();
         if !out.is_empty() {
             writer.write_all(&out)?;
@@ -125,20 +131,32 @@ fn pump(
     }
 }
 
+/// Applies the source's buffered changes to the connection, but only once
+/// the session is established; events polled before that are dropped.
+fn drain_source(server: &mut ServerConnection, source: &mut dyn TreeSource) -> Result<(), ServerError> {
+    let events = source.poll_events();
+    if !server.is_established() {
+        return Ok(());
+    }
+    for event in events {
+        apply_source_event(server, event)?;
+    }
+    Ok(())
+}
+
 fn dispatch(
     server: &mut ServerConnection,
-    source: &mut DemoSource,
+    source: &mut dyn TreeSource,
     chunk: &[u8],
 ) -> Result<(), ServerError> {
     for event in server.handle_input(chunk)? {
         match event {
             ServerEvent::Established => {
-                server.sync_initial_state(source.initial_state(), source.focus())?;
+                let (windows, focus) = source.initial_state();
+                server.sync_initial_state(windows, focus)?;
             }
             ServerEvent::Action { window, request } => {
-                if let Some(update) = source.perform(window, &request) {
-                    server.send_tree_update(window, update)?;
-                }
+                source.perform(window, &request);
             }
             ServerEvent::Closed { reason } => {
                 eprintln!("accesskit_remoted: peer said goodbye: {reason}");
@@ -147,4 +165,88 @@ fn dispatch(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accesskit_remote::{
+        AppInfo, Message, PeerRole, Session, SessionConfig, SessionEvent, WindowId,
+    };
+    use accesskit_remote_server::{SourceEvent, WindowDescriptor};
+
+    struct StubSource {
+        events: Vec<SourceEvent>,
+    }
+
+    impl TreeSource for StubSource {
+        fn initial_state(
+            &mut self,
+        ) -> (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>) {
+            (Vec::new(), None)
+        }
+        fn perform(&mut self, _window: WindowId, _request: &accesskit::ActionRequest) {}
+        fn poll_events(&mut self) -> Vec<SourceEvent> {
+            std::mem::take(&mut self.events)
+        }
+    }
+
+    fn established_server() -> (ServerConnection, Session) {
+        let mut server = ServerConnection::new("test");
+        let mut consumer = Session::new(SessionConfig::new(PeerRole::Consumer, "consumer"));
+        consumer.handle_input(&server.take_output()).unwrap();
+        server.handle_input(&consumer.take_output()).unwrap();
+        assert!(server.is_established());
+        (server, consumer)
+    }
+
+    fn empty_tree() -> accesskit::TreeUpdate {
+        accesskit::TreeUpdate {
+            nodes: vec![(
+                accesskit::NodeId(0),
+                accesskit::Node::new(accesskit::Role::Window),
+            )],
+            tree: Some(accesskit::Tree::new(accesskit::NodeId(0))),
+            tree_id: accesskit::TreeId::ROOT,
+            focus: accesskit::NodeId(0),
+        }
+    }
+
+    #[test]
+    fn drain_forwards_events_when_established() {
+        let (mut server, mut consumer) = established_server();
+        let mut source = StubSource {
+            events: vec![SourceEvent::WindowAdded {
+                descriptor: WindowDescriptor {
+                    id: WindowId(1),
+                    title: "w".into(),
+                    app: AppInfo::default(),
+                },
+                tree: empty_tree(),
+            }],
+        };
+        drain_source(&mut server, &mut source).unwrap();
+        let events = consumer.handle_input(&server.take_output()).unwrap();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Message(Message::WindowAdded { .. }))));
+    }
+
+    #[test]
+    fn drain_drops_events_before_established() {
+        let mut server = ServerConnection::new("test");
+        let _ = server.take_output(); // discard the queued handshake hello
+        let mut source = StubSource {
+            events: vec![SourceEvent::FocusChanged(None)],
+        };
+        drain_source(&mut server, &mut source).unwrap();
+        assert!(
+            server.take_output().is_empty(),
+            "no session messages emitted before established"
+        );
+        assert!(
+            source.poll_events().is_empty(),
+            "buffered events were drained and dropped"
+        );
+    }
 }

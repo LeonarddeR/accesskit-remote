@@ -3,7 +3,7 @@
 //! (handshake, sync, live updates, actions) without an AT-SPI session.
 
 use accesskit_remote::{AppInfo, WindowId};
-use accesskit_remote_server::WindowDescriptor;
+use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 
 const WINDOW: WindowId = WindowId(1);
 const ROOT: accesskit::NodeId = accesskit::NodeId(0);
@@ -13,6 +13,7 @@ const BUTTON: accesskit::NodeId = accesskit::NodeId(2);
 pub struct DemoSource {
     clicks: u32,
     focused: accesskit::NodeId,
+    pending: Vec<SourceEvent>,
 }
 
 impl DemoSource {
@@ -20,59 +21,7 @@ impl DemoSource {
         Self {
             clicks: 0,
             focused: BUTTON,
-        }
-    }
-
-    pub fn initial_state(&self) -> Vec<(WindowDescriptor, accesskit::TreeUpdate)> {
-        let descriptor = WindowDescriptor {
-            id: WINDOW,
-            title: "AccessKit Remote Demo".into(),
-            app: AppInfo {
-                name: "accesskit_remoted".into(),
-                app_id: Some("dev.accesskit.RemoteDemo".into()),
-                pid: Some(std::process::id()),
-                toolkit: Some("accesskit_remoted demo".into()),
-                toolkit_version: None,
-            },
-        };
-        vec![(descriptor, self.full_tree())]
-    }
-
-    pub fn focus(&self) -> Option<WindowId> {
-        Some(WINDOW)
-    }
-
-    /// Applies an action and returns the resulting tree delta, if any.
-    pub fn perform(
-        &mut self,
-        window: WindowId,
-        request: &accesskit::ActionRequest,
-    ) -> Option<accesskit::TreeUpdate> {
-        if window != WINDOW {
-            return None;
-        }
-        match request.action {
-            accesskit::Action::Click if request.target_node == BUTTON => {
-                self.clicks += 1;
-                Some(accesskit::TreeUpdate {
-                    nodes: vec![(LABEL, self.label_node())],
-                    tree: None,
-                    tree_id: accesskit::TreeId::ROOT,
-                    focus: self.focused,
-                })
-            }
-            accesskit::Action::Focus
-                if [ROOT, LABEL, BUTTON].contains(&request.target_node) =>
-            {
-                self.focused = request.target_node;
-                Some(accesskit::TreeUpdate {
-                    nodes: Vec::new(),
-                    tree: None,
-                    tree_id: accesskit::TreeId::ROOT,
-                    focus: self.focused,
-                })
-            }
-            _ => None,
+            pending: Vec::new(),
         }
     }
 
@@ -99,43 +48,105 @@ impl DemoSource {
     }
 }
 
+impl TreeSource for DemoSource {
+    fn initial_state(
+        &mut self,
+    ) -> (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>) {
+        let descriptor = WindowDescriptor {
+            id: WINDOW,
+            title: "AccessKit Remote Demo".into(),
+            app: AppInfo {
+                name: "accesskit_remoted".into(),
+                app_id: Some("dev.accesskit.RemoteDemo".into()),
+                pid: Some(std::process::id()),
+                toolkit: Some("accesskit_remoted demo".into()),
+                toolkit_version: None,
+            },
+        };
+        (vec![(descriptor, self.full_tree())], Some(WINDOW))
+    }
+
+    fn perform(&mut self, window: WindowId, request: &accesskit::ActionRequest) {
+        if window != WINDOW {
+            return;
+        }
+        match request.action {
+            accesskit::Action::Click if request.target_node == BUTTON => {
+                self.clicks += 1;
+                self.pending.push(SourceEvent::TreeUpdate {
+                    window: WINDOW,
+                    update: accesskit::TreeUpdate {
+                        nodes: vec![(LABEL, self.label_node())],
+                        tree: None,
+                        tree_id: accesskit::TreeId::ROOT,
+                        focus: self.focused,
+                    },
+                });
+            }
+            accesskit::Action::Focus if [ROOT, LABEL, BUTTON].contains(&request.target_node) => {
+                self.focused = request.target_node;
+                self.pending.push(SourceEvent::TreeUpdate {
+                    window: WINDOW,
+                    update: accesskit::TreeUpdate {
+                        nodes: Vec::new(),
+                        tree: None,
+                        tree_id: accesskit::TreeId::ROOT,
+                        focus: self.focused,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn poll_events(&mut self) -> Vec<SourceEvent> {
+        std::mem::take(&mut self.pending)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn click_button() -> accesskit::ActionRequest {
+        accesskit::ActionRequest {
+            action: accesskit::Action::Click,
+            target_tree: accesskit::TreeId::ROOT,
+            target_node: BUTTON,
+            data: None,
+        }
+    }
+
     #[test]
-    fn click_updates_label() {
+    fn click_buffers_label_delta() {
         let mut source = DemoSource::new();
-        let update = source
-            .perform(
-                WINDOW,
-                &accesskit::ActionRequest {
-                    action: accesskit::Action::Click,
-                    target_tree: accesskit::TreeId::ROOT,
-                    target_node: BUTTON,
-                    data: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(update.nodes.len(), 1);
-        let (id, node) = &update.nodes[0];
-        assert_eq!(*id, LABEL);
-        assert_eq!(node.value().unwrap(), "Button clicked 1 times");
+        source.perform(WINDOW, &click_button());
+        let events = source.poll_events();
+        match &events[..] {
+            [SourceEvent::TreeUpdate { window, update }] => {
+                assert_eq!(*window, WINDOW);
+                assert_eq!(update.nodes.len(), 1);
+                let (id, node) = &update.nodes[0];
+                assert_eq!(*id, LABEL);
+                assert_eq!(node.value().unwrap(), "Button clicked 1 times");
+            }
+            other => panic!("unexpected events: {other:?}"),
+        }
+        assert!(source.poll_events().is_empty(), "events drain only once");
     }
 
     #[test]
     fn ignores_unknown_targets() {
         let mut source = DemoSource::new();
-        assert!(source
-            .perform(
-                WindowId(99),
-                &accesskit::ActionRequest {
-                    action: accesskit::Action::Click,
-                    target_tree: accesskit::TreeId::ROOT,
-                    target_node: BUTTON,
-                    data: None,
-                },
-            )
-            .is_none());
+        source.perform(WindowId(99), &click_button());
+        assert!(source.poll_events().is_empty());
+    }
+
+    #[test]
+    fn initial_state_reports_focus() {
+        let mut source = DemoSource::new();
+        let (windows, focus) = source.initial_state();
+        assert_eq!(focus, Some(WINDOW));
+        assert_eq!(windows.len(), 1);
     }
 }
