@@ -51,7 +51,9 @@ for the build-up.
   by frame path) re-walk the affected window. Verified: clicking
   gnome-text-editor's New Tab first yields the stale 83-node re-walk, then a
   children-changed re-walk grows the tree to 107 (`passive_reflect` example).
-  Commit 66e0a0e.
+  The milestone verified only the *static* initial tree over the wire, so a
+  live GTK change reaching the Windows UIA tree end to end is composed from
+  proven seams but not yet run as one. Commit 66e0a0e.
 - `AppInfo` carries pid + toolkit: `discover_windows` reads toolkit
   name/version off the Application interface and pid via the a11y bus
   `GetConnectionUnixProcessID`. Verified live: gnome-text-editor → pid set,

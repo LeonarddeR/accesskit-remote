@@ -266,10 +266,14 @@ impl Mirror {
                     .collect()
             }
             Event::Window(WindowEvents::Activate(_) | WindowEvents::Deactivate(_)) => {
+                let sender = event.sender();
                 let path = event.path();
                 self.windows
                     .iter()
-                    .filter(|w| w.root.path_as_str() == path.as_str())
+                    .filter(|w| {
+                        w.root.path_as_str() == path.as_str()
+                            && w.root.name().is_some_and(|n| n.as_str() == sender.as_str())
+                    })
                     .map(|w| w.id)
                     .collect()
             }
