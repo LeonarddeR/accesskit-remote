@@ -40,50 +40,63 @@ for the build-up.
   / ProgressIndicator / ScrollView; Click only on the 7 real buttons).
   Deps `atspi 0.30` / `zbus 5.18` / `tokio`, gated to `cfg(linux)` so the
   crate is empty on Windows. Commit 9777500.
+- `accesskit_remoted --atspi` serves the live mirror: a Linux-only `--atspi`
+  flag swaps `DemoSource` for `AtspiSource`; on non-Linux it errors and
+  compiles out. Commit fdc6879.
+- Passive event reflection: the bridge `select!`s over the action channel and
+  a live AT-SPI event stream running on a *dedicated* connection (sharing one
+  with method calls deadlocks — a full event broadcast stalls that
+  connection's socket reader and starves in-flight replies). `children-changed`
+  (matched to a window by app sender) and window activate/deactivate (matched
+  by frame path) re-walk the affected window. Verified: clicking
+  gnome-text-editor's New Tab first yields the stale 83-node re-walk, then a
+  children-changed re-walk grows the tree to 107 (`passive_reflect` example).
+  Commit 66e0a0e.
+- `AppInfo` carries pid + toolkit: `discover_windows` reads toolkit
+  name/version off the Application interface and pid via the a11y bus
+  `GetConnectionUnixProcessID`. Verified live: gnome-text-editor → pid set,
+  toolkit GTK 4.18.6. Commit cf0c413.
+- **MILESTONE — a GTK app's tree is visible from Windows via UIA.** Full stack
+  proven live: gnome-text-editor (GTK/AT-SPI, WSL) → `AtspiSource` →
+  `accesskit_remoted --atspi --vsock 4750` → hvsocket → Windows `viewer` →
+  `RemoteWindowBinding` UIA host. A Windows PowerShell 5.1
+  System.Windows.Automation client read the viewer window: FrameworkId
+  'AccessKit'; the 7 Buttons (Open, New Tab, Document Properties, Main Menu,
+  Close) and the text Edit, matching the tree the TCP `probe` saw. Needed a
+  viewer fix: on hvsocket a receive timeout surfaces as `ConnectionAborted`
+  (not `WouldBlock`/`TimedOut`) while the connection stays usable, so retry it
+  on hvsocket only — otherwise the first idle read drops the connection.
+  Commit 18542fd.
 
-## In flight
+## Remaining
 
-1. `accesskit_remote_atspi` v0 is built and smoke-tested (above).
-   Remaining for the mirror:
-   - **Passive event reflection** (not wired yet). Today updates are
-     action-driven only: `perform` → re-walk that window → emit
-     `TreeUpdate`. The action round trip is verified live (do_action(0)
-     returned true, TreeUpdate came back), but the immediate re-walk
-     **races the toolkit's async UI update** — clicking "New Tab" emitted
-     an unchanged 83-node tree because GTK had not created the new
-     accessibles yet. Subscribe to atspi `event_stream()` and re-walk
-     affected windows on focus / window-lifecycle / `children-changed`;
-     that both closes the race and reflects app-driven changes.
-     Consistency discipline per Orca (events are hints; re-query before
-     believing; re-walk on structural events; ~60s reconciliation) lands
-     with this. See `P:\a11y\orca`.
-   - **Window lifecycle**: emit `WindowAdded`/`WindowRemoved` as apps open
-     and close toplevels (v0 enumerates once at connect).
-   - App identity: `pid`/`toolkit` on `AppInfo` (v0 sets `name` only).
-   - Cleanups: `MAX_NODES_PER_WINDOW` breaking mid-walk leaves parents
-     whose `children` reference unwalked paths, so `build_window_update`
-     allocates ids for nodes that never appear → a malformed `TreeUpdate`
-     (latent; >5000 nodes). Guard by dropping child refs to paths not in
-     the walked set. Also drop atspi's `p2p` default feature to silence
-     the harmless `Failed to create peer … Invalid address string`
-     warning (bus routing works regardless).
-2. **Wire `AtspiSource` into `accesskit_remoted`** — the daemon still
-   hardcodes `DemoSource`. Add a `cfg(linux)` dep on
-   `accesskit_remote_atspi` and a flag (e.g. `--atspi`) that constructs
-   `AtspiSource::new()?` instead of `DemoSource`. `pump`/`drain_source`
-   already run over `&mut dyn TreeSource`, so this is construction + arg
-   parsing only.
-3. Test recipe for the milestone (GTK app tree visible from Windows;
-   needs step 2 first):
-   - WSL: `CARGO_TARGET_DIR=~/target-accesskit-remote cargo build` (drvfs
-     is slow; keep target dir native), run
-     `accesskit_remoted --vsock 4750`, launch
-     `GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1 gnome-text-editor`
-     (without cairo renderer the GTK4 window may never map under WSLg).
-   - Windows: `viewer --hvsocket <vm-id> 4750`; VM ID from msrdc cmdline
-     `/v:` (only while a WSLg app runs) or `sudo hcsdiag list` row whose
-     owner column is `WSL` (do NOT take the first GUID). Then UIA-inspect
-     the viewer window.
+1. **Window lifecycle** (mirror): emit `WindowAdded`/`WindowRemoved` as apps
+   open/close toplevels (v0 enumerates once at connect). Plan: reconcile on
+   window Create/Destroy events — re-run `discover_windows`, diff against
+   tracked windows by `ObjectRef` identity, emit Added/Removed. Reuses
+   discover's app-info + Showing+Visible filter, so a not-yet-ready window is
+   skipped rather than emitted broken. Residual race (a window that never
+   re-signals after becoming visible) is what Orca's ~60s reconciliation is
+   for; a periodic reconcile is future work. See `P:\a11y\orca`.
+2. **Node-level focus**: deferred from passive events to avoid a
+   `state-changed` re-walk storm; today only window activate/deactivate
+   re-walks the frame. The action's immediate re-walk still covers state-only
+   results, so it stays even though passive re-walks now cover structure.
+3. **Coalesce children-changed bursts**: New Tab fires ~28 full re-walks in 8s
+   before settling. Full-tree re-walks are convergent, so this is a cost, not
+   a correctness, issue; debounce is a future optimization.
+4. **`probe` example** has the same latent hvsocket receive-timeout bug the
+   `viewer` had (fixed in 18542fd); apply the same `ConnectionAborted`-retry
+   if probe is ever driven over hvsocket.
+
+## Notes / corrections
+
+- The `Failed to create peer … Invalid address string` warning is NOT fixable
+  from our Cargo.toml: `atspi`'s `connection` feature pulls `atspi-connection`
+  with *its* default features (which include `p2p`) regardless of atspi's own
+  `p2p` feature, and it has no `default-features = false`. The warning is a
+  debug-only `eprintln` in `atspi-connection`, silently ignored in release
+  builds. Left as is (the doc's "drop p2p" plan was moot).
 
 ## After that
 
@@ -128,3 +141,21 @@ for the build-up.
   org.a11y.Status IsEnabled b true` before launching the app. Then
   `GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1 setsid gnome-text-editor &`,
   sleep ~7s, run `dump_tree`.
+- Never `pkill -f gnome-text-editor` (or `-f accesskit_remoted`) from a
+  `bash -lc '<script>'` whose text contains that string: `-f` matches the
+  script's own bash cmdline and SIGTERMs it (exit 15). Kill by pid, or guard
+  with `me=$$; [ "$p" != "$me" ]`. `pgrep -a NAME` also fails for names >15
+  chars — use `pgrep -af`.
+- `wsl -e bash -lc '<script>'` exits 15 in this harness even on success; check
+  the actual output, not the exit code.
+- Cross-machine milestone recipe (proven): on WSL, enable a11y, then launch
+  the app and daemon *detached* so they outlive the launching command —
+  `... setsid gnome-text-editor >/tmp/gte.log 2>&1 </dev/null &`, sleep ~9s,
+  `setsid accesskit_remoted --atspi --vsock 4750 >/tmp/daemon.log 2>&1
+  </dev/null &`. On Windows: VM ID from `Get-CimInstance Win32_Process
+  -Filter "Name='msrdc.exe'"` `/v:` (single msrdc while a WSLg app runs — no
+  GUID ambiguity), run `viewer --hvsocket <vm-id> 4750` in the background,
+  then UIA-inspect via **powershell.exe** (Windows PowerShell 5.1,
+  `System.Windows.Automation`): find the RootElement child whose FrameworkId
+  is 'AccessKit'. The AccessKit UIA provider collapses filtered/generic nodes,
+  so the 83-node AT-SPI tree shows as ~13 UIA descendants (the real controls).
