@@ -30,6 +30,27 @@ const WINDOW: WindowId = WindowId(1);
 const ROOT: accesskit::NodeId = accesskit::NodeId(0);
 const LABEL: accesskit::NodeId = accesskit::NodeId(1);
 const BUTTON: accesskit::NodeId = accesskit::NodeId(2);
+const DOC: accesskit::NodeId = accesskit::NodeId(3);
+const RUN0: accesskit::NodeId = accesskit::NodeId(4);
+const RUN1: accesskit::NodeId = accesskit::NodeId(5);
+
+/// Builds a Role::TextRun node with per-code-point character lengths.
+fn run(value: &str) -> accesskit::Node {
+    let mut node = accesskit::Node::new(accesskit::Role::TextRun);
+    node.set_value(value.to_owned());
+    node.set_character_lengths(value.chars().map(|c| c.len_utf8() as u8).collect::<Vec<u8>>());
+    node
+}
+
+/// The document container with a caret at (`caret_run`, `caret_index`). The
+/// selection references run nodes that need not be present in the same update.
+fn doc_node(caret_run: accesskit::NodeId, caret_index: usize) -> accesskit::Node {
+    let mut doc = accesskit::Node::new(accesskit::Role::MultilineTextInput);
+    doc.set_children(vec![RUN0, RUN1]);
+    let pos = accesskit::TextPosition { node: caret_run, character_index: caret_index };
+    doc.set_text_selection(accesskit::TextSelection { anchor: pos, focus: pos });
+    doc
+}
 
 /// In-process provider: the demo tree plus click handling.
 struct Provider {
@@ -52,13 +73,20 @@ impl Provider {
     fn full_tree(&self) -> accesskit::TreeUpdate {
         let mut root = accesskit::Node::new(accesskit::Role::Window);
         root.set_label("AccessKit Visible Demo");
-        root.set_children(vec![LABEL, BUTTON]);
+        root.set_children(vec![LABEL, BUTTON, DOC]);
         let mut button = accesskit::Node::new(accesskit::Role::Button);
         button.set_label("Click me");
         button.add_action(accesskit::Action::Click);
         button.add_action(accesskit::Action::Focus);
         accesskit::TreeUpdate {
-            nodes: vec![(ROOT, root), (LABEL, self.label_node()), (BUTTON, button)],
+            nodes: vec![
+                (ROOT, root),
+                (LABEL, self.label_node()),
+                (BUTTON, button),
+                (DOC, doc_node(RUN0, 0)),
+                (RUN0, run("Hello\n")),
+                (RUN1, run("World")),
+            ],
             tree: Some(accesskit::Tree::new(ROOT)),
             tree_id: accesskit::TreeId::ROOT,
             focus: BUTTON,
@@ -90,6 +118,18 @@ impl Provider {
                     focus: BUTTON,
                 };
                 self.server.send_tree_update(WINDOW, update).expect("send_tree_update");
+                // A caret-only, container-only delta: only DOC is present, and
+                // its selection references RUN0/RUN1, which are not in the
+                // update. Alternate the caret start↔end.
+                let (caret_run, caret_index) =
+                    if self.clicks % 2 == 1 { (RUN1, 5) } else { (RUN0, 0) };
+                let caret = accesskit::TreeUpdate {
+                    nodes: vec![(DOC, doc_node(caret_run, caret_index))],
+                    tree: None,
+                    tree_id: accesskit::TreeId::ROOT,
+                    focus: BUTTON,
+                };
+                self.server.send_tree_update(WINDOW, caret).expect("send_tree_update caret");
             }
             // A focus-only delta: no nodes, just the new focus. Exercises the
             // path node focus forwarding relies on.
