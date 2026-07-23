@@ -45,7 +45,7 @@ mod viewer {
 
     pub fn run() -> std::io::Result<()> {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let mut stream = connect(&args)?;
+        let (stream, hvsocket) = connect(&args)?;
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
 
         let client: SharedClient = Arc::new(Mutex::new(ClientConnection::new("viewer")));
@@ -53,17 +53,21 @@ mod viewer {
         let ui_thread = unsafe { GetCurrentThreadId() };
 
         let pump_client = client.clone();
-        std::thread::spawn(move || pump(stream, pump_client, action_rx, ui_thread));
+        std::thread::spawn(move || pump(stream, pump_client, action_rx, ui_thread, hvsocket));
 
         run_message_loop(client, action_tx);
         Ok(())
     }
 
-    fn connect(args: &[String]) -> std::io::Result<accesskit_remote_transport::Socket> {
+    /// Connects and reports whether the transport is hvsocket, whose read
+    /// timeout surfaces as `ConnectionAborted` rather than
+    /// `WouldBlock`/`TimedOut`.
+    fn connect(args: &[String]) -> std::io::Result<(accesskit_remote_transport::Socket, bool)> {
         match args.first().map(String::as_str) {
             Some("--tcp") | None => {
                 let port: u16 = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(4750);
-                accesskit_remote_transport::tcp::connect_local(port).map(Into::into)
+                let socket = accesskit_remote_transport::tcp::connect_local(port)?;
+                Ok((socket.into(), false))
             }
             Some("--hvsocket") => {
                 let vm_id = args
@@ -72,10 +76,19 @@ mod viewer {
                     .parse::<uuid::Uuid>()
                     .expect("invalid VM ID");
                 let port: u32 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(4750);
-                accesskit_remote_transport::hvsocket::connect(vm_id, port)
+                Ok((accesskit_remote_transport::hvsocket::connect(vm_id, port)?, true))
             }
             Some(other) => Err(std::io::Error::other(format!("unknown mode: {other}"))),
         }
+    }
+
+    /// Whether a read error is a timeout to retry rather than a dead
+    /// connection. hvsocket surfaces receive timeouts as `ConnectionAborted`.
+    fn is_retryable_read(err: &std::io::Error, hvsocket: bool) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) || (hvsocket && err.kind() == std::io::ErrorKind::ConnectionAborted)
     }
 
     fn pump(
@@ -83,6 +96,7 @@ mod viewer {
         client: SharedClient,
         actions: mpsc::Receiver<OutgoingAction>,
         ui_thread: u32,
+        hvsocket: bool,
     ) {
         let post = |message: u32, wparam: usize, lparam: isize| unsafe {
             let _ = PostThreadMessageW(ui_thread, message, WPARAM(wparam), LPARAM(lparam));
@@ -109,12 +123,7 @@ mod viewer {
                         break;
                     }
                 },
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    continue;
-                }
+                Err(e) if is_retryable_read(&e, hvsocket) => continue,
                 Err(_) => break,
             };
             for event in events {
