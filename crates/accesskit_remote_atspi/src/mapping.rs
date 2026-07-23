@@ -103,6 +103,28 @@ pub fn node_flags(states: StateSet) -> (bool, bool) {
     (states.contains(State::Focusable), states.contains(State::Focused))
 }
 
+/// Whether a role is one whose default action a consumer should expose as
+/// Click. GTK exposes the AT-SPI Action interface on many containers, so the
+/// interface alone is too broad; this narrows it to conventionally clickable
+/// roles.
+fn is_clickable_role(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Button
+            | Role::ToggleButton
+            | Role::CheckBox
+            | Role::CheckMenuItem
+            | Role::RadioButton
+            | Role::RadioMenuItem
+            | Role::MenuItem
+            | Role::Menu
+            | Role::PageTab
+            | Role::Link
+            | Role::ListItem
+            | Role::TreeItem
+    )
+}
+
 /// Builds a full-tree [`TreeUpdate`] for one window. `nodes[0]` is the window
 /// root; focus lands on the node marked focused, or the root if none is.
 ///
@@ -140,7 +162,7 @@ fn build_node(node: &MirrorNode, ids: &mut NodeIdMap) -> Node {
     if !children.is_empty() {
         out.set_children(children);
     }
-    if node.actionable {
+    if node.actionable && is_clickable_role(node.role) {
         out.add_action(accesskit::Action::Click);
     }
     if node.focusable {
@@ -211,6 +233,24 @@ mod tests {
             .unwrap();
         assert!(button_node.supports_action(accesskit::Action::Click));
         assert!(button_node.supports_action(accesskit::Action::Focus));
+    }
+
+    #[test]
+    fn click_is_gated_to_clickable_roles() {
+        let mut panel = leaf("/panel", Role::Panel, "");
+        panel.actionable = true;
+        let mut button = leaf("/button", Role::Button, "Go");
+        button.actionable = true;
+
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[panel, button], &mut ids);
+        let panel_node = &update.nodes[0].1;
+        let button_node = &update.nodes[1].1;
+        assert!(
+            !panel_node.supports_action(accesskit::Action::Click),
+            "a container that merely implements the Action interface is not clickable"
+        );
+        assert!(button_node.supports_action(accesskit::Action::Click));
     }
 
     #[test]
