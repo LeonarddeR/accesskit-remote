@@ -131,6 +131,35 @@ for the build-up.
     weston rdprail-shell, independent of it.) Commits ba4c457 (Spike 2d),
     0963a4b (scaffolding), 6c7ab5c (chain-load).
 
+- **MILESTONE — full RAIL E2E: a GTK app's live tree on its real RAIL window,
+  read and driven via UIA, all from inside msrdc.** The DVC plugin now runs the
+  whole consumer stack: `Connected` starts a per-RDP-connection `Session` —
+  hvsocket pump (VM id parsed fresh from `/v:`, port 4750 or
+  `ACCESSKIT_DVC_PORT`, viewer-style loop with `ConnectionAborted` retry and
+  connect-retry until the daemon is up) plus a RAIL hook thread. The hook is a
+  process-wide **in-context** `SetWinEventHook` (CREATE..NAMECHANGE, own pid);
+  its proc runs synchronously on the emitting window's owning thread —
+  **empirically confirmed** (log: owning thread == current thread) — where it
+  matches unattached `RAIL_WINDOW`s against the remote window registry
+  (normalized title; distro from Lxss registry for the anchored suffix strip;
+  `WslgServerWindowId` logged) and installs the new **visible-window adapter**
+  right there. That adapter (`accesskit_remote_windows::install_visible_adapter`)
+  hosts the lower-level `accesskit_windows::Adapter` under a manual subclass —
+  no visibility precondition, so attaching to the already-visible RAIL HWND
+  works (the `SubclassingAdapter` panic is bypassed, not patched). Tree deltas
+  cross threads via a registered window message (`post_delta` boxes the update;
+  the subclass wndproc applies + raises on the owning thread); UIA actions flow
+  back through the mpsc channel → pump → `request_action`. **Verified live**:
+  UIA client on the real `RAIL_WINDOW` (FrameworkId 'AccessKit') read
+  gnome-text-editor's tree (13 UIA descendants of the 83-node AT-SPI tree, all
+  7 buttons + Edit), InvokePattern'd **New Tab** → GTK opened a tab → tree grew
+  to 106 nodes → deltas posted back → UIA re-read 22 descendants. Also verified
+  env-independent: the `visible_demo` example attaches AFTER showing a plain
+  window, UIA reads it, clicks round-trip (label 0→1→3). Unit tests cover title
+  normalization, association matching, and `/v:` parsing (25 tests total in the
+  plugin + windows crates). Commits 0bce2b3 (pump), step-3/4 commits
+  (visible adapter, rail hook), plus docs.
+
 ## Remaining
 
 1. **Periodic reconcile** (mirror): window add/remove now reconciles on
@@ -160,30 +189,27 @@ for the build-up.
   debug-only `eprintln` in `atspi-connection`, silently ignored in release
   builds. Left as is (the doc's "drop p2p" plan was moot).
 
-## After that — DVC plugin, remaining (scaffolding + live load done above)
+## After that — DVC plugin follow-ups (full E2E done above)
 
-1. **hvsocket transport in the plugin**: wire `accesskit_remote_client`'s
-   `ClientConnection` into the plugin — parse the WSL VM ID from our own process
-   command line (`/v:<guid>`), `hvsocket::connect`, and pump
-   `handle_input`/`take_output` on a dedicated thread, mirroring the `viewer`
-   example (incl. the `ConnectionAborted`-retry). The DVC channel stays
-   vestigial; tree data flows out-of-band over hvsocket. The `client`/`windows`
-   deps are already declared for this.
-2. **UIA on RAIL HWNDs**: reuse `RemoteWindowBinding`, but `SubclassingAdapter`
-   panics on already-visible windows and RAIL HWNDs are visible when the plugin
-   sees them. Either attach pre-show via an in-context WinEvent hook
-   (`EVENT_OBJECT_CREATE`/`SHOW`, own PID) or build a parallel binding on the
-   lower-level `accesskit_windows::Adapter` with a manual `WM_GETOBJECT` subclass
-   (no visibility precondition). Spike 1b: msrdc exposes no server-side UIA on
-   RAIL windows, so anything we add is pure addition.
-3. **Window association**: match each GTK toplevel to its RAIL HWND via the
-   `WslgServerWindowId` HWND property + normalized titles (strip
-   `[WARN:COPY MODE] ` prefix and ` (<distro>)` suffix, which equals the AT-SPI
-   frame name for GTK apps).
-
-Also re-confirm a `RAIL_WINDOW` actually maps in a healthy WSLg session — this
-session's GTK app never presented a surface even in default WSLg (see the
-milestone caveat above), so the RAIL-HWND work needs a boot where windows map.
+1. **Idle-window attach gap**: the hook attaches on the first in-range event
+   from an unattached RAIL window, but an idle window emits none — in the live
+   run the attach only fired after a minimize/restore nudge (event 0x8002).
+   Fix ideas: when the pump learns a new remote window, trigger events on
+   candidate RAIL HWNDs (e.g. a harmless `SetWindowPos` frame-change from the
+   hook thread), or sweep `EnumThreadWindows` from the hook proc on every event,
+   or widen the hook range. Until then, first focus/interaction attaches.
+2. **`app_id` is None from `AtspiSource`** (`remote window added … app=None`):
+   the mirror fills pid/toolkit but not the desktop-file id, so association
+   disambiguation-by-app-id never engages; same-title windows across apps stay
+   unmatched. Plumb the app id through `AppInfo` on the Linux side.
+3. **Window focus → UIA**: `ClientEvent::FocusChanged` is logged but not yet
+   forwarded to bound adapters (`update_window_focus_state` runs only off the
+   window's own WM_SETFOCUS/KILLFOCUS). Wire remote focus into the adapter for
+   correct focus tracking across RAIL windows.
+4. **Registration UX**: production install still manual (HKLM
+   `OptionalAddIns\WSLDVC_PRIVATE` + `.wslgconfig`); consider a small installer
+   or DllInstall-style helper later. The debug DLL is currently registered on
+   this machine — remove the HKLM key + `%USERPROFILE%\.wslgconfig` to disable.
 
 ## Workflow notes
 
