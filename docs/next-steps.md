@@ -47,14 +47,26 @@ for the build-up.
    Remaining for the mirror:
    - **Passive event reflection** (not wired yet). Today updates are
      action-driven only: `perform` → re-walk that window → emit
-     `TreeUpdate`. Next: subscribe to atspi `event_stream()` and re-walk
-     affected windows on focus / window-lifecycle / `children-changed`.
+     `TreeUpdate`. The action round trip is verified live (do_action(0)
+     returned true, TreeUpdate came back), but the immediate re-walk
+     **races the toolkit's async UI update** — clicking "New Tab" emitted
+     an unchanged 83-node tree because GTK had not created the new
+     accessibles yet. Subscribe to atspi `event_stream()` and re-walk
+     affected windows on focus / window-lifecycle / `children-changed`;
+     that both closes the race and reflects app-driven changes.
      Consistency discipline per Orca (events are hints; re-query before
      believing; re-walk on structural events; ~60s reconciliation) lands
      with this. See `P:\a11y\orca`.
    - **Window lifecycle**: emit `WindowAdded`/`WindowRemoved` as apps open
      and close toplevels (v0 enumerates once at connect).
    - App identity: `pid`/`toolkit` on `AppInfo` (v0 sets `name` only).
+   - Cleanups: `MAX_NODES_PER_WINDOW` breaking mid-walk leaves parents
+     whose `children` reference unwalked paths, so `build_window_update`
+     allocates ids for nodes that never appear → a malformed `TreeUpdate`
+     (latent; >5000 nodes). Guard by dropping child refs to paths not in
+     the walked set. Also drop atspi's `p2p` default feature to silence
+     the harmless `Failed to create peer … Invalid address string`
+     warning (bus routing works regardless).
 2. **Wire `AtspiSource` into `accesskit_remoted`** — the daemon still
    hardcodes `DemoSource`. Add a `cfg(linux)` dep on
    `accesskit_remote_atspi` and a flag (e.g. `--atspi`) that constructs
