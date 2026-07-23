@@ -1,0 +1,294 @@
+// Shared helpers for integration tests: the fake DVC framework objects and a
+// libloading-based loader that drives the real DLL through its
+// `VirtualChannelGetInstance` export.
+
+#![allow(dead_code)]
+
+use std::path::PathBuf;
+
+/// Resolve the path to the built `accesskit_remote_dvc_plugin.dll`.
+///
+/// Resolution order:
+/// 1. `ACCESSKIT_DVC_DLL_PATH` env var, if set.
+/// 2. `CARGO_TARGET_DIR` (or `<manifest>/target`) joined with target triple + profile.
+///
+/// `cargo test` does NOT build the cdylib for these integration tests
+/// (libloading uses it at runtime, no link dependency exists). Run
+/// `cargo build --target x86_64-pc-windows-msvc` before
+/// `cargo test --target x86_64-pc-windows-msvc`.
+pub fn dll_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("ACCESSKIT_DVC_DLL_PATH") {
+        return PathBuf::from(p);
+    }
+
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join("target"));
+
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
+    const DLL: &str = "accesskit_remote_dvc_plugin.dll";
+
+    let triple_path =
+        target_dir.join("x86_64-pc-windows-msvc").join(profile).join(DLL);
+    if triple_path.is_file() {
+        return triple_path;
+    }
+
+    // Fallback: default (host-arch) path.
+    let default_path = target_dir.join(profile).join(DLL);
+    if default_path.is_file() {
+        return default_path;
+    }
+
+    // Give up gracefully — return the most likely path so the eventual
+    // `Library::new` error is informative.
+    triple_path
+}
+
+use parking_lot::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use windows::Win32::System::RemoteDesktop::IWTSVirtualChannel;
+use windows::core::implement;
+
+/// Shared state exposed to the test for assertion after plugin calls.
+#[derive(Default)]
+pub struct FakeChannelState {
+    pub writes: Mutex<Vec<Vec<u8>>>,
+    pub closed: AtomicBool,
+}
+
+impl FakeChannelState {
+    pub fn snapshot_writes(&self) -> Vec<Vec<u8>> {
+        self.writes.lock().clone()
+    }
+
+    pub fn flat_writes(&self) -> Vec<u8> {
+        self.writes.lock().iter().flatten().copied().collect()
+    }
+}
+
+/// Fake `IWTSVirtualChannel` that captures every `Write` payload and
+/// records `Close` — no real RDS session involved.
+#[implement(IWTSVirtualChannel)]
+pub struct FakeVirtualChannel {
+    pub state: Arc<FakeChannelState>,
+}
+
+impl FakeVirtualChannel {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> (IWTSVirtualChannel, Arc<FakeChannelState>) {
+        let state = Arc::new(FakeChannelState::default());
+        let iface: IWTSVirtualChannel = FakeVirtualChannel { state: state.clone() }.into();
+        (iface, state)
+    }
+}
+
+impl windows::Win32::System::RemoteDesktop::IWTSVirtualChannel_Impl for FakeVirtualChannel_Impl {
+    fn Write(
+        &self,
+        cbsize: u32,
+        pbuffer: *const u8,
+        _preserved: windows_core::Ref<windows_core::IUnknown>,
+    ) -> windows_core::Result<()> {
+        let buf = unsafe { std::slice::from_raw_parts(pbuffer, cbsize as usize) }.to_vec();
+        self.state.writes.lock().push(buf);
+        Ok(())
+    }
+
+    fn Close(&self) -> windows_core::Result<()> {
+        self.state.closed.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+use windows::Win32::System::RemoteDesktop::{
+    IWTSListener, IWTSListenerCallback, IWTSVirtualChannelManager,
+};
+
+/// Stub listener — the plugin never calls `GetConfiguration` in our tests,
+/// but the interface requires an impl.
+#[implement(IWTSListener)]
+pub struct FakeListener;
+
+impl windows::Win32::System::RemoteDesktop::IWTSListener_Impl for FakeListener_Impl {
+    fn GetConfiguration(
+        &self,
+    ) -> windows_core::Result<windows::Win32::System::Com::StructuredStorage::IPropertyBag> {
+        Err(windows_core::Error::from_hresult(windows::Win32::Foundation::E_NOTIMPL))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum MgrEvent {
+    CreateListener { name: String },
+}
+
+#[derive(Default)]
+pub struct FakeMgrState {
+    pub events: Mutex<Vec<MgrEvent>>,
+    pub listeners: Mutex<Vec<(String, IWTSListenerCallback)>>,
+}
+
+/// Fake `IWTSVirtualChannelManager` that records `CreateListener` calls so
+/// tests can later retrieve the callbacks and drive `OnNewChannelConnection`.
+#[implement(IWTSVirtualChannelManager)]
+pub struct FakeChannelMgr {
+    pub state: Arc<FakeMgrState>,
+}
+
+impl FakeChannelMgr {
+    #[allow(clippy::new_ret_no_self, clippy::arc_with_non_send_sync)]
+    pub fn new() -> (IWTSVirtualChannelManager, Arc<FakeMgrState>) {
+        let state = Arc::new(FakeMgrState::default());
+        let iface: IWTSVirtualChannelManager = FakeChannelMgr { state: state.clone() }.into();
+        (iface, state)
+    }
+}
+
+impl windows::Win32::System::RemoteDesktop::IWTSVirtualChannelManager_Impl for FakeChannelMgr_Impl {
+    fn CreateListener(
+        &self,
+        pszchannelname: &windows_core::PCSTR,
+        _uflags: u32,
+        plistenercallback: windows_core::Ref<IWTSListenerCallback>,
+    ) -> windows_core::Result<IWTSListener> {
+        let name = unsafe { pszchannelname.to_string() }.map_err(|_| {
+            windows_core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED)
+        })?;
+        let cb = plistenercallback
+            .as_ref()
+            .ok_or_else(|| {
+                windows_core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED)
+            })?
+            .clone();
+
+        self.state.events.lock().push(MgrEvent::CreateListener { name: name.clone() });
+        self.state.listeners.lock().push((name, cb));
+
+        Ok(FakeListener.into())
+    }
+}
+
+use libloading::Library;
+use windows::Win32::System::RemoteDesktop::IWTSPlugin;
+use windows::core::{GUID, HRESULT, Interface};
+
+/// Signature of the DLL's `VirtualChannelGetInstance` export.
+pub type VirtualChannelGetInstanceFn = unsafe extern "system" fn(
+    refiid: *const GUID,
+    pnumobjs: *mut u32,
+    ppo: *mut *mut core::ffi::c_void,
+) -> HRESULT;
+
+/// Owns the loaded `accesskit_remote_dvc_plugin.dll`. Loaded exactly once per
+/// test process via a `OnceLock`; `Library` and `Symbol` outlive the process.
+pub struct DllHandle {
+    pub get_instance: libloading::Symbol<'static, VirtualChannelGetInstanceFn>,
+    // Keep alive to prevent unload; `DllMain(DLL_PROCESS_DETACH)` racing
+    // with tracing-subscriber TLS teardown would otherwise abort the
+    // test process.
+    _lib: &'static Library,
+}
+
+// SAFETY: libloading::Symbol is !Send by default but the underlying function
+// pointer is fine to call from any thread; we never re-bind the Library and
+// process-exit cleanup is the only release path.
+unsafe impl Send for DllHandle {}
+unsafe impl Sync for DllHandle {}
+
+impl DllHandle {
+    /// Returns a process-global handle to the loaded DLL. First call loads
+    /// the DLL; subsequent calls return the same reference. This guarantees
+    /// `DllMain(DLL_PROCESS_ATTACH)` runs exactly once (so
+    /// `tracing_subscriber::fmt().init()` doesn't panic on re-init) and
+    /// avoids per-test handle leaks.
+    pub fn load() -> &'static DllHandle {
+        static HANDLE: std::sync::OnceLock<DllHandle> = std::sync::OnceLock::new();
+        HANDLE.get_or_init(|| {
+            let path = dll_path();
+            let lib = unsafe { Library::new(&path) }
+                .unwrap_or_else(|e| panic!("LoadLibrary {path:?} failed: {e}"));
+            let lib: &'static Library = Box::leak(Box::new(lib));
+            let get_instance: libloading::Symbol<'static, VirtualChannelGetInstanceFn> =
+                unsafe { lib.get(b"VirtualChannelGetInstance\0") }
+                    .expect("VirtualChannelGetInstance export missing");
+            DllHandle { get_instance, _lib: lib }
+        })
+    }
+
+    /// Access the underlying `libloading::Library` for resolving additional
+    /// exports.
+    pub fn lib(&self) -> &'static Library {
+        self._lib
+    }
+}
+
+/// Obtain an `IWTSPlugin` from the DLL via the two-call
+/// `VirtualChannelGetInstance` pattern (probe count, then fetch). Our plugin is
+/// written last in the array, so the last slot is returned.
+pub fn create_plugin(dll: &DllHandle) -> IWTSPlugin {
+    let iid = IWTSPlugin::IID;
+
+    // Probe: ppObjArray == null → returns the number of plugins in *pnumobjs.
+    let mut n: u32 = 0;
+    let hr = unsafe { (dll.get_instance)(&iid, &mut n, core::ptr::null_mut()) };
+    assert!(hr.is_ok(), "VirtualChannelGetInstance probe returned {hr:?}");
+    assert!(n >= 1, "probe reported {n} plugins, expected >= 1");
+
+    // Fetch: allocate an array of the reported size and retrieve the pointers.
+    let mut objs: Vec<*mut core::ffi::c_void> = vec![core::ptr::null_mut(); n as usize];
+    let mut count = n;
+    let hr = unsafe { (dll.get_instance)(&iid, &mut count, objs.as_mut_ptr()) };
+    assert!(hr.is_ok(), "VirtualChannelGetInstance fetch returned {hr:?}");
+    assert!(
+        count >= 1 && (count as usize) <= objs.len(),
+        "fetch wrote {count} objects into an array of {}",
+        objs.len()
+    );
+
+    let ptr = objs[(count - 1) as usize];
+    assert!(!ptr.is_null(), "plugin slot {} is null", count - 1);
+    unsafe { IWTSPlugin::from_raw(ptr as *mut _) }
+}
+
+/// Read the tail of `%TEMP%\AccessKitDvc.log` for diagnostics. Returns a
+/// placeholder if the log is missing or unreadable.
+pub fn read_log_tail() -> String {
+    let path = std::env::temp_dir().join("AccessKitDvc.log");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(80);
+            lines[start..].join("\n")
+        }
+        Err(e) => format!("(could not read {}: {e})", path.display()),
+    }
+}
+
+use windows::Win32::System::RemoteDesktop::IWTSVirtualChannelCallback;
+use windows_core::{BOOL, BSTR};
+
+/// Drive `OnNewChannelConnection` on a captured listener callback and return
+/// the `IWTSVirtualChannelCallback` the plugin produced.
+pub fn trigger_new_channel(
+    listener_cb: &IWTSListenerCallback,
+    channel: &IWTSVirtualChannel,
+) -> IWTSVirtualChannelCallback {
+    let bstr = BSTR::new();
+    let mut accept = BOOL::default();
+    let mut chan_cb: Option<IWTSVirtualChannelCallback> = None;
+
+    unsafe {
+        listener_cb
+            .OnNewChannelConnection(channel, &bstr, &mut accept, &mut chan_cb)
+            .expect("OnNewChannelConnection failed");
+    }
+    assert!(accept.as_bool(), "plugin refused channel");
+    chan_cb.expect("plugin did not return a channel callback")
+}
+
+/// Return the COM vtable pointer of an `IWTSVirtualChannel` as a `usize`.
+pub fn channel_addr(chan: &IWTSVirtualChannel) -> usize {
+    chan.as_raw() as usize
+}
