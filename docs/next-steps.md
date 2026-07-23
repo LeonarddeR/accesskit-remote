@@ -207,15 +207,43 @@ for the build-up.
     Commits 150f4cb (focus emit), 6becbb4 (post_focus), c9c8ee8 (plugin route),
     4d5933a (TextRun synth), cd5c039 (Text reads), 43a2923 (text events).
 
+- **Active-descendant focus, caret drive & periodic reconcile.**
+  - *Active-descendant* (5a): the event connection subscribes to
+    `object:active-descendant-changed`; a move resolves the new descendant to its
+    window+node (`handle_active_descendant` → shared `emit_node_focus`, reusing
+    `resolve_focus_target` by sender + descendant path) and emits a focus-only
+    delta with no re-walk. Forwards the focus *pointer* only; item selection state
+    stays governed by re-walks.
+  - *Caret drive* (5b): UIA `Action::SetTextSelection` now maps to AT-SPI
+    `set_caret_offset`/`set_selection`. `AtspiSource::perform` carries the payload
+    (previously dropped) through `PerformMsg`; `handle_action` resolves the
+    anchor/focus TextRun positions to global code-point offsets via the container's
+    text-node layout (new pure `mapping::text_offset`, the inverse of
+    `text_position` — TextRun ids are synthesized, so only the container routes
+    through `objects`); `mirror::set_text_selection` writes the Text interface.
+  - *Periodic reconcile* (remaining 1): a 60s `tokio::time::interval` arm in
+    `bridge_main` drives the idempotent `Mirror::reconcile` as a safety net (tokio
+    `time` feature enabled for the crate).
+  - **Verification.** `text_offset` round-trips against `text_position` at the
+    start / interior / end-of-text boundary; active-descendant resolution+emit is
+    unit-tested; 38 unit tests pass. Periodic reconcile ran past the 60s tick
+    against gnome-text-editor with no panic and no spurious window churn.
+    **Environment caveat:** active-descendant and caret drive are *not*
+    live-verifiable headlessly (GTK4 emits no focus events headlessly; GTK's
+    `set_caret_offset` is `NotSupported` over AT-SPI) — wired + unit-tested, live
+    verification deferred to the interactive RAIL path. Also fixed: the `probe`
+    example now retries the hvsocket `ConnectionAborted` receive-timeout like the
+    `viewer` (remaining 4). Commits ad24120 (probe), a1e8b46 (atspi additions).
+
 ## Remaining
 
-1. **Periodic reconcile** (mirror): window add/remove now reconciles on
-   root-path `children-changed` (done above), but a window that becomes
-   Showing+Visible *without* re-signaling, or an app that dies without a root
-   `remove`, is missed until the next root event. Not observed in testing (the
-   add event fired after the window was visible in every trial), but it is the
-   residual race Orca's ~60s reconciliation covers; a periodic reconcile is
-   future work. See `P:\a11y\orca`.
+1. **Periodic reconcile** (mirror): ~~future work~~ **done** — a 60s
+   `tokio::time::interval` arm in `bridge_main` now drives the idempotent
+   `Mirror::reconcile` (see the milestone above), the safety net Orca's ~60s
+   reconciliation provides. A window that becomes Showing+Visible *without*
+   re-signaling, or an app that dies without a root `remove`, is now caught within
+   60s rather than missed until the next root event. The only residual window is
+   the ≤60s gap between ticks. See `P:\a11y\orca`.
 2. **Node-level focus**: ~~deferred from passive events~~ **done** — a
    `state-changed:focused` gain now emits a focus-only delta with no re-walk
    (see the focus/caret milestone above). The re-walk-storm concern is avoided
@@ -223,17 +251,18 @@ for the build-up.
 3. **Coalesce children-changed bursts**: New Tab fires ~28 full re-walks in 8s
    before settling. Full-tree re-walks are convergent, so this is a cost, not
    a correctness, issue; debounce is a future optimization.
-4. **`probe` example** has the same latent hvsocket receive-timeout bug the
-   `viewer` had (fixed in 18542fd); apply the same `ConnectionAborted`-retry
-   if probe is ever driven over hvsocket.
-5. **Focus/caret follow-ups** (v1 shipped above): (a) subscribe
-   `object:active-descendant-changed` for focus moving among a container's
-   descendants (lists/trees/combos), as Orca does; (b) map UIA
-   `Action::SetTextSelection` → AT-SPI `set_caret_offset`/selection so the caret
-   can be driven from Windows; (c) give `Role::Label`/`Document`/`Terminal` text
-   runs too (currently gated to editable text-input roles); (d) geometry
-   (`character_positions`/`widths`) for magnifiers; (e) a `GetForegroundWindow`
-   gate on `post_focus(true)` if RAIL testing shows Narrator/NVDA focus theft.
+4. **`probe` example**: ~~latent hvsocket receive-timeout bug~~ **done** — probe
+   now returns the hvsocket flag from `connect` and retries `ConnectionAborted`
+   like the `viewer` fix (18542fd). Commit ad24120.
+5. **Focus/caret follow-ups**: (a) ~~subscribe
+   `object:active-descendant-changed`~~ **done** (see the milestone above);
+   (b) ~~map UIA `Action::SetTextSelection` → AT-SPI `set_caret_offset`/selection~~
+   **wired** (unit-tested; live verification of the AT-SPI write deferred to the
+   RAIL path, as GTK returns `NotSupported` headlessly); (c) give
+   `Role::Label`/`Document`/`Terminal` text runs too (currently gated to editable
+   text-input roles); (d) geometry (`character_positions`/`widths`) for
+   magnifiers; (e) a `GetForegroundWindow` gate on `post_focus(true)` if RAIL
+   testing shows Narrator/NVDA focus theft.
 
 ## Notes / corrections
 
