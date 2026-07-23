@@ -6,3 +6,9 @@
 //! structural events trigger subtree re-walks diffed against the mirror, and
 //! value/state events are re-read live before being applied.
 #![cfg(target_os = "linux")]
+
+pub mod mapping;
+mod mirror;
+mod source;
+
+pub use source::AtspiSource;

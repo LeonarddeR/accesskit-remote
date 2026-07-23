@@ -26,6 +26,8 @@ socket2 = { version = "0.6", features = ["all"] }
 uuid = "1"
 accesskit_windows = "0.34"
 windows = "0.62"
+atspi = { version = "0.30", features = ["tokio", "zbus"] }
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
 
 accesskit_remote = { path = "crates/accesskit_remote" }
 accesskit_remote_transport = { path = "crates/accesskit_remote_transport" }
