@@ -3,8 +3,7 @@
 //! lifetime of the RDP connection.
 
 use accesskit_remote_client::{ClientConnection, ClientEvent};
-use accesskit_remote_windows::{OutgoingAction, SharedClient};
-use std::sync::mpsc::Sender;
+use accesskit_remote_windows::SharedClient;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use windows::Win32::Foundation::E_UNEXPECTED;
@@ -15,6 +14,7 @@ use windows::core::{Error, PCSTR, Result, implement};
 use windows_core::Ref;
 
 use crate::listener::AccessKitListenerCallback;
+use crate::rail::{self, RailHook, RailShared, Registry};
 use crate::transport::{self, PumpHandle};
 
 /// The channel name the plug-in listens on. Phase-1 placeholder: in `/wslg`
@@ -23,14 +23,11 @@ use crate::transport::{self, PumpHandle};
 /// client. Distinct from the stock `Microsoft::Windows::RDS::RemoteApplicationList`.
 pub const CHANNEL_NAME: &str = "AccessKit";
 
-/// Per-RDP-connection state: the shared client store, the hvsocket pump, and
-/// the action channel bindings send UIA actions into.
+/// Per-RDP-connection state: the shared client store, the hvsocket pump, the
+/// RAIL hook, and the action channel bindings send UIA actions into.
 struct Session {
-    #[allow(dead_code)]
-    client: SharedClient,
-    #[allow(dead_code)]
-    actions_tx: Sender<OutgoingAction>,
     pump: PumpHandle,
+    hook: Option<RailHook>,
 }
 
 impl Session {
@@ -42,20 +39,36 @@ impl Session {
             .unwrap_or(transport::DEFAULT_PORT);
         let client: SharedClient = Arc::new(Mutex::new(ClientConnection::new("dvc_plugin")));
         let (actions_tx, actions_rx) = std::sync::mpsc::channel();
-        let sink_client = client.clone();
-        let pump = transport::spawn_pump(vm_id, port, client.clone(), actions_rx, move |event| {
-            log_event(&sink_client, event);
+        let distro = rail::default_distro();
+        if distro.is_none() {
+            warn!("could not determine the default WSL distro; title suffixes won't be stripped");
+        }
+        let shared = Arc::new(RailShared {
+            client: client.clone(),
+            actions: actions_tx,
+            distro,
+            registry: Mutex::new(Registry::default()),
         });
-        Some(Self { client, actions_tx, pump })
+        let hook = rail::start(shared.clone());
+        let sink_client = client.clone();
+        let sink_shared = shared.clone();
+        let pump = transport::spawn_pump(vm_id, port, client, actions_rx, move |event| {
+            handle_event(&sink_client, &sink_shared, event);
+        });
+        Some(Self { pump, hook: Some(hook) })
     }
 
-    fn stop(self) {
+    fn stop(mut self) {
+        if let Some(hook) = self.hook.take() {
+            hook.stop();
+        }
         self.pump.stop();
     }
 }
 
-/// Phase-2 event sink: log what arrives. RAIL binding consumes these later.
-fn log_event(client: &SharedClient, event: ClientEvent) {
+/// Pump-thread event sink: keep the registry current and route deltas to
+/// bound RAIL windows.
+fn handle_event(client: &SharedClient, shared: &Arc<RailShared>, event: ClientEvent) {
     match event {
         ClientEvent::Connected => info!("remote session established"),
         ClientEvent::WindowAdded { window } => {
@@ -67,10 +80,26 @@ fn log_event(client: &SharedClient, event: ClientEvent) {
                 info.map(|i| i.title.as_str()),
                 info.and_then(|i| i.app.app_id.as_deref())
             );
+            let (title, app_id) = match info {
+                Some(i) => (i.title.clone(), i.app.app_id.clone()),
+                None => return,
+            };
+            drop(locked);
+            shared.registry.lock().unwrap().window_added(window, title, app_id);
         }
-        ClientEvent::WindowRemoved { window } => info!("remote window removed: {}", window.0),
+        ClientEvent::WindowRemoved { window } => {
+            info!("remote window removed: {}", window.0);
+            let hwnd = shared.registry.lock().unwrap().window_removed(window);
+            if let Some(hwnd) = hwnd {
+                accesskit_remote_windows::post_detach(hwnd_from_key(hwnd));
+            }
+        }
         ClientEvent::TreeUpdated { window, update } => {
-            debug!("tree updated: window {} ({} nodes)", window.0, update.nodes.len())
+            debug!("tree updated: window {} ({} nodes)", window.0, update.nodes.len());
+            let hwnd = shared.registry.lock().unwrap().bound_hwnd(window);
+            if let Some(hwnd) = hwnd {
+                accesskit_remote_windows::post_delta(hwnd_from_key(hwnd), update);
+            }
         }
         ClientEvent::FocusChanged { window } => {
             debug!("remote focus: {:?}", window.map(|w| w.0))
@@ -78,6 +107,10 @@ fn log_event(client: &SharedClient, event: ClientEvent) {
         ClientEvent::Pong { seq } => debug!("pong {seq}"),
         ClientEvent::Closed { reason } => info!("remote session closed: {reason}"),
     }
+}
+
+fn hwnd_from_key(key: isize) -> accesskit_remote_windows::HWND {
+    accesskit_remote_windows::HWND(key as _)
 }
 
 #[implement(IWTSPlugin)]

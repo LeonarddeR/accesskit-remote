@@ -20,6 +20,7 @@ accesskit_remote_transport.workspace = true
 accesskit_remote_windows.workspace = true
 uuid.workspace = true
 windows-core.workspace = true
+windows-registry.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
@@ -33,6 +34,7 @@ features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ]
 

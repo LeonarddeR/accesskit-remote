@@ -17,7 +17,10 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub use accesskit_windows::HWND;
-pub use visible::{delta_message, install_visible_adapter, post_delta, uninstall_visible_adapter};
+pub use visible::{
+    delta_message, detach_message, install_visible_adapter, post_delta, post_detach,
+    uninstall_visible_adapter,
+};
 
 pub type SharedClient = Arc<Mutex<ClientConnection>>;
 

@@ -27,6 +27,7 @@ uuid = "1"
 accesskit_windows = "0.34"
 windows = "0.62"
 windows-core = "0.62"
+windows-registry = "0.6"
 tracing = "0.1"
 tracing-appender = { version = "0.2", features = ["parking_lot"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "parking_lot", "tracing-log"] }

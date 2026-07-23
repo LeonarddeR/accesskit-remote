@@ -15,6 +15,7 @@ mod chain_load;
 mod channel;
 mod listener;
 mod plugin;
+mod rail;
 pub mod transport;
 
 use core::ffi::c_void;
@@ -32,6 +33,11 @@ use windows_core::BOOL;
 use plugin::AccessKitDvcPlugin;
 
 static INSTANCE: AtomicIsize = AtomicIsize::new(0);
+
+/// The DLL's own module handle, captured in `DllMain`.
+pub(crate) fn instance() -> HMODULE {
+    HMODULE(INSTANCE.load(Ordering::Acquire) as _)
+}
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {

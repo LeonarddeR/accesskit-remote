@@ -36,6 +36,18 @@ pub fn delta_message() -> u32 {
     *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("AccessKitRemoteDelta")) })
 }
 
+/// The registered window message requesting the adapter detach itself on the
+/// window's own thread.
+pub fn detach_message() -> u32 {
+    static MSG: OnceLock<u32> = OnceLock::new();
+    *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("AccessKitRemoteDetach")) })
+}
+
+/// Ask a bound window to remove its adapter. Callable from any thread.
+pub fn post_detach(hwnd: HWND) -> bool {
+    unsafe { PostMessageW(Some(hwnd), detach_message(), WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
 /// Post a tree delta to a window bound with [`install_visible_adapter`].
 /// Callable from any thread; the delta is applied on the window's own thread.
 pub fn post_delta(hwnd: HWND, update: accesskit::TreeUpdate) -> bool {
@@ -75,6 +87,10 @@ extern "system" fn wnd_proc(window: HWND, message: u32, wparam: WPARAM, lparam: 
         if let Some(events) = events {
             events.raise();
         }
+        return LRESULT(0);
+    }
+    if message == detach_message() {
+        uninstall_visible_adapter(window);
         return LRESULT(0);
     }
     match message {
