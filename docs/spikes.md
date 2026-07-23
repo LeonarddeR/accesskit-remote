@@ -74,6 +74,8 @@ msrdc.exe /wslg /silent /v:FBDDE2F2-6CC4-4A2A-AC4D-CE69559CADC5
 
 ## Spike 2b — plugin loading into the /wslg msrdc: AddIns is dead, WSLDVC_PRIVATE is the way
 
+**(msrdc only — mstsc `/wslg` behaves differently; see Spike 2d.)**
+
 Verified empirically (2026-07-23) and against the local WSLg clone at
 `P:\Microsoft\wslg`:
 
@@ -131,6 +133,39 @@ round-trip succeeded; guest saw the peer as CID 2 (host).
 - The user distro can bind vsock directly; the system distro is not
   involved. This validates the phase 1 out-of-band transport exactly as
   designed.
+
+## Spike 2d — mstsc `/wslg` DOES honor the classic AddIns hive
+
+Verified empirically (2026-07-23) with `WSLG_USE_MSTSC=true` in `.wslgconfig`
+(`[system-distro-env]` section — WSLGd copies those keys into the system
+distro env; see `WSLGd/main.cpp:154-181`), which makes WSLGd launch
+`mstsc.exe /wslg ...` instead of msrdc (`WSLGd/main.cpp:470`).
+
+- **Unlike msrdc (Spike 2b), the `/wslg` mstsc instance enumerates the regular
+  `Terminal Server Client\Default\AddIns` hive and loads those plugins
+  *alongside* the command-line `/plugin:WSLDVC_PACKAGE`.** Proof: rd_pipe is
+  registered only via HKCU `...\AddIns\RdPipe` (`Name` = its CLSID) with COM
+  under `HKCU\...\CLSID\{D1F74DC7-...}`; no `OptionalAddIns` entry for it. In
+  the connected `/wslg` mstsc (151 loaded modules, four `RAIL_WINDOW` HWNDs,
+  weston `rdp_rail_notify_app_list` for `org.gnome.TextEditor`) both
+  `WSLDVCPlugin.dll` **and** `rd_pipe.dll` were mapped. rd_pipe can only reach
+  that process through classic-AddIns COM activation, so mstsc `/wslg` read the
+  hive. So AddIns-vs-not is **client-specific**: msrdc = OptionalAddIns +
+  command-line only; mstsc = classic AddIns + command-line.
+- **Deployment consequence**: our plugin has a low-friction dev/bring-up
+  loading path — register it the classic rd_pipe way (HKCU `AddIns` + COM) and
+  set `WSLG_USE_MSTSC=true`; no `VirtualChannelGetInstance` chain-loading and no
+  `OptionalAddIns\WSLDVC_PRIVATE` needed to iterate. Production on the default
+  msrdc client still needs the `WSLDVC_PRIVATE` chain-load from Spike 2b.
+- **Caveat — the RDP-file security dialog**: mstsc shows a modal warning on
+  every launch ("You are opening an RDP file which will establish a
+  connection...", fwlink 2347342) that `/silent` does **not** suppress (msrdc
+  does). The connection stalls at `rdp_peer is not initalized` until it is
+  dismissed with a real interactive OK; only then does the peer initialize,
+  RAIL windows appear, and AddIns plugins load. Synthetic `WM_COMMAND`/`BM_CLICK`
+  to the `#32770` dialog did **not** complete the trust-proceed path here
+  (mstsc kept exiting and being relaunched by WSLGd) — do not mistake that for
+  "mstsc doesn't support the `/wslg` transport"; a genuine OK connects fine.
 
 ## WSLg reliability quirks observed
 
