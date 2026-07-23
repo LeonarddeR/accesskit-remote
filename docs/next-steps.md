@@ -69,17 +69,41 @@ for the build-up.
   (not `WouldBlock`/`TimedOut`) while the connection stays usable, so retry it
   on hvsocket only — otherwise the first idle read drops the connection.
   Commit 18542fd.
+- **Window lifecycle** (mirror): `AtspiSource` now emits `WindowAdded`/
+  `WindowRemoved` as apps open and close toplevels. Pure `reconcile.rs`
+  (`WindowKey` = unique bus name + object path; `reconcile_windows` diff, 5
+  tests) compares the tracked set against a fresh `discover_windows` by
+  `ObjectRef` identity; `Mirror::reconcile` drops vanished windows (announcing
+  each) and walks new ones (announcing each). `add_discovered` is factored out
+  of `enumerate` so both share the walk/build/track step (and no longer leak an
+  id on an empty walk). **Trigger finding**: GTK4 does not emit
+  `window:create`/`window:destroy` in this WSLg environment — a raw a11y-bus
+  monitor (`busctl --address <a11y bus> monitor`) shows no `window:*` signals
+  at all, even with our window match rule registered. Toplevel lifecycle
+  instead arrives as `children-changed` on the AT-SPI root path
+  (`/org/a11y/atspi/accessible/root`): an app's root gains a window child
+  (add), or the registry root loses an app (remove), disambiguated by sender.
+  So `is_window_lifecycle_event` reconciles on root-path `children-changed`
+  (and on `window:create`/`destroy`, kept as a fallback for toolkits that emit
+  them); deeper `children-changed` stays a same-window re-walk. Reconcile is
+  idempotent (full-set diff), so the ~20 intra-window updates between opens
+  cause no spurious announces. Added/removed windows emit no focus event; the
+  client nulls its own focus when a focused window is removed (node-level focus
+  deferred, #2). **Verified live** via the `window_lifecycle` example: across
+  two clean-slate trials, 5/5 `--new-window` opens each produced exactly one
+  `WindowAdded` (correct title/tree) and killing the apps produced
+  `WindowRemoved` for every tracked window; the visibility race never bit.
+  Commit 16b10e6.
 
 ## Remaining
 
-1. **Window lifecycle** (mirror): emit `WindowAdded`/`WindowRemoved` as apps
-   open/close toplevels (v0 enumerates once at connect). Plan: reconcile on
-   window Create/Destroy events — re-run `discover_windows`, diff against
-   tracked windows by `ObjectRef` identity, emit Added/Removed. Reuses
-   discover's app-info + Showing+Visible filter, so a not-yet-ready window is
-   skipped rather than emitted broken. Residual race (a window that never
-   re-signals after becoming visible) is what Orca's ~60s reconciliation is
-   for; a periodic reconcile is future work. See `P:\a11y\orca`.
+1. **Periodic reconcile** (mirror): window add/remove now reconciles on
+   root-path `children-changed` (done above), but a window that becomes
+   Showing+Visible *without* re-signaling, or an app that dies without a root
+   `remove`, is missed until the next root event. Not observed in testing (the
+   add event fired after the window was visible in every trial), but it is the
+   residual race Orca's ~60s reconciliation covers; a periodic reconcile is
+   future work. See `P:\a11y\orca`.
 2. **Node-level focus**: deferred from passive events to avoid a
    `state-changed` re-walk storm; today only window activate/deactivate
    re-walks the frame. The action's immediate re-walk still covers state-only
