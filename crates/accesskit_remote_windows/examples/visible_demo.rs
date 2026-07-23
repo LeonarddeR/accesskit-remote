@@ -45,6 +45,7 @@ impl Provider {
     fn label_node(&self) -> accesskit::Node {
         let mut label = accesskit::Node::new(accesskit::Role::Label);
         label.set_value(format!("Button clicked {} times", self.clicks));
+        label.add_action(accesskit::Action::Focus);
         label
     }
 
@@ -79,15 +80,29 @@ impl Provider {
     }
 
     fn perform(&mut self, request: &accesskit::ActionRequest) {
-        if request.action == accesskit::Action::Click && request.target_node == BUTTON {
-            self.clicks += 1;
-            let update = accesskit::TreeUpdate {
-                nodes: vec![(LABEL, self.label_node())],
-                tree: None,
-                tree_id: accesskit::TreeId::ROOT,
-                focus: BUTTON,
-            };
-            self.server.send_tree_update(WINDOW, update).expect("send_tree_update");
+        match request.action {
+            accesskit::Action::Click if request.target_node == BUTTON => {
+                self.clicks += 1;
+                let update = accesskit::TreeUpdate {
+                    nodes: vec![(LABEL, self.label_node())],
+                    tree: None,
+                    tree_id: accesskit::TreeId::ROOT,
+                    focus: BUTTON,
+                };
+                self.server.send_tree_update(WINDOW, update).expect("send_tree_update");
+            }
+            // A focus-only delta: no nodes, just the new focus. Exercises the
+            // path node focus forwarding relies on.
+            accesskit::Action::Focus => {
+                let update = accesskit::TreeUpdate {
+                    nodes: Vec::new(),
+                    tree: None,
+                    tree_id: accesskit::TreeId::ROOT,
+                    focus: request.target_node,
+                };
+                self.server.send_tree_update(WINDOW, update).expect("send_tree_update");
+            }
+            _ => {}
         }
     }
 }

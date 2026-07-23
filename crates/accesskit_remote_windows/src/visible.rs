@@ -48,6 +48,29 @@ pub fn post_detach(hwnd: HWND) -> bool {
     unsafe { PostMessageW(Some(hwnd), detach_message(), WPARAM(0), LPARAM(0)) }.is_ok()
 }
 
+/// The registered window message carrying a host-focus flag (0/1) in `wParam`.
+pub fn focus_message() -> u32 {
+    static MSG: OnceLock<u32> = OnceLock::new();
+    *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("AccessKitRemoteFocus")) })
+}
+
+/// Tell a bound window whether its remote window holds the session focus.
+/// Callable from any thread; the state is applied on the window's own thread.
+/// The consumer only raises UIA focus events while it believes the window is
+/// host-focused, so remote focus must be driven through here for a RAIL window
+/// that never receives its own `WM_SETFOCUS`.
+pub fn post_focus(hwnd: HWND, is_focused: bool) -> bool {
+    unsafe {
+        PostMessageW(
+            Some(hwnd),
+            focus_message(),
+            WPARAM(is_focused as usize),
+            LPARAM(0),
+        )
+    }
+    .is_ok()
+}
+
 /// Post a tree delta to a window bound with [`install_visible_adapter`].
 /// Callable from any thread; the delta is applied on the window's own thread.
 pub fn post_delta(hwnd: HWND, update: accesskit::TreeUpdate) -> bool {
@@ -91,6 +114,10 @@ extern "system" fn wnd_proc(window: HWND, message: u32, wparam: WPARAM, lparam: 
     }
     if message == detach_message() {
         uninstall_visible_adapter(window);
+        return LRESULT(0);
+    }
+    if message == focus_message() {
+        r#impl.update_window_focus_state(wparam.0 != 0);
         return LRESULT(0);
     }
     match message {
