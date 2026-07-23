@@ -94,7 +94,7 @@ impl DemoSource {
 
     fn label_node(&self) -> accesskit::Node {
         let mut label = accesskit::Node::new(accesskit::Role::Label);
-        label.set_label(format!("Button clicked {} times", self.clicks));
+        label.set_value(format!("Button clicked {} times", self.clicks));
         label
     }
 }
@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(update.nodes.len(), 1);
         let (id, node) = &update.nodes[0];
         assert_eq!(*id, LABEL);
-        assert_eq!(node.label().unwrap(), "Button clicked 1 times");
+        assert_eq!(node.value().unwrap(), "Button clicked 1 times");
     }
 
     #[test]

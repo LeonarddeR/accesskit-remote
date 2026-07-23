@@ -7,6 +7,22 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
-[dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
 accesskit.workspace = true
+accesskit_remote.workspace = true
 accesskit_remote_client.workspace = true
+accesskit_windows.workspace = true
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+accesskit_remote_transport.workspace = true
+uuid.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[[example]]
+name = "viewer"

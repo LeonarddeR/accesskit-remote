@@ -95,7 +95,7 @@ fn main() -> std::io::Result<()> {
 fn connect(args: &[String]) -> std::io::Result<accesskit_remote_transport::Socket> {
     match args.first().map(String::as_str) {
         Some("--tcp") | None => {
-            let port: u16 = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(52017);
+            let port: u16 = args.get(1).and_then(|p| p.parse().ok()).unwrap_or(4750);
             accesskit_remote_transport::tcp::connect_local(port).map(Into::into)
         }
         #[cfg(windows)]
@@ -105,7 +105,7 @@ fn connect(args: &[String]) -> std::io::Result<accesskit_remote_transport::Socke
                 .expect("usage: probe --hvsocket <vm-id> [PORT]")
                 .parse::<uuid::Uuid>()
                 .expect("invalid VM ID");
-            let port: u32 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(52017);
+            let port: u32 = args.get(2).and_then(|p| p.parse().ok()).unwrap_or(4750);
             accesskit_remote_transport::hvsocket::connect(vm_id, port)
         }
         Some(other) => Err(std::io::Error::other(format!("unknown mode: {other}"))),

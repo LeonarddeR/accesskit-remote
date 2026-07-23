@@ -2,7 +2,7 @@
 //! AT-SPI source lands.
 //!
 //! Usage: `accesskit_remoted [--tcp PORT | --vsock PORT]`
-//! Defaults to `--tcp 52017`; `--vsock` is Linux-only.
+//! Defaults to `--tcp 4750`; `--vsock` is Linux-only.
 
 mod demo;
 
@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
-pub const DEFAULT_PORT: u32 = 52017;
+pub const DEFAULT_PORT: u32 = 4750;
 
 enum Listener {
     Tcp(std::net::TcpListener),
