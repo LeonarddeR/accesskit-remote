@@ -102,7 +102,14 @@ fn handle_event(client: &SharedClient, shared: &Arc<RailShared>, event: ClientEv
             }
         }
         ClientEvent::FocusChanged { window } => {
-            debug!("remote focus: {:?}", window.map(|w| w.0))
+            debug!("remote focus: {:?}", window.map(|w| w.0));
+            let transition = shared.registry.lock().unwrap().focus_changed(window);
+            if let Some(hwnd) = transition.unfocus {
+                accesskit_remote_windows::post_focus(hwnd_from_key(hwnd), false);
+            }
+            if let Some(hwnd) = transition.focus {
+                accesskit_remote_windows::post_focus(hwnd_from_key(hwnd), true);
+            }
         }
         ClientEvent::Pong { seq } => debug!("pong {seq}"),
         ClientEvent::Closed { reason } => info!("remote session closed: {reason}"),

@@ -47,11 +47,21 @@ pub struct Registry {
     client_windows: HashMap<u64, ClientWindow>,
     bound: HashMap<u64, isize>,
     attached: HashSet<isize>,
+    focused: Option<u64>,
 }
 
 struct ClientWindow {
     title: String,
     app_id: Option<String>,
+}
+
+/// The host-focus posts to make after a remote focus change: clear the window
+/// that lost focus, set the one that gained it. `None` entries are unbound
+/// windows with no HWND to post to.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FocusTransition {
+    pub unfocus: Option<isize>,
+    pub focus: Option<isize>,
 }
 
 impl Registry {
@@ -62,6 +72,9 @@ impl Registry {
     /// Forgets a remote window; returns the HWND it was bound to, if any.
     pub fn window_removed(&mut self, id: WindowId) -> Option<isize> {
         self.client_windows.remove(&id.0);
+        if self.focused == Some(id.0) {
+            self.focused = None;
+        }
         let hwnd = self.bound.remove(&id.0);
         if let Some(h) = hwnd {
             self.attached.remove(&h);
@@ -71,6 +84,25 @@ impl Registry {
 
     pub fn bound_hwnd(&self, id: WindowId) -> Option<isize> {
         self.bound.get(&id.0).copied()
+    }
+
+    /// The remote window currently holding session focus, if known.
+    pub fn focused(&self) -> Option<WindowId> {
+        self.focused.map(WindowId)
+    }
+
+    /// Records the new session focus and returns the HWNDs to update: the
+    /// previously-focused window is cleared and the newly-focused one is set.
+    /// A repeat of the current focus is a no-op.
+    pub fn focus_changed(&mut self, window: Option<WindowId>) -> FocusTransition {
+        let new = window.map(|w| w.0);
+        if new == self.focused {
+            return FocusTransition { unfocus: None, focus: None };
+        }
+        let unfocus = self.focused.and_then(|id| self.bound.get(&id).copied());
+        let focus = new.and_then(|id| self.bound.get(&id).copied());
+        self.focused = new;
+        FocusTransition { unfocus, focus }
     }
 
     fn unbound_windows(&self) -> Vec<(WindowId, accesskit_remote_client::WindowInfo)> {
@@ -238,7 +270,9 @@ fn try_attach(shared: &Arc<RailShared>, hwnd: HWND, event: u32) {
          event {event:#06x}, owning thread {owning_thread}, current thread {current_thread})",
         window.0, rail.server_window_id, rail.title
     );
-    let is_focused = unsafe { GetFocus() } == hwnd;
+    // Seed host-focus from local focus or a remote FocusChanged that arrived
+    // before this window attached.
+    let is_focused = unsafe { GetFocus() } == hwnd || registry.focused() == Some(window);
     match install_visible_adapter(
         hwnd,
         window,
@@ -251,5 +285,79 @@ fn try_attach(shared: &Arc<RailShared>, hwnd: HWND, event: u32) {
             registry.attached.insert(hwnd_key);
         }
         Err(e) => warn!("install_visible_adapter failed for {hwnd:?}: {e:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> Registry {
+        Registry::default()
+    }
+
+    #[test]
+    fn focus_to_unbound_window_records_but_posts_nothing() {
+        let mut r = registry();
+        r.window_added(WindowId(1), "t".into(), None);
+        assert_eq!(
+            r.focus_changed(Some(WindowId(1))),
+            FocusTransition { unfocus: None, focus: None }
+        );
+        assert_eq!(r.focused(), Some(WindowId(1)));
+    }
+
+    #[test]
+    fn focus_across_bound_windows_clears_old_and_sets_new() {
+        let mut r = registry();
+        r.bound.insert(1, 0x111);
+        r.bound.insert(2, 0x222);
+        assert_eq!(
+            r.focus_changed(Some(WindowId(1))),
+            FocusTransition { unfocus: None, focus: Some(0x111) }
+        );
+        assert_eq!(
+            r.focus_changed(Some(WindowId(2))),
+            FocusTransition { unfocus: Some(0x111), focus: Some(0x222) }
+        );
+    }
+
+    #[test]
+    fn repeating_the_current_focus_is_a_no_op() {
+        let mut r = registry();
+        r.bound.insert(1, 0x111);
+        r.focus_changed(Some(WindowId(1)));
+        assert_eq!(
+            r.focus_changed(Some(WindowId(1))),
+            FocusTransition { unfocus: None, focus: None }
+        );
+    }
+
+    #[test]
+    fn focus_none_unfocuses_the_previous_window_only() {
+        let mut r = registry();
+        r.bound.insert(1, 0x111);
+        r.focus_changed(Some(WindowId(1)));
+        assert_eq!(
+            r.focus_changed(None),
+            FocusTransition { unfocus: Some(0x111), focus: None }
+        );
+        assert_eq!(r.focused(), None);
+    }
+
+    #[test]
+    fn removing_the_focused_window_clears_focus_so_next_focus_has_no_stale_unfocus() {
+        let mut r = registry();
+        r.window_added(WindowId(1), "a".into(), None);
+        r.bound.insert(1, 0x111);
+        r.attached.insert(0x111);
+        r.focus_changed(Some(WindowId(1)));
+        r.window_removed(WindowId(1));
+        assert_eq!(r.focused(), None);
+        r.bound.insert(2, 0x222);
+        assert_eq!(
+            r.focus_changed(Some(WindowId(2))),
+            FocusTransition { unfocus: None, focus: Some(0x222) }
+        );
     }
 }
