@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/accesskit_remote",
+    "crates/accesskit_remote_transport",
+    "crates/accesskit_remote_server",
+    "crates/accesskit_remote_client",
+    "crates/accesskit_remote_atspi",
+    "crates/accesskit_remoted",
+    "crates/accesskit_remote_windows",
+    "crates/accesskit_remote_dvc_plugin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["Leonard de Ruijter"]
+
+[workspace.dependencies]
+accesskit = { version = "0.24", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+accesskit_remote = { path = "crates/accesskit_remote" }
+accesskit_remote_transport = { path = "crates/accesskit_remote_transport" }
+accesskit_remote_server = { path = "crates/accesskit_remote_server" }
+accesskit_remote_client = { path = "crates/accesskit_remote_client" }
+accesskit_remote_atspi = { path = "crates/accesskit_remote_atspi" }
+accesskit_remote_windows = { path = "crates/accesskit_remote_windows" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"

@@ -1,0 +1,17 @@
+[package]
+name = "accesskit_remote_dvc_plugin"
+description = "RDP dynamic virtual channel plugin exposing remote AccessKit trees to UI Automation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+accesskit_remote_client.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+accesskit_remote_windows.workspace = true
