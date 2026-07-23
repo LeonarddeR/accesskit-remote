@@ -235,6 +235,35 @@ for the build-up.
     example now retries the hvsocket `ConnectionAborted` receive-timeout like the
     `viewer` (remaining 4). Commits ad24120 (probe), a1e8b46 (atspi additions).
 
+- **Static text runs (Label/Terminal/Document).** The walk now mirrors the AT-SPI
+  `Text` interface into `Role::TextRun` children for the static text roles, not
+  just editable inputs. Pure `reads_text_runs(role, has_children)` gives
+  Label/Terminal/Document* runs, gated to *leaves* — a structured document (one
+  with element children) keeps its child structure instead of also emitting the
+  whole text flat; editable roles are exempt from the leaf gate (always get runs).
+  `map_role` now maps `Terminal → Terminal` and the six `Document*` roles →
+  `Document`, matching accesskit's `supports_text_ranges` role set exactly
+  (`{text inputs} ∪ {Label, Document, Terminal}`, each needing ≥1 `TextRun` child —
+  confirmed by reading `accesskit_consumer` `text.rs`), so the UIA Text pattern
+  surfaces on them. `has_text_caret(role)` keeps caret/selection only for editable
+  fields and terminals; static labels/documents expose readable runs with
+  `SupportedTextSelection = None` (`has_text_selection()` false → `_None` in the
+  consumer). This matters because GTK reports `caret_offset = 0` (not `-1`) on
+  non-selectable labels, which would otherwise stamp a degenerate caret-at-0 on
+  every one — including on live `text-changed` re-reads, since a status label is a
+  tracked text node now. `read_text_state` gained a `with_caret` arg (also skipping
+  two bus calls per static node) and `TextNodeCache.caret_enabled` carries the bit
+  so `refresh_text` honors it without needing the role. **Verified live**
+  (`dump_tree` vs gnome-text-editor): all 9 `Label` nodes gained exactly one
+  `TextRun` with `sel=None`, while the editable document (`MultilineTextInput`)
+  kept its real caret (`sel=Some`). **Decisions/caveats:** Terminal keeps its caret
+  (a terminal's caret-at-0 is the real home cursor, not an AtkText artifact) —
+  correct default but not headlessly verifiable, like the caret-drive note; a
+  *selectable* Document's caret is **deferred** (Document* is treated caret-less
+  like Label, right for read-only views). Terminal/Document runs are wired +
+  unit-tested but gnome-text-editor has no such node to exercise them live. 44 unit
+  tests. Commit 438a852.
+
 ## Remaining
 
 1. **Periodic reconcile** (mirror): ~~future work~~ **done** — a 60s
@@ -264,9 +293,11 @@ for the build-up.
    `object:active-descendant-changed`~~ **done** (see the milestone above);
    (b) ~~map UIA `Action::SetTextSelection` → AT-SPI `set_caret_offset`/selection~~
    **wired** (unit-tested; live verification of the AT-SPI write deferred to the
-   RAIL path, as GTK returns `NotSupported` headlessly); (c) give
-   `Role::Label`/`Document`/`Terminal` text runs too (currently gated to editable
-   text-input roles); (d) geometry (`character_positions`/`widths`) for
+   RAIL path, as GTK returns `NotSupported` headlessly); (c) ~~give
+   `Role::Label`/`Document`/`Terminal` text runs too~~ **done** (see the static
+   text runs milestone above — leaf-gated, caret suppressed for the caret-less
+   static roles; Terminal caret and selectable-Document caret noted there);
+   (d) geometry (`character_positions`/`widths`) for
    magnifiers; (e) a `GetForegroundWindow` gate on `post_focus(true)` if RAIL
    testing shows Narrator/NVDA focus theft.
 
