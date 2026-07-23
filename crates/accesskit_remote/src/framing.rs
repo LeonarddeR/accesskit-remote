@@ -26,8 +26,9 @@ impl core::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-/// Wraps a payload in a frame header.
-pub fn frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
+/// Appends a payload's frame (length header + payload) to `out`, leaving
+/// `out` untouched on error.
+pub fn frame_into(payload: &[u8], out: &mut Vec<u8>) -> Result<(), FrameError> {
     if payload.is_empty() {
         return Err(FrameError::Empty);
     }
@@ -37,9 +38,16 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
             max: DEFAULT_MAX_FRAME_LEN,
         });
     }
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    out.reserve(FRAME_HEADER_LEN + payload.len());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Wraps a payload in a frame header.
+pub fn frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
+    let mut out = Vec::new();
+    frame_into(payload, &mut out)?;
     Ok(out)
 }
 
@@ -97,7 +105,6 @@ impl FrameReader {
         let start = self.pos + FRAME_HEADER_LEN;
         let payload = self.buf[start..start + len].to_vec();
         self.pos = start + len;
-        self.compact();
         Ok(Some(payload))
     }
 

@@ -40,7 +40,7 @@ fn main() -> std::io::Result<()> {
             match event {
                 ClientEvent::Connected => println!("connected and established"),
                 ClientEvent::WindowAdded { window } => {
-                    let info = client.window_info(window).unwrap().clone();
+                    let info = client.window_info(window).unwrap();
                     println!(
                         "window {}: '{}' app={} ({})",
                         window.0,

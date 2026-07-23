@@ -14,7 +14,7 @@ mod messages;
 mod session;
 
 pub use codec::{Codec, CodecError};
-pub use framing::{frame, FrameError, FrameReader, DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN};
+pub use framing::{frame, frame_into, FrameError, FrameReader, DEFAULT_MAX_FRAME_LEN, FRAME_HEADER_LEN};
 pub use messages::{AppInfo, Hello, Message, PeerRole, WindowId};
 pub use session::{Session, SessionConfig, SessionError, SessionEvent};
 

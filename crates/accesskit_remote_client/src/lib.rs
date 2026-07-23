@@ -10,7 +10,7 @@
 use accesskit_remote::{
     AppInfo, Message, PeerRole, Session, SessionConfig, SessionError, SessionEvent, WindowId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowInfo {
@@ -104,7 +104,7 @@ impl TreeStore {
     fn snapshot(&mut self) -> Option<accesskit::TreeUpdate> {
         let tree = self.tree.clone()?;
         let mut nodes = Vec::new();
-        let mut reachable = std::collections::HashSet::new();
+        let mut reachable = HashSet::new();
         let mut stack = vec![tree.root];
         while let Some(id) = stack.pop() {
             if !reachable.insert(id) {
@@ -196,57 +196,62 @@ impl ClientConnection {
         let events = self.session.handle_input(chunk)?;
         let mut out = Vec::new();
         for event in events {
-            match event {
-                SessionEvent::Established { .. } => out.push(ClientEvent::Connected),
-                SessionEvent::Closed { reason } => out.push(ClientEvent::Closed { reason }),
-                SessionEvent::Message(msg) => match msg {
-                    Message::WindowAdded { window, title, app } => {
-                        let entry = WindowEntry {
-                            info: WindowInfo { title, app },
-                            store: TreeStore::new(),
-                        };
-                        if self.windows.insert(window, entry).is_some() {
-                            return self.fail(ClientError::DuplicateWindow(window));
-                        }
-                        out.push(ClientEvent::WindowAdded { window });
-                    }
-                    Message::WindowRemoved { window } => {
-                        if self.windows.remove(&window).is_none() {
-                            return self.fail(ClientError::UnknownWindow(window));
-                        }
-                        if self.focus == Some(window) {
-                            self.focus = None;
-                        }
-                        out.push(ClientEvent::WindowRemoved { window });
-                    }
-                    Message::TreeUpdate { window, update } => {
-                        let Some(entry) = self.windows.get_mut(&window) else {
-                            return self.fail(ClientError::UnknownWindow(window));
-                        };
-                        entry.store.apply(&update);
-                        out.push(ClientEvent::TreeUpdated { window, update });
-                    }
-                    Message::FocusChanged { window } => {
-                        if let Some(id) = window {
-                            if !self.windows.contains_key(&id) {
-                                return self.fail(ClientError::UnknownWindow(id));
-                            }
-                        }
-                        self.focus = window;
-                        out.push(ClientEvent::FocusChanged { window });
-                    }
-                    Message::Pong { seq } => out.push(ClientEvent::Pong { seq }),
-                    other => {
-                        return self.fail(ClientError::UnexpectedMessage(format!("{other:?}")));
-                    }
-                },
-            }
+            self.handle_event(event, &mut out)
+                .inspect_err(|e| self.session.close(e.to_string()))?;
         }
         Ok(out)
     }
 
-    fn fail(&mut self, error: ClientError) -> Result<Vec<ClientEvent>, ClientError> {
-        self.session.close(error.to_string());
-        Err(error)
+    fn handle_event(
+        &mut self,
+        event: SessionEvent,
+        out: &mut Vec<ClientEvent>,
+    ) -> Result<(), ClientError> {
+        match event {
+            SessionEvent::Established { .. } => out.push(ClientEvent::Connected),
+            SessionEvent::Closed { reason } => out.push(ClientEvent::Closed { reason }),
+            SessionEvent::Message(msg) => match msg {
+                Message::WindowAdded { window, title, app } => {
+                    let entry = WindowEntry {
+                        info: WindowInfo { title, app },
+                        store: TreeStore::new(),
+                    };
+                    if self.windows.insert(window, entry).is_some() {
+                        return Err(ClientError::DuplicateWindow(window));
+                    }
+                    out.push(ClientEvent::WindowAdded { window });
+                }
+                Message::WindowRemoved { window } => {
+                    if self.windows.remove(&window).is_none() {
+                        return Err(ClientError::UnknownWindow(window));
+                    }
+                    if self.focus == Some(window) {
+                        self.focus = None;
+                    }
+                    out.push(ClientEvent::WindowRemoved { window });
+                }
+                Message::TreeUpdate { window, update } => {
+                    let Some(entry) = self.windows.get_mut(&window) else {
+                        return Err(ClientError::UnknownWindow(window));
+                    };
+                    entry.store.apply(&update);
+                    out.push(ClientEvent::TreeUpdated { window, update });
+                }
+                Message::FocusChanged { window } => {
+                    if let Some(id) = window {
+                        if !self.windows.contains_key(&id) {
+                            return Err(ClientError::UnknownWindow(id));
+                        }
+                    }
+                    self.focus = window;
+                    out.push(ClientEvent::FocusChanged { window });
+                }
+                Message::Pong { seq } => out.push(ClientEvent::Pong { seq }),
+                other => {
+                    return Err(ClientError::UnexpectedMessage(other.kind().into()));
+                }
+            },
+        }
+        Ok(())
     }
 }

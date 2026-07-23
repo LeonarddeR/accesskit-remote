@@ -11,7 +11,7 @@
 //! automatically; incoming pongs are surfaced for RTT measurement.
 
 use crate::codec::{Codec, CodecError};
-use crate::framing::{frame, FrameError, FrameReader, DEFAULT_MAX_FRAME_LEN};
+use crate::framing::{frame_into, FrameError, FrameReader, DEFAULT_MAX_FRAME_LEN};
 use crate::messages::{Hello, Message, PeerRole};
 use crate::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 
@@ -82,7 +82,7 @@ impl From<CodecError> for SessionError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum State {
     AwaitingHello,
     Established { codec: Codec },
@@ -144,49 +144,38 @@ impl Session {
         }
         self.reader.push(chunk);
         let mut events = Vec::new();
-        loop {
-            let payload = match self.reader.next_frame() {
-                Ok(Some(payload)) => payload,
-                Ok(None) => break,
-                Err(e) => return self.fail(SessionError::Frame(e)),
-            };
-            match &self.state {
-                State::AwaitingHello => match self.handle_hello(&payload) {
-                    Ok(event) => events.push(event),
-                    Err(e) => return self.fail(e),
-                },
-                State::Established { codec } => {
-                    let msg = match codec.decode(&payload) {
-                        Ok(msg) => msg,
-                        Err(e) => return self.fail(SessionError::Codec(e)),
-                    };
-                    match msg {
-                        Message::Hello(_) => {
-                            return self.fail(SessionError::UnexpectedMessage(
-                                "hello after handshake".into(),
-                            ));
-                        }
-                        Message::Goodbye { reason } => {
-                            self.state = State::Closed;
-                            events.push(SessionEvent::Closed { reason });
-                            break;
-                        }
-                        Message::Ping { seq } => {
-                            let codec = *codec;
-                            self.queue(codec, &Message::Pong { seq })?;
-                        }
-                        msg => events.push(SessionEvent::Message(msg)),
+        self.drain_frames(&mut events)
+            .inspect_err(|e| self.close(e.to_string()))?;
+        Ok(events)
+    }
+
+    fn drain_frames(&mut self, events: &mut Vec<SessionEvent>) -> Result<(), SessionError> {
+        while let Some(payload) = self.reader.next_frame()? {
+            match self.state {
+                State::AwaitingHello => events.push(self.handle_hello(&payload)?),
+                State::Established { codec } => match codec.decode(&payload)? {
+                    Message::Hello(_) => {
+                        return Err(SessionError::UnexpectedMessage(
+                            "hello after handshake".into(),
+                        ));
                     }
-                }
+                    Message::Goodbye { reason } => {
+                        self.state = State::Closed;
+                        events.push(SessionEvent::Closed { reason });
+                        break;
+                    }
+                    Message::Ping { seq } => self.queue(codec, &Message::Pong { seq })?,
+                    msg => events.push(SessionEvent::Message(msg)),
+                },
                 State::Closed => break,
             }
         }
-        Ok(events)
+        Ok(())
     }
 
     /// Encodes and queues an application message.
     pub fn send(&mut self, msg: &Message) -> Result<(), SessionError> {
-        let State::Established { codec } = &self.state else {
+        let State::Established { codec } = self.state else {
             return Err(SessionError::NotEstablished);
         };
         if matches!(msg, Message::Hello(_) | Message::Goodbye { .. }) {
@@ -194,7 +183,6 @@ impl Session {
                 "hello and goodbye are managed by the session".into(),
             ));
         }
-        let codec = *codec;
         self.queue(codec, msg)
     }
 
@@ -203,8 +191,8 @@ impl Session {
         if self.is_closed() {
             return;
         }
-        let codec = match &self.state {
-            State::Established { codec } => *codec,
+        let codec = match self.state {
+            State::Established { codec } => codec,
             _ => Codec::HANDSHAKE,
         };
         let _ = self.queue(
@@ -252,20 +240,15 @@ impl Session {
 
     fn queue(&mut self, codec: Codec, msg: &Message) -> Result<(), SessionError> {
         let encoded = codec.encode(msg)?;
-        let framed = frame(&encoded)?;
-        self.out.extend_from_slice(&framed);
+        frame_into(&encoded, &mut self.out)?;
         Ok(())
-    }
-
-    fn fail(&mut self, error: SessionError) -> Result<Vec<SessionEvent>, SessionError> {
-        self.close(error.to_string());
-        Err(error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framing::frame;
     use crate::messages::WindowId;
 
     fn raw_hello_frame(hello: Hello) -> Vec<u8> {

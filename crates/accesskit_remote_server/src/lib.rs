@@ -59,11 +59,7 @@ pub fn apply_source_event(
     event: SourceEvent,
 ) -> Result<(), ServerError> {
     match event {
-        SourceEvent::WindowAdded { descriptor, tree } => {
-            let id = descriptor.id;
-            server.announce_window(&descriptor)?;
-            server.send_tree_update(id, tree)
-        }
+        SourceEvent::WindowAdded { descriptor, tree } => server.add_window(&descriptor, tree),
         SourceEvent::WindowRemoved(id) => server.remove_window(id),
         SourceEvent::TreeUpdate { window, update } => server.send_tree_update(window, update),
         SourceEvent::FocusChanged(window) => server.send_focus(window),
@@ -146,23 +142,31 @@ impl ServerConnection {
         let events = self.session.handle_input(chunk)?;
         let mut out = Vec::new();
         for event in events {
-            match event {
-                SessionEvent::Established { .. } => out.push(ServerEvent::Established),
-                SessionEvent::Closed { reason } => out.push(ServerEvent::Closed { reason }),
-                SessionEvent::Message(Message::Action { window, request }) => {
-                    out.push(ServerEvent::Action { window, request });
-                }
-                SessionEvent::Message(Message::Pong { seq }) => {
-                    out.push(ServerEvent::Pong { seq });
-                }
-                SessionEvent::Message(other) => {
-                    let error = ServerError::UnexpectedMessage(format!("{other:?}"));
-                    self.session.close(error.to_string());
-                    return Err(error);
-                }
-            }
+            self.handle_event(event, &mut out)
+                .inspect_err(|e| self.session.close(e.to_string()))?;
         }
         Ok(out)
+    }
+
+    fn handle_event(
+        &mut self,
+        event: SessionEvent,
+        out: &mut Vec<ServerEvent>,
+    ) -> Result<(), ServerError> {
+        match event {
+            SessionEvent::Established { .. } => out.push(ServerEvent::Established),
+            SessionEvent::Closed { reason } => out.push(ServerEvent::Closed { reason }),
+            SessionEvent::Message(Message::Action { window, request }) => {
+                out.push(ServerEvent::Action { window, request });
+            }
+            SessionEvent::Message(Message::Pong { seq }) => {
+                out.push(ServerEvent::Pong { seq });
+            }
+            SessionEvent::Message(other) => {
+                return Err(ServerError::UnexpectedMessage(other.kind().into()));
+            }
+        }
+        Ok(())
     }
 
     /// Announces existing windows, their full trees, and the focused window
@@ -173,11 +177,20 @@ impl ServerConnection {
         focus: Option<WindowId>,
     ) -> Result<(), ServerError> {
         for (descriptor, tree) in windows {
-            let id = descriptor.id;
-            self.announce_window(&descriptor)?;
-            self.send_tree_update(id, tree)?;
+            self.add_window(&descriptor, tree)?;
         }
         self.send_focus(focus)
+    }
+
+    /// Announces a window and immediately sends its full tree, in the order
+    /// the consumer requires.
+    fn add_window(
+        &mut self,
+        descriptor: &WindowDescriptor,
+        tree: accesskit::TreeUpdate,
+    ) -> Result<(), ServerError> {
+        self.announce_window(descriptor)?;
+        self.send_tree_update(descriptor.id, tree)
     }
 
     pub fn announce_window(&mut self, descriptor: &WindowDescriptor) -> Result<(), ServerError> {

@@ -97,6 +97,24 @@ pub enum Message {
     },
 }
 
+impl Message {
+    /// A short, stable name for the variant, for bounded diagnostics
+    /// (a message's `Debug` can embed an entire tree).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Hello(_) => "hello",
+            Self::Goodbye { .. } => "goodbye",
+            Self::WindowAdded { .. } => "windowAdded",
+            Self::WindowRemoved { .. } => "windowRemoved",
+            Self::TreeUpdate { .. } => "treeUpdate",
+            Self::FocusChanged { .. } => "focusChanged",
+            Self::Action { .. } => "action",
+            Self::Ping { .. } => "ping",
+            Self::Pong { .. } => "pong",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
