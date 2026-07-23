@@ -94,6 +94,42 @@ for the build-up.
   `WindowAdded` (correct title/tree) and killing the apps produced
   `WindowRemoved` for every tracked window; the visibility race never bit.
   Commit 16b10e6.
+- **DVC plugin scaffolding + live load** (`accesskit_remote_dvc_plugin`): COM
+  scaffolding ported from rd_pipe-rs (relicensed MIT/Apache), exposed via the
+  **instance method** — the DLL exports `VirtualChannelGetInstance`; no class
+  factory, no CLSID, no `DllInstall` (manual registration). `IWTSPlugin` →
+  `IWTSListenerCallback` → `IWTSVirtualChannelCallback` (the channel callback is
+  a logging **stub**; the real transport is hvsocket, still to come). Hardcoded
+  `AccessKit` channel name; `DllMain` logs to `%TEMP%\AccessKitDvc.log` (level
+  via `ACCESSKIT_DVC_LOG`). The export chain-loads the stock `WSLDVCPlugin.dll`
+  and returns both plug-ins **only** when it occupies the `WSLDVC_PRIVATE` slot
+  (gated on `/plugin:WSLDVC_PRIVATE` in the host command line); the merge never
+  writes past the caller's array and reports the actual count written, our
+  plug-in written last. 12 tests (5 unit incl. a live probe of the real stock
+  DLL; 7 integration over a fake DVC framework). Build/test:
+  `cargo build|test -p accesskit_remote_dvc_plugin --target x86_64-pc-windows-msvc`
+  (the cdylib is loaded at runtime, so `build` must precede `test`; never
+  `--workspace`). **Verified live on both routes:**
+  - *mstsc dev path* (HKCU `AddIns\<name>` `Name` = DLL path, `.wslgconfig`
+    `WSLG_USE_MSTSC=true`): loaded into the connected mstsc; log shows probe
+    `reporting 1 (chain=false)`, fetch `cap=1 wrote 1`, `Initialize` → `Creating
+    listener … AccessKit` → `Client connected`. (mstsc shows a per-launch
+    RemoteApp trust dialog that needs a real interactive Connect click; synthetic
+    clicks don't complete it — Spike 2d.)
+  - *msrdc production path* (HKLM `OptionalAddIns\WSLDVC_PRIVATE` `Name` = DLL
+    path, `WSLG_USE_WSLDVC_PRIVATE=true`): both our DLL **and** the stock
+    `WSLDVCPlugin.dll` loaded into the connected msrdc; log shows `Chain-loaded
+    stock plug-in …`, probe `reporting 2 (ours=1, stock=1, chain=true)`, fetch
+    `cap=2 wrote 2`. **msrdc allocated a 2-element array, so the count>1 return
+    is confirmed safe — the buffer-overflow linchpin is resolved, not just
+    mitigated.** weston's `rdp_rail_notify_app_list()` fired, i.e. the
+    chain-loaded stock plug-in accepted its channel → WSLg integration intact.
+    **Caveat**: no `RAIL_WINDOW` toplevel mapped this session; a control run of
+    *default* WSLg (no plugin) also mapped none (empty GTK app logs both times),
+    so this is a boot/GTK-surface condition, **not** a plugin regression.
+    (WSLDVCPlugin governs the Start-Menu app-list only; RAIL windowing is msrdc +
+    weston rdprail-shell, independent of it.) Commits ba4c457 (Spike 2d),
+    0963a4b (scaffolding), 6c7ab5c (chain-load).
 
 ## Remaining
 
@@ -124,23 +160,30 @@ for the build-up.
   debug-only `eprintln` in `atspi-connection`, silently ignored in release
   builds. Left as is (the doc's "drop p2p" plan was moot).
 
-## After that
+## After that — DVC plugin, remaining (scaffolding + live load done above)
 
-- DVC plugin (`accesskit_remote_dvc_plugin`): port rd_pipe-rs COM
-  scaffolding (user holds copyright, relicense MIT/Apache): `src/lib.rs`,
-  `class_factory.rs`, `registry.rs`, plugin/listener halves of
-  `rd_pipe_plugin.rs`, fake-DVC test harness from `tests/common/mod.rs`.
-  New CLSID. Reuse `RemoteWindowBinding` on RAIL HWNDs; association via
-  `WslgServerWindowId` HWND props + normalized titles (strip
-  `[WARN:COPY MODE] ` prefix and ` (<distro>)` suffix). WSLg loading:
-  `OptionalAddIns\WSLDVC_PRIVATE` + `.wslgconfig`
-  `WSLG_USE_WSLDVC_PRIVATE=true`; our `VirtualChannelGetInstance` returns
-  BOTH the stock WSLDVCPlugin instance (chain-load
-  `C:\Program Files\WSL\WSLDVCPlugin.dll`) and ours. Regular `AddIns` is
-  ignored by the /wslg msrdc instance (verified) but works for mstsc.
-- In-context WinEvent hook (`EVENT_OBJECT_CREATE`/`SHOW`, own PID) to
-  catch RAIL windows pre-visibility; late attach needs an upstream
-  AccessKit patch (SubclassingAdapter panics on visible windows).
+1. **hvsocket transport in the plugin**: wire `accesskit_remote_client`'s
+   `ClientConnection` into the plugin — parse the WSL VM ID from our own process
+   command line (`/v:<guid>`), `hvsocket::connect`, and pump
+   `handle_input`/`take_output` on a dedicated thread, mirroring the `viewer`
+   example (incl. the `ConnectionAborted`-retry). The DVC channel stays
+   vestigial; tree data flows out-of-band over hvsocket. The `client`/`windows`
+   deps are already declared for this.
+2. **UIA on RAIL HWNDs**: reuse `RemoteWindowBinding`, but `SubclassingAdapter`
+   panics on already-visible windows and RAIL HWNDs are visible when the plugin
+   sees them. Either attach pre-show via an in-context WinEvent hook
+   (`EVENT_OBJECT_CREATE`/`SHOW`, own PID) or build a parallel binding on the
+   lower-level `accesskit_windows::Adapter` with a manual `WM_GETOBJECT` subclass
+   (no visibility precondition). Spike 1b: msrdc exposes no server-side UIA on
+   RAIL windows, so anything we add is pure addition.
+3. **Window association**: match each GTK toplevel to its RAIL HWND via the
+   `WslgServerWindowId` HWND property + normalized titles (strip
+   `[WARN:COPY MODE] ` prefix and ` (<distro>)` suffix, which equals the AT-SPI
+   frame name for GTK apps).
+
+Also re-confirm a `RAIL_WINDOW` actually maps in a healthy WSLg session — this
+session's GTK app never presented a surface even in default WSLg (see the
+milestone caveat above), so the RAIL-HWND work needs a boot where windows map.
 
 ## Workflow notes
 
