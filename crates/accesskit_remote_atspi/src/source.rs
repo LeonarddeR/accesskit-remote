@@ -4,7 +4,7 @@
 //! actions in via a tokio channel, tree events out via a std channel.
 
 use crate::focus::FocusTracker;
-use crate::mapping::{build_window_update, focus_update, NodeIdMap};
+use crate::mapping::{build_window_update, focus_update, NodeIdMap, TextNodeCache};
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
 use accesskit_remote::WindowId;
@@ -194,8 +194,11 @@ struct WindowState {
     ids: NodeIdMap,
     objects: HashMap<accesskit::NodeId, ObjectRefOwned>,
     /// The node this window last reported as focused, kept live so partial
-    /// (focus-only, and later caret) deltas can carry a non-stale `focus`.
+    /// (focus-only, and caret) deltas can carry a non-stale `focus`.
     focus: accesskit::NodeId,
+    /// Per-text-node cache (keyed by AT-SPI object path) for minimal caret and
+    /// text-change deltas.
+    text: HashMap<String, TextNodeCache>,
 }
 
 impl Mirror {
@@ -247,7 +250,8 @@ impl Mirror {
         let mut descriptor = window.descriptor;
         descriptor.id = id;
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&nodes, &mut ids);
+        let mut text = HashMap::new();
+        let update = build_window_update(&nodes, &mut ids, &mut text);
         let objects = index_objects(&nodes, &ids, &objects_by_path);
         self.windows.push(WindowState {
             id,
@@ -255,6 +259,7 @@ impl Mirror {
             ids,
             objects,
             focus: update.focus,
+            text,
         });
         Ok(Some((descriptor, update)))
     }
@@ -406,7 +411,7 @@ impl Mirror {
             return None;
         }
         let state = &mut self.windows[index];
-        let update = build_window_update(&nodes, &mut state.ids);
+        let update = build_window_update(&nodes, &mut state.ids, &mut state.text);
         state.objects = index_objects(&nodes, &state.ids, &objects_by_path);
         state.focus = update.focus;
         Some(SourceEvent::TreeUpdate { window, update })
@@ -549,6 +554,7 @@ mod tests {
             ids,
             objects,
             focus: node_id,
+            text: HashMap::new(),
         }
     }
 

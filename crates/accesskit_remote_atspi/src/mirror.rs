@@ -168,6 +168,7 @@ pub async fn walk_window(
             focused: states.contains(State::Focused),
             actionable,
             children,
+            text: None,
         });
         objects.insert(path, obj);
     }
