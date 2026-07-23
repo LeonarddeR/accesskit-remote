@@ -1,8 +1,8 @@
-//! The provider daemon. Serves the demo tree source over a socket until the
-//! AT-SPI source lands.
+//! The provider daemon. Serves a tree source over a socket.
 //!
-//! Usage: `accesskit_remoted [--tcp PORT | --vsock PORT]`
-//! Defaults to `--tcp 4750`; `--vsock` is Linux-only.
+//! Usage: `accesskit_remoted [--tcp PORT | --vsock PORT] [--atspi]`
+//! Defaults to `--tcp 4750` with the demo source; `--vsock` and `--atspi`
+//! are Linux-only.
 
 mod demo;
 
@@ -33,22 +33,47 @@ impl Listener {
     }
 }
 
+/// Which tree source the daemon serves to each connection.
+#[derive(Clone, Copy)]
+enum Source {
+    Demo,
+    #[cfg(target_os = "linux")]
+    Atspi,
+}
+
+#[cfg(target_os = "linux")]
+fn select_atspi() -> io::Result<Source> {
+    Ok(Source::Atspi)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn select_atspi() -> io::Result<Source> {
+    Err(io::Error::other("--atspi is only supported on Linux"))
+}
+
 fn main() -> io::Result<()> {
-    let (listener, description) = parse_args(std::env::args().skip(1))?;
+    let (listener, description, source) = parse_args(std::env::args().skip(1))?;
     eprintln!("accesskit_remoted: listening on {description}");
     loop {
         let stream = listener.accept()?;
         eprintln!("accesskit_remoted: client connected");
-        match serve(stream) {
+        match serve(stream, source) {
             Ok(()) => eprintln!("accesskit_remoted: client disconnected"),
             Err(e) => eprintln!("accesskit_remoted: connection ended: {e}"),
         }
     }
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> io::Result<(Listener, String)> {
-    let args: Vec<String> = args.collect();
-    let (mode, port) = match args.as_slice() {
+fn parse_args(args: impl Iterator<Item = String>) -> io::Result<(Listener, String, Source)> {
+    let mut source = Source::Demo;
+    let mut positional = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--atspi" => source = select_atspi()?,
+            _ => positional.push(arg),
+        }
+    }
+    let (mode, port) = match positional.as_slice() {
         [] => ("--tcp", DEFAULT_PORT),
         [mode] => (mode.as_str(), DEFAULT_PORT),
         [mode, port] => (
@@ -56,25 +81,36 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<(Listener, Strin
             port.parse()
                 .map_err(|_| io::Error::other(format!("invalid port: {port}")))?,
         ),
-        _ => return Err(io::Error::other("usage: accesskit_remoted [--tcp PORT | --vsock PORT]")),
+        _ => {
+            return Err(io::Error::other(
+                "usage: accesskit_remoted [--tcp PORT | --vsock PORT] [--atspi]",
+            ))
+        }
     };
     match mode {
         "--tcp" => {
             let listener = accesskit_remote_transport::tcp::listen_local(port as u16)?;
-            Ok((Listener::Tcp(listener), format!("tcp 127.0.0.1:{port}")))
+            Ok((Listener::Tcp(listener), format!("tcp 127.0.0.1:{port}"), source))
         }
         #[cfg(target_os = "linux")]
         "--vsock" => {
             let listener = accesskit_remote_transport::vsock::listen(port)?;
-            Ok((Listener::Vsock(listener), format!("vsock port {port}")))
+            Ok((Listener::Vsock(listener), format!("vsock port {port}"), source))
         }
         other => Err(io::Error::other(format!("unknown mode: {other}"))),
     }
 }
 
-fn serve(stream: Socket) -> io::Result<()> {
-    let mut source = DemoSource::new();
-    let mut server = ServerConnection::new("accesskit_remoted-demo");
+fn serve(stream: Socket, source: Source) -> io::Result<()> {
+    let (mut source, name): (Box<dyn TreeSource>, &str) = match source {
+        Source::Demo => (Box::new(DemoSource::new()), "accesskit_remoted-demo"),
+        #[cfg(target_os = "linux")]
+        Source::Atspi => (
+            Box::new(accesskit_remote_atspi::AtspiSource::new().map_err(io::Error::other)?),
+            "accesskit_remoted-atspi",
+        ),
+    };
+    let mut server = ServerConnection::new(name);
     let mut writer = stream.try_clone()?;
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
@@ -93,7 +129,7 @@ fn serve(stream: Socket) -> io::Result<()> {
         }
     });
 
-    let result = pump(&mut server, &mut source, &rx, &mut writer);
+    let result = pump(&mut server, source.as_mut(), &rx, &mut writer);
     let _ = writer.shutdown(std::net::Shutdown::Both);
     drop(rx);
     let _ = reader_thread.join();
