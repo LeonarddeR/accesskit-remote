@@ -19,40 +19,50 @@ for the build-up.
   (FrameworkId 'AccessKit') and InvokePattern-clicked the demo button,
   label updated through daemon and back. UIA test script pattern: find
   window by name via System.Windows.Automation in Windows PowerShell 5.1.
+- `TreeSource` seam wired: `DemoSource` implements `TreeSource` (buffers
+  deltas in a pending vec, drained via `poll_events`; `initial_state`
+  returns the focus tuple). `accesskit_remoted`'s `serve`/`pump`/`dispatch`
+  run over `&mut dyn TreeSource`; `pump` drains `poll_events()` →
+  `apply_source_event` after each chunk and tick, gated on an established
+  session (events polled before that are dropped). Commit 58e78c2.
+- `accesskit_remote_atspi` v0 — the AT-SPI mirror (Linux-only). Pure
+  mapping core (`mapping.rs`): AT-SPI role → accesskit role with a
+  `GenericContainer` fallback; stable path→NodeId allocator; Label text
+  → `set_value` (UIA Name for labels comes from value); Click gated to
+  clickable roles; Focus from `Focusable`. 6 unit tests. Async bus layer
+  (`mirror.rs`): connect, discover visible toplevel frames across the
+  desktop's apps, BFS-walk a frame. `AtspiSource` (`source.rs`) runs the
+  bus on a dedicated tokio current-thread; `initial_state` blocks on the
+  first enumeration snapshot; `perform` → bridge re-walks the window and
+  emits a `TreeUpdate`; `poll_events` drains a std channel. **Verified
+  live**: the `dump_tree` example enumerated gnome-text-editor into an
+  83-node tree (root Window; correct Button / Label / MultilineTextInput
+  / ProgressIndicator / ScrollView; Click only on the 7 real buttons).
+  Deps `atspi 0.30` / `zbus 5.18` / `tokio`, gated to `cfg(linux)` so the
+  crate is empty on Windows. Commit 9777500.
 
-## In flight (committed, not yet wired)
+## In flight
 
-`accesskit_remote_server` now has `TreeSource` trait + `SourceEvent` +
-`apply_source_event`. The daemon still calls `DemoSource` methods
-directly. Next steps:
-
-1. Make `DemoSource` implement `TreeSource` (buffer deltas in a pending
-   vec, drain via `poll_events`; `initial_state` returns the tuple with
-   focus). Generalize `serve`/`pump` in `accesskit_remoted/src/main.rs`
-   over `&mut dyn TreeSource`: on tick and after each chunk, drain
-   `poll_events()` → `apply_source_event` (only when established;
-   drop events when not — initial sync covers state).
-2. Build `accesskit_remote_atspi` v0 (the mirror). Design decisions made:
-   - `atspi` crate (Odilia, ~0.29) + zbus, tokio current-thread runtime in
-     a dedicated thread; bridge to the sync daemon with std mpsc (events
-     out) + tokio mpsc (actions in). `AtspiSource` implements `TreeSource`
-     over the channels.
-   - v0 scope: enumerate desktop → applications → toplevel frames
-     (visible+showing); walk subtrees; map AT-SPI role/name/states to
-     accesskit nodes (Role::Label gets text via `set_value` — the UIA
-     Name for labels comes from value, not label!). NodeIds: sequential
-     u64 per D-Bus object path (keep a path→NodeId map per window).
-   - Events v0: focus + window lifecycle + `children-changed` → full
-     re-walk of that window, send whole tree as one update (overwrite
-     semantics make this valid; client store prunes unreachable nodes).
-     Fine-grained diffing and the text pattern come later.
-   - Actions: Click → Action interface `do_action(0)`; Focus →
-     `Component.GrabFocus`.
-   - Consistency discipline per Orca analysis (see the "Mirror
-     consistency strategy" section of the design plan and
-     `P:\a11y\orca`): events are hints; re-query before believing;
-     re-walk on structural events; ~60s reconciliation later.
-3. Test recipe for the milestone (GTK app tree visible from Windows):
+1. `accesskit_remote_atspi` v0 is built and smoke-tested (above).
+   Remaining for the mirror:
+   - **Passive event reflection** (not wired yet). Today updates are
+     action-driven only: `perform` → re-walk that window → emit
+     `TreeUpdate`. Next: subscribe to atspi `event_stream()` and re-walk
+     affected windows on focus / window-lifecycle / `children-changed`.
+     Consistency discipline per Orca (events are hints; re-query before
+     believing; re-walk on structural events; ~60s reconciliation) lands
+     with this. See `P:\a11y\orca`.
+   - **Window lifecycle**: emit `WindowAdded`/`WindowRemoved` as apps open
+     and close toplevels (v0 enumerates once at connect).
+   - App identity: `pid`/`toolkit` on `AppInfo` (v0 sets `name` only).
+2. **Wire `AtspiSource` into `accesskit_remoted`** — the daemon still
+   hardcodes `DemoSource`. Add a `cfg(linux)` dep on
+   `accesskit_remote_atspi` and a flag (e.g. `--atspi`) that constructs
+   `AtspiSource::new()?` instead of `DemoSource`. `pump`/`drain_source`
+   already run over `&mut dyn TreeSource`, so this is construction + arg
+   parsing only.
+3. Test recipe for the milestone (GTK app tree visible from Windows;
+   needs step 2 first):
    - WSL: `CARGO_TARGET_DIR=~/target-accesskit-remote cargo build` (drvfs
      is slow; keep target dir native), run
      `accesskit_remoted --vsock 4750`, launch
@@ -89,3 +99,20 @@ directly. Next steps:
   elevation.
 - Commit each tested component without asking (user's standing
   instruction); stop only for real obstacles.
+- Rust **is** now installed in the WSL distro (rustup, cargo, rustc
+  1.97.1); the spikes.md note is stale. Build/test the Linux-only crates
+  from Windows via `wsl -e bash -lc '...'`. Use single-quoted PowerShell
+  args so `$` reaches bash unexpanded. Keep `CARGO_TARGET_DIR=~/target-
+  accesskit-remote` (native, drvfs is slow); build one crate
+  (`-p accesskit_remote_atspi`), never `--workspace` on Linux (the
+  Windows-only members won't build).
+- Read vendored crate source from the WSL registry with the Read tool via
+  the UNC path `\\wsl.localhost\Debian\home\leonard\.cargo\registry\src\
+  index.crates.io-*\<crate>-<ver>\src\...` — invaluable for verifying an
+  API instead of guessing.
+- atspi smoke test (no Windows bridge needed): the a11y tree exists even
+  without a mapped window, but GTK4 only publishes it when accessibility
+  is enabled — `busctl --user set-property org.a11y.Bus /org/a11y/bus
+  org.a11y.Status IsEnabled b true` before launching the app. Then
+  `GSK_RENDERER=cairo LIBGL_ALWAYS_SOFTWARE=1 setsid gnome-text-editor &`,
+  sleep ~7s, run `dump_tree`.

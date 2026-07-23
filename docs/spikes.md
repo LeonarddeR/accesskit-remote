@@ -146,5 +146,5 @@ round-trip succeeded; guest saw the peer as CID 2 (host).
 - The WSL distro cold-starts on first `wsl.exe` call; WSLg (weston + msrdc)
   starts with it. Everything above was exercised inside the user's active RDP
   session (console locked) — WSLg works there, in RAIL copy mode.
-- Rust is not yet installed in the distro (rustup needed before Linux-side
-  builds).
+- Rust is installed in the distro (rustup + cargo, rustc 1.97.1 as of
+  2026-07-23); Linux-side builds run via `wsl -e bash -lc '...'`.
