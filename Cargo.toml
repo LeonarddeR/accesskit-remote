@@ -22,6 +22,8 @@ authors = ["Leonard de Ruijter"]
 accesskit = { version = "0.24", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+socket2 = { version = "0.6", features = ["all"] }
+uuid = "1"
 
 accesskit_remote = { path = "crates/accesskit_remote" }
 accesskit_remote_transport = { path = "crates/accesskit_remote_transport" }

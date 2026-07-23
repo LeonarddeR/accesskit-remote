@@ -8,3 +8,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+socket2.workspace = true
+uuid.workspace = true
