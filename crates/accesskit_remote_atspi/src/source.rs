@@ -4,13 +4,16 @@
 //! actions in via a tokio channel, tree events out via a std channel.
 
 use crate::focus::FocusTracker;
-use crate::mapping::{build_window_update, focus_update, NodeIdMap, TextNodeCache};
+use crate::mapping::{build_window_update, focus_update, rebuild_text_node, NodeIdMap, TextNodeCache};
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
-use atspi::events::object::{ChildrenChangedEvent, StateChangedEvent};
+use atspi::events::object::{
+    ChildrenChangedEvent, StateChangedEvent, TextCaretMovedEvent, TextChangedEvent,
+    TextSelectionChangedEvent,
+};
 use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
 use atspi::object_ref::ObjectRefOwned;
 use atspi::State;
@@ -168,14 +171,18 @@ async fn bridge_main(
 }
 
 /// Subscribes to the AT-SPI events that drive passive tree reflection:
-/// structural `children-changed`, window lifecycle/activation, and
-/// `state-changed` (filtered to `:focused` in the handler). The coarse
-/// `state-changed` rule also delivers unrelated state changes; the handler
-/// discards them in O(1) and never re-walks on them.
+/// structural `children-changed`, window lifecycle/activation, `state-changed`
+/// (filtered to `:focused` in the handler), and the text events that move the
+/// caret or change text/selection. The coarse `state-changed` rule also
+/// delivers unrelated state changes; the handler discards them in O(1). Text
+/// events re-query a single node and never re-walk.
 async fn register_events(conn: &AccessibilityConnection) -> BridgeResult<()> {
     conn.register_event::<ChildrenChangedEvent>().await?;
     conn.register_event::<WindowEvents>().await?;
     conn.register_event::<StateChangedEvent>().await?;
+    conn.register_event::<TextCaretMovedEvent>().await?;
+    conn.register_event::<TextChangedEvent>().await?;
+    conn.register_event::<TextSelectionChangedEvent>().await?;
     Ok(())
 }
 
@@ -301,6 +308,18 @@ impl Mirror {
                 return self.handle_focus_change(conn, &event, enabled).await;
             }
         }
+        match &event {
+            Event::Object(ObjectEvents::TextCaretMoved(ev)) => {
+                return self.refresh_text(conn, &ev.item).await
+            }
+            Event::Object(ObjectEvents::TextChanged(ev)) => {
+                return self.refresh_text(conn, &ev.item).await
+            }
+            Event::Object(ObjectEvents::TextSelectionChanged(ev)) => {
+                return self.refresh_text(conn, &ev.item).await
+            }
+            _ => {}
+        }
         let activation = matches!(&event, Event::Window(WindowEvents::Activate(_)));
         let deactivation = matches!(&event, Event::Window(WindowEvents::Deactivate(_)));
         let targets: Vec<WindowId> = match &event {
@@ -396,6 +415,49 @@ impl Mirror {
             }
         }
         out
+    }
+
+    /// Reflects an AT-SPI text event (caret move, text change, selection change)
+    /// by re-querying just the emitting node's `Text` interface and emitting a
+    /// minimal delta of the changed nodes — never a re-walk. Gated on the object
+    /// being a tracked text node of the sending app, so unrelated objects and
+    /// untracked apps cost no bus call.
+    async fn refresh_text(
+        &mut self,
+        conn: &AccessibilityConnection,
+        item: &ObjectRefOwned,
+    ) -> Vec<SourceEvent> {
+        let Some(sender) = item.name() else {
+            return Vec::new();
+        };
+        let sender = sender.as_str();
+        let path = item.path_as_str();
+        let Some(index) = self.windows.iter().position(|w| {
+            w.root.name().is_some_and(|n| n.as_str() == sender) && w.text.contains_key(path)
+        }) else {
+            return Vec::new();
+        };
+        let Some(state) = mirror::read_text_state(conn.connection(), item).await else {
+            return Vec::new();
+        };
+        let window_state = &mut self.windows[index];
+        let cache = window_state
+            .text
+            .get_mut(path)
+            .expect("text cache present (checked above)");
+        let changed = rebuild_text_node(cache, path, &state, &mut window_state.ids);
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        vec![SourceEvent::TreeUpdate {
+            window: window_state.id,
+            update: accesskit::TreeUpdate {
+                nodes: changed,
+                tree: None,
+                tree_id: accesskit::TreeId::ROOT,
+                focus: window_state.focus,
+            },
+        }]
     }
 
     /// Re-walks one window and rebuilds its tree, reusing its stable id map.
