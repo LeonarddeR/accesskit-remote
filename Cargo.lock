@@ -37,7 +37,9 @@ dependencies = [
  "accesskit",
  "accesskit_remote",
  "accesskit_remote_server",
+ "accesskit_remote_transport",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -77,8 +79,10 @@ dependencies = [
 name = "accesskit_remoted"
 version = "0.1.0"
 dependencies = [
- "accesskit_remote_atspi",
+ "accesskit",
+ "accesskit_remote",
  "accesskit_remote_server",
+ "accesskit_remote_transport",
 ]
 
 [[package]]

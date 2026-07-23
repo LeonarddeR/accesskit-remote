@@ -1,6 +1,6 @@
 [package]
 name = "accesskit_remoted"
-description = "Daemon serving AT-SPI accessibility trees to remote AccessKit consumers"
+description = "Daemon serving accessibility trees to remote AccessKit consumers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,7 +8,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+accesskit.workspace = true
+accesskit_remote.workspace = true
 accesskit_remote_server.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-accesskit_remote_atspi.workspace = true
+accesskit_remote_transport.workspace = true
