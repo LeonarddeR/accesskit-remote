@@ -9,6 +9,7 @@ members = [
     "crates/accesskit_remoted",
     "crates/accesskit_remote_windows",
     "crates/accesskit_remote_dvc_plugin",
+    "xtask",
 ]
 
 [workspace.package]
