@@ -19,7 +19,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::zbus::fdo::DBusProxy;
 use atspi::zbus::names::BusName;
-use atspi::{CoordType, Interface, Role, State, StateSet};
+use atspi::{CoordType, Interface, InterfaceSet, Role, State, StateSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Errors from the bridge are boxed so bus, session, and zbus error types can
@@ -175,10 +175,12 @@ pub(crate) async fn read_node(
     let role = proxy.get_role().await.unwrap_or(Role::Invalid);
     let name = proxy.name().await.unwrap_or_default();
     let states = proxy.get_state().await.unwrap_or_else(|_| StateSet::empty());
-    let interfaces = proxy.get_interfaces().await.ok();
-    let actionable = interfaces
-        .as_ref()
-        .is_some_and(|set| set.contains(Interface::Action));
+    // A failed read degrades to "advertises nothing", so every interface-gated
+    // read below is skipped rather than attempted blind.
+    let interfaces = proxy
+        .get_interfaces()
+        .await
+        .unwrap_or_else(|_| InterfaceSet::empty());
     let mut children = Vec::new();
     let mut child_refs = Vec::new();
     for child in proxy.get_children().await.unwrap_or_default() {
@@ -188,33 +190,23 @@ pub(crate) async fn read_node(
         children.push(child.path_as_str().to_owned());
         child_refs.push(child);
     }
-    let text = if reads_text_runs(role, !children.is_empty())
-        && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
+    let text = if reads_text_runs(role, !children.is_empty()) && interfaces.contains(Interface::Text)
     {
         read_text_state(zconn, obj, has_text_caret(role), true).await
     } else {
         None
     };
-    let bounds = if interfaces
-        .as_ref()
-        .is_some_and(|set| set.contains(Interface::Component))
-    {
+    let bounds = if interfaces.contains(Interface::Component) {
         read_component_extents(zconn, obj).await
     } else {
         None
     };
-    let st = node_states(states);
     let node = MirrorNode {
         path: obj.path_as_str().to_owned(),
         role,
         name,
-        focusable: st.focusable,
-        focused: st.focused,
-        expanded: st.expanded,
-        selected: st.selected,
-        toggled: st.toggled,
-        has_popup: st.has_popup,
-        actionable,
+        interfaces,
+        states: node_states(states),
         children,
         text,
         bounds,

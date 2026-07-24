@@ -8,7 +8,7 @@ use crate::coalesce::RewalkCoalescer;
 use crate::focus::FocusTracker;
 use crate::mapping::{
     build_window_update, emitted_children, focus_update, merge_update, rebuild_text_node,
-    splice_chain_update, text_offset, NodeIdMap, TextNodeCache,
+    splice_chain_update, text_offset, NodeIdMap, WindowCache,
 };
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
@@ -265,9 +265,10 @@ struct WindowState {
     /// The node this window last reported as focused, kept live so partial
     /// (focus-only, and caret) deltas can carry a non-stale `focus`.
     focus: accesskit::NodeId,
-    /// Per-text-node cache (keyed by AT-SPI object path) for minimal caret and
-    /// text-change deltas.
-    text: HashMap<String, TextNodeCache>,
+    /// What this window last emitted, keyed by AT-SPI object path: every
+    /// container node the client holds, plus per-text-node bookkeeping for
+    /// minimal caret and text-change deltas.
+    cache: WindowCache,
     /// The element children each walked node was emitted with, by path — the
     /// client tree's current structure, consulted when splicing new nodes in.
     children: HashMap<String, Vec<String>>,
@@ -323,8 +324,8 @@ impl Mirror {
         let mut descriptor = window.descriptor;
         descriptor.id = id;
         let mut ids = NodeIdMap::new();
-        let mut text = HashMap::new();
-        let update = build_window_update(&nodes, &mut ids, &mut text);
+        let mut cache = WindowCache::default();
+        let update = build_window_update(&nodes, &mut ids, &mut cache);
         let objects = index_objects(&nodes, &ids, &objects_by_path);
         self.windows.push(WindowState {
             id,
@@ -332,7 +333,7 @@ impl Mirror {
             ids,
             objects,
             focus: update.focus,
-            text,
+            cache,
             children: emitted_children(&nodes),
         });
         Ok(Some((descriptor, update)))
@@ -353,7 +354,7 @@ impl Mirror {
             let target = window.objects.get(&msg.node)?.clone();
             let selection = if msg.action == accesskit::Action::SetTextSelection {
                 let sel = msg.data.as_ref()?;
-                let cache = window.text.get(target.path_as_str())?;
+                let cache = window.cache.text.get(target.path_as_str())?;
                 let anchor = text_offset(&cache.layout, &sel.anchor)?;
                 let focus = text_offset(&cache.layout, &sel.focus)?;
                 Some((anchor, focus))
@@ -637,7 +638,7 @@ impl Mirror {
             &ancestor_children,
             &known,
             &mut state.ids,
-            &mut state.text,
+            &mut state.cache,
         )?;
         for (node, object) in chain {
             if let Some(id) = state.ids.get(&node.path) {
@@ -668,22 +669,23 @@ impl Mirror {
         let sender = sender.as_str();
         let path = item.path_as_str();
         let Some(index) = self.windows.iter().position(|w| {
-            w.root.name().is_some_and(|n| n.as_str() == sender) && w.text.contains_key(path)
+            w.root.name().is_some_and(|n| n.as_str() == sender) && w.cache.text.contains_key(path)
         }) else {
             return Vec::new();
         };
-        let with_caret = self.windows[index].text[path].caret_enabled;
+        let with_caret = self.windows[index].cache.text[path].caret_enabled;
         let Some(state) =
             mirror::read_text_state(conn.connection(), item, with_caret, with_geometry).await
         else {
             return Vec::new();
         };
         let window_state = &mut self.windows[index];
-        let cache = window_state
-            .text
-            .get_mut(path)
-            .expect("text cache present (checked above)");
-        let changed = rebuild_text_node(cache, path, &state, &mut window_state.ids);
+        let changed = rebuild_text_node(
+            &mut window_state.cache,
+            path,
+            &state,
+            &mut window_state.ids,
+        );
         if changed.is_empty() {
             return Vec::new();
         }
@@ -718,7 +720,7 @@ impl Mirror {
             return None;
         }
         let state = &mut self.windows[index];
-        let mut update = build_window_update(&nodes, &mut state.ids, &mut state.text);
+        let mut update = build_window_update(&nodes, &mut state.ids, &mut state.cache);
         state.objects = index_objects(&nodes, &state.ids, &objects_by_path);
         state.children = emitted_children(&nodes);
         state.focus = update.focus;
@@ -877,7 +879,7 @@ mod tests {
             ids,
             objects,
             focus: node_id,
-            text: HashMap::new(),
+            cache: WindowCache::default(),
             children,
         }
     }
@@ -894,16 +896,7 @@ mod tests {
             path: path.to_owned(),
             role,
             name: name.to_owned(),
-            focusable: false,
-            focused: false,
-            expanded: None,
-            selected: None,
-            toggled: None,
-            has_popup: false,
-            actionable: false,
-            children: Vec::new(),
-            text: None,
-            bounds: None,
+            ..Default::default()
         }
     }
 

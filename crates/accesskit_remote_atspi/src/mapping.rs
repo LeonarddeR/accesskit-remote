@@ -3,7 +3,7 @@
 //! tested without a live accessibility bus.
 
 use accesskit::{Node, NodeId, TextPosition, TextSelection, Tree, TreeId, TreeUpdate};
-use atspi::{Role, State, StateSet};
+use atspi::{Interface, InterfaceSet, Role, State, StateSet};
 use std::collections::{HashMap, HashSet};
 
 /// Caps the text mirrored from one node, in Unicode scalar values. Longer text
@@ -49,28 +49,47 @@ impl NodeIdMap {
 
 /// One AT-SPI object flattened into the fields the mapping needs. Produced by
 /// the async walk; the object path (not a proxy) is the identity.
+///
+/// Each `Option` field corresponds to an AT-SPI interface the object
+/// advertises, so `interfaces` doubles as the gate for which extra reads the
+/// walk performed: `text` ⇔ `Text`, `bounds` ⇔ `Component`.
 #[derive(Debug, Clone)]
 pub struct MirrorNode {
     pub path: String,
     pub role: Role,
     pub name: String,
-    pub focusable: bool,
-    pub focused: bool,
-    /// Expanded/collapsed when the node is expandable; `None` otherwise.
-    pub expanded: Option<bool>,
-    /// Selected/unselected when the node is selectable; `None` otherwise.
-    pub selected: Option<bool>,
-    /// Toggle state for checkable or pressable nodes; `None` otherwise.
-    pub toggled: Option<accesskit::Toggled>,
-    /// Whether the node advertises a popup (menu button, combo box, etc.).
-    pub has_popup: bool,
-    pub actionable: bool,
+    /// The interfaces the object advertises, gating the walk's optional reads
+    /// and the actions that can be planned against it.
+    pub interfaces: InterfaceSet,
+    pub states: NodeStates,
     pub children: Vec<String>,
     /// Text-interface state for text-input roles; `None` for non-text nodes.
     pub text: Option<TextState>,
     /// The object's own window-relative extents from `Component.GetExtents`;
     /// `None` when the interface is absent or the read failed.
     pub bounds: Option<CharExtent>,
+}
+
+impl Default for MirrorNode {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            role: Role::Invalid,
+            name: String::new(),
+            interfaces: InterfaceSet::empty(),
+            states: NodeStates::default(),
+            children: Vec::new(),
+            text: None,
+            bounds: None,
+        }
+    }
+}
+
+impl MirrorNode {
+    /// Whether the object advertises the AT-SPI `Action` interface.
+    pub fn is_actionable(&self) -> bool {
+        self.interfaces.contains(Interface::Action)
+    }
 }
 
 /// The AT-SPI `Text` interface state of one node. Offsets are Unicode scalar
@@ -108,7 +127,6 @@ pub struct TextRunLayout {
 #[derive(Debug, Clone)]
 pub struct TextNodeCache {
     pub node_id: NodeId,
-    pub parent: Node,
     pub element_children: Vec<NodeId>,
     pub runs: Vec<(NodeId, Node)>,
     pub layout: Vec<TextRunLayout>,
@@ -120,6 +138,18 @@ pub struct TextNodeCache {
     pub extents: Option<Vec<CharExtent>>,
     /// The container's own bounds, anchoring an empty field's caret run.
     pub container_bounds: Option<CharExtent>,
+}
+
+/// What one window last emitted, keyed by AT-SPI object path: `nodes` is
+/// exactly the set of container nodes the client's tree currently holds, and
+/// `text` the extra bookkeeping a text delta diffs against. Both are written by
+/// [`build_window_update`] (which also prunes vanished paths) and
+/// [`splice_chain_update`]; `nodes` is additionally written by a single-node
+/// refresh, making it the one authority for a node's last-emitted form.
+#[derive(Debug, Default)]
+pub struct WindowCache {
+    pub nodes: HashMap<String, Node>,
+    pub text: HashMap<String, TextNodeCache>,
 }
 
 /// Translates an AT-SPI [`Role`] into the nearest AccessKit role.
@@ -519,16 +549,22 @@ pub fn text_selection(state: &TextState, layout: &[TextRunLayout]) -> Option<Tex
 /// changed, plus any run whose content differs), and updating the cache. An
 /// empty result means nothing changed.
 pub fn rebuild_text_node(
-    cache: &mut TextNodeCache,
+    cache: &mut WindowCache,
     parent_path: &str,
     state: &TextState,
     ids: &mut NodeIdMap,
 ) -> Vec<(NodeId, Node)> {
+    let Some(text) = cache.text.get(parent_path) else {
+        return Vec::new();
+    };
+    let Some(old_parent) = cache.nodes.get(parent_path).cloned() else {
+        return Vec::new();
+    };
     // Fresh extents win; a refresh that read none (caret/selection move)
     // reuses the cached ones as long as the text length still matches.
     let effective: Option<Vec<CharExtent>> = match &state.extents {
         Some(fresh) => Some(fresh.clone()),
-        None => cache
+        None => text
             .extents
             .as_ref()
             .filter(|cached| cached.len() == state.text.chars().count())
@@ -538,11 +574,11 @@ pub fn rebuild_text_node(
         parent_path,
         &state.text,
         effective.as_deref(),
-        cache.container_bounds,
+        text.container_bounds,
         ids,
     );
-    let mut parent = cache.parent.clone();
-    let mut children = cache.element_children.clone();
+    let mut parent = old_parent.clone();
+    let mut children = text.element_children.clone();
     children.extend(runs.iter().map(|(id, _)| *id));
     parent.set_children(children);
     match text_selection(state, &layout) {
@@ -551,11 +587,11 @@ pub fn rebuild_text_node(
     }
 
     let mut changed = Vec::new();
-    if parent != cache.parent {
-        changed.push((cache.node_id, parent.clone()));
+    if parent != old_parent {
+        changed.push((text.node_id, parent.clone()));
     }
     for (index, (id, node)) in runs.iter().enumerate() {
-        let differs = match cache.runs.get(index) {
+        let differs = match text.runs.get(index) {
             Some((old_id, old_node)) => old_id != id || old_node != node,
             None => true,
         };
@@ -564,10 +600,14 @@ pub fn rebuild_text_node(
         }
     }
 
-    cache.parent = parent;
-    cache.runs = runs;
-    cache.layout = layout;
-    cache.extents = effective;
+    cache.nodes.insert(parent_path.to_owned(), parent);
+    let text = cache
+        .text
+        .get_mut(parent_path)
+        .expect("text cache present (checked above)");
+    text.runs = runs;
+    text.layout = layout;
+    text.extents = effective;
     changed
 }
 
@@ -580,7 +620,7 @@ pub fn rebuild_text_node(
 pub fn build_window_update(
     nodes: &[MirrorNode],
     ids: &mut NodeIdMap,
-    text_caches: &mut HashMap<String, TextNodeCache>,
+    cache: &mut WindowCache,
 ) -> TreeUpdate {
     let walked: HashSet<&str> = nodes.iter().map(|node| node.path.as_str()).collect();
     let root_id = ids.id_for(&nodes[0].path);
@@ -589,18 +629,20 @@ pub fn build_window_update(
     let mut live: HashSet<String> = HashSet::new();
     for node in nodes {
         let id = ids.id_for(&node.path);
-        if node.focused {
+        if node.states.focused {
             focus = id;
         }
         let built = build_node(node, id, ids, &walked);
+        cache.nodes.insert(node.path.clone(), built.container.clone());
         out.push((id, built.container));
         out.extend(built.runs);
-        if let Some(cache) = built.cache {
+        if let Some(text) = built.cache {
             live.insert(node.path.clone());
-            text_caches.insert(node.path.clone(), cache);
+            cache.text.insert(node.path.clone(), text);
         }
     }
-    text_caches.retain(|path, _| live.contains(path));
+    cache.nodes.retain(|path, _| walked.contains(path.as_str()));
+    cache.text.retain(|path, _| live.contains(path));
     TreeUpdate {
         nodes: out,
         tree: Some(Tree::new(root_id)),
@@ -661,7 +703,7 @@ pub fn splice_chain_update(
     ancestor_children: &[String],
     known: &HashSet<String>,
     ids: &mut NodeIdMap,
-    text_caches: &mut HashMap<String, TextNodeCache>,
+    cache: &mut WindowCache,
 ) -> Option<SpliceResult> {
     if chain.len() < 2 {
         return None;
@@ -697,12 +739,13 @@ pub fn splice_chain_update(
     for node in &spliced {
         let id = ids.id_for(&node.path);
         let built = build_node(node, id, ids, &walked);
+        cache.nodes.insert(node.path.clone(), built.container.clone());
         nodes_out.push((id, built.container));
         nodes_out.extend(built.runs);
-        if let Some(cache) = built.cache {
-            text_caches.insert(node.path.clone(), cache);
+        if let Some(text) = built.cache {
+            cache.text.insert(node.path.clone(), text);
         } else {
-            text_caches.remove(&node.path);
+            cache.text.remove(&node.path);
         }
         focus = Some(id);
     }
@@ -756,16 +799,16 @@ fn build_node(
             container.set_label(node.name.clone());
         }
     }
-    if let Some(toggled) = node.toggled {
+    if let Some(toggled) = node.states.toggled {
         container.set_toggled(toggled);
     }
-    if let Some(expanded) = node.expanded {
+    if let Some(expanded) = node.states.expanded {
         container.set_expanded(expanded);
     }
-    if let Some(selected) = node.selected {
+    if let Some(selected) = node.states.selected {
         container.set_selected(selected);
     }
-    if node.has_popup {
+    if node.states.has_popup {
         container.set_has_popup(accesskit::HasPopup::Menu);
     }
     let element_children: Vec<NodeId> = node
@@ -774,10 +817,10 @@ fn build_node(
         .filter(|path| walked.contains(path.as_str()))
         .map(|path| ids.id_for(path))
         .collect();
-    if node.actionable && is_clickable_role(node.role) {
+    if node.is_actionable() && is_clickable_role(node.role) {
         container.add_action(accesskit::Action::Click);
     }
-    if node.focusable {
+    if node.states.focusable {
         container.add_action(accesskit::Action::Focus);
     }
     if let Some(bounds) = node.bounds {
@@ -809,7 +852,6 @@ fn build_node(
             }
             let cache = TextNodeCache {
                 node_id: id,
-                parent: container.clone(),
                 element_children,
                 runs: runs.clone(),
                 layout,
@@ -850,21 +892,12 @@ mod tests {
             path: path.to_owned(),
             role,
             name: name.to_owned(),
-            focusable: false,
-            focused: false,
-            expanded: None,
-            selected: None,
-            toggled: None,
-            has_popup: false,
-            actionable: false,
-            children: Vec::new(),
-            text: None,
-            bounds: None,
+            ..Default::default()
         }
     }
 
     fn build(nodes: &[MirrorNode], ids: &mut NodeIdMap) -> TreeUpdate {
-        build_window_update(nodes, ids, &mut HashMap::new())
+        build_window_update(nodes, ids, &mut WindowCache::default())
     }
 
     #[test]
@@ -877,6 +910,36 @@ mod tests {
         assert_eq!(ids.id_for("/a"), a, "same path reuses its id");
         assert_eq!(ids.get("/b"), Some(b));
         assert_eq!(ids.get("/missing"), None);
+    }
+
+    #[test]
+    fn window_cache_holds_exactly_the_emitted_containers() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/a".into(), "/b".into()];
+        let a = leaf("/a", Role::Button, "A");
+        let b = leaf("/b", Role::Label, "B");
+
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        let update = build_window_update(&[root, a.clone(), b], &mut ids, &mut cache);
+
+        let emitted: HashMap<NodeId, Node> = update.nodes.iter().cloned().collect();
+        for path in ["/win", "/a", "/b"] {
+            let id = ids.get(path).expect("id allocated");
+            assert_eq!(
+                cache.nodes.get(path),
+                emitted.get(&id),
+                "cache holds the node emitted for {path}",
+            );
+        }
+        assert_eq!(cache.nodes.len(), 3);
+
+        let mut shrunk = leaf("/win", Role::Frame, "w");
+        shrunk.children = vec!["/a".into()];
+        build_window_update(&[shrunk, a], &mut ids, &mut cache);
+        assert_eq!(cache.nodes.len(), 2);
+        assert!(cache.nodes.contains_key("/a"));
+        assert!(!cache.nodes.contains_key("/b"), "vanished path is pruned");
     }
 
     #[test]
@@ -972,12 +1035,12 @@ mod tests {
         let mut root = leaf("/win", Role::Frame, "App");
         root.children = vec!["/check".into(), "/combo".into(), "/opt".into()];
         let mut check = leaf("/check", Role::CheckMenuItem, "Bold");
-        check.toggled = Some(Toggled::True);
+        check.states.toggled = Some(Toggled::True);
         let mut combo = leaf("/combo", Role::ComboBox, "Font");
-        combo.has_popup = true;
-        combo.expanded = Some(false);
+        combo.states.has_popup = true;
+        combo.states.expanded = Some(false);
         let mut opt = leaf("/opt", Role::ListItem, "Item");
-        opt.selected = Some(true);
+        opt.states.selected = Some(true);
 
         let mut ids = NodeIdMap::new();
         let update = build(&[root, check, combo, opt], &mut ids);
@@ -998,8 +1061,8 @@ mod tests {
         root.children = vec!["/label".into(), "/button".into()];
         let label = leaf("/label", Role::Label, "hello");
         let mut button = leaf("/button", Role::Button, "Click me");
-        button.actionable = true;
-        button.focusable = true;
+        button.interfaces.insert(Interface::Action);
+        button.states.focusable = true;
 
         let mut ids = NodeIdMap::new();
         let update = build(&[root, label, button], &mut ids);
@@ -1022,9 +1085,9 @@ mod tests {
     #[test]
     fn click_is_gated_to_clickable_roles() {
         let mut panel = leaf("/panel", Role::Panel, "");
-        panel.actionable = true;
+        panel.interfaces.insert(Interface::Action);
         let mut button = leaf("/button", Role::Button, "Go");
-        button.actionable = true;
+        button.interfaces.insert(Interface::Action);
 
         let mut ids = NodeIdMap::new();
         let update = build(&[panel, button], &mut ids);
@@ -1052,7 +1115,7 @@ mod tests {
         let mut root = leaf("/win", Role::Frame, "w");
         root.children = vec!["/button".into()];
         let mut button = leaf("/button", Role::Button, "b");
-        button.focused = true;
+        button.states.focused = true;
         let mut ids = NodeIdMap::new();
         let update = build(&[root, button], &mut ids);
         assert_eq!(update.focus, ids.get("/button").unwrap());
@@ -1134,7 +1197,7 @@ mod tests {
         });
 
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[root, doc, p1, p2], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[root, doc, p1, p2], &mut ids, &mut WindowCache::default());
         let doc_id = ids.get("/doc").unwrap();
 
         let tree = accesskit_consumer::Tree::new(update, false);
@@ -1306,7 +1369,7 @@ mod tests {
         let doc = text_node("/doc", TextState { text: "hi\n".into(), caret: Some(3), selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         let update = build_window_update(&[root, doc], &mut ids, &mut caches);
 
         let doc_id = ids.get("/doc").unwrap();
@@ -1318,12 +1381,12 @@ mod tests {
             let (_, n) = update.nodes.iter().find(|(id, _)| id == child).unwrap();
             assert_eq!(n.role(), accesskit::Role::TextRun);
         }
-        assert!(caches.contains_key("/doc"), "text cache populated");
+        assert!(caches.text.contains_key("/doc"), "text cache populated");
 
         // Vanished text paths are pruned from the cache on the next build.
         let root2 = leaf("/win", Role::Frame, "w");
         build_window_update(&[root2], &mut ids, &mut caches);
-        assert!(!caches.contains_key("/doc"), "cache pruned when node absent");
+        assert!(!caches.text.contains_key("/doc"), "cache pruned when node absent");
     }
 
     #[test]
@@ -1334,11 +1397,11 @@ mod tests {
         label.text = Some(TextState { text: "hi".into(), caret: None, selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[editable, label], &mut ids, &mut caches);
 
-        assert!(caches.get("/e").unwrap().caret_enabled, "editable text has a caret");
-        assert!(!caches.get("/l").unwrap().caret_enabled, "static label has none");
+        assert!(caches.text.get("/e").unwrap().caret_enabled, "editable text has a caret");
+        assert!(!caches.text.get("/l").unwrap().caret_enabled, "static label has none");
     }
 
     #[test]
@@ -1347,7 +1410,7 @@ mod tests {
         label.text = Some(TextState { text: "Status: OK".into(), caret: None, selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[label], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[label], &mut ids, &mut WindowCache::default());
         let (_, node) = &update.nodes[0];
 
         assert_eq!(node.value(), Some("Status: OK"), "label keeps its name in value");
@@ -1367,7 +1430,7 @@ mod tests {
         let b = text_node("/b", TextState { text: "z".into(), caret: None, selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[root, a, b], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[root, a, b], &mut ids, &mut WindowCache::default());
         let mut seen = HashSet::new();
         for (id, _) in &update.nodes {
             assert!(seen.insert(*id), "duplicate node id {id:?} in update");
@@ -1378,25 +1441,24 @@ mod tests {
     fn rebuild_text_node_emits_minimal_deltas() {
         let doc = text_node("/doc", TextState { text: "one\ntwo".into(), caret: Some(0), selection: None, extents: None });
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[doc], &mut ids, &mut caches);
-        let cache = caches.get_mut("/doc").unwrap();
 
         // Caret-only move: exactly the container changes.
         let moved = TextState { text: "one\ntwo".into(), caret: Some(5), selection: None, extents: None };
-        let delta = rebuild_text_node(cache, "/doc", &moved, &mut ids);
+        let delta = rebuild_text_node(&mut caches, "/doc", &moved, &mut ids);
         assert_eq!(delta.len(), 1, "caret move is a single-node delta");
-        assert_eq!(delta[0].0, cache.node_id);
+        assert_eq!(delta[0].0, caches.text["/doc"].node_id);
 
         // Identical state: nothing changes.
-        assert!(rebuild_text_node(cache, "/doc", &moved, &mut ids).is_empty());
+        assert!(rebuild_text_node(&mut caches, "/doc", &moved, &mut ids).is_empty());
 
         // Editing the second line: container (its selection tracks) + that run.
         let edited = TextState { text: "one\nTWO".into(), caret: Some(7), selection: None, extents: None };
-        let ids_before = (cache.runs[0].0, cache.runs[1].0);
-        let delta = rebuild_text_node(cache, "/doc", &edited, &mut ids);
+        let ids_before = (caches.text["/doc"].runs[0].0, caches.text["/doc"].runs[1].0);
+        let delta = rebuild_text_node(&mut caches, "/doc", &edited, &mut ids);
         let changed_ids: HashSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
-        assert!(changed_ids.contains(&cache.node_id));
+        assert!(changed_ids.contains(&caches.text["/doc"].node_id));
         assert!(changed_ids.contains(&ids_before.1), "edited run 1 is included");
         assert!(!changed_ids.contains(&ids_before.0), "unchanged run 0 is not");
     }
@@ -1405,13 +1467,12 @@ mod tests {
     fn rebuild_text_node_shrinks_run_children() {
         let doc = text_node("/doc", TextState { text: "a\nb\nc".into(), caret: None, selection: None, extents: None });
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[doc], &mut ids, &mut caches);
-        let cache = caches.get_mut("/doc").unwrap();
-        let node_id = cache.node_id;
+        let node_id = caches.text["/doc"].node_id;
 
         let shorter = TextState { text: "a".into(), caret: None, selection: None, extents: None };
-        let delta = rebuild_text_node(cache, "/doc", &shorter, &mut ids);
+        let delta = rebuild_text_node(&mut caches, "/doc", &shorter, &mut ids);
         let (_, parent) = delta.iter().find(|(id, _)| *id == node_id).unwrap();
         assert_eq!(parent.children().len(), 1, "container children shrink to one run");
     }
@@ -1428,18 +1489,17 @@ mod tests {
             },
         );
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[doc], &mut ids, &mut caches);
-        let cache = caches.get_mut("/doc").unwrap();
 
         // A caret move re-reads no geometry; the cached extents keep the runs
         // identical, so only the container changes.
         let moved = TextState { text: "hi".into(), caret: Some(1), selection: None, extents: None };
-        let delta = rebuild_text_node(cache, "/doc", &moved, &mut ids);
+        let delta = rebuild_text_node(&mut caches, "/doc", &moved, &mut ids);
         assert_eq!(delta.len(), 1, "caret move stays a container-only delta");
-        assert_eq!(delta[0].0, cache.node_id);
+        assert_eq!(delta[0].0, caches.text["/doc"].node_id);
         assert!(
-            cache.runs[0].1.bounds().is_some(),
+            caches.text["/doc"].runs[0].1.bounds().is_some(),
             "cached run keeps its geometry across the caret move"
         );
     }
@@ -1456,9 +1516,8 @@ mod tests {
             },
         );
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[doc], &mut ids, &mut caches);
-        let cache = caches.get_mut("/doc").unwrap();
 
         let fresh = vec![ext(10, 0, 8, 16), ext(18, 0, 9, 16)];
         let edited = TextState {
@@ -1467,15 +1526,15 @@ mod tests {
             selection: None,
             extents: Some(fresh.clone()),
         };
-        let delta = rebuild_text_node(cache, "/doc", &edited, &mut ids);
-        let run_id = cache.runs[0].0;
+        let delta = rebuild_text_node(&mut caches, "/doc", &edited, &mut ids);
+        let run_id = caches.text["/doc"].runs[0].0;
         let (_, run) = delta.iter().find(|(id, _)| *id == run_id).unwrap();
         assert_eq!(
             run.bounds(),
             Some(accesskit::Rect { x0: 10.0, y0: 0.0, x1: 27.0, y1: 16.0 }),
             "edited run carries the fresh geometry"
         );
-        assert_eq!(cache.extents.as_deref(), Some(&fresh[..]), "fresh extents cached");
+        assert_eq!(caches.text["/doc"].extents.as_deref(), Some(&fresh[..]), "fresh extents cached");
     }
 
     #[test]
@@ -1490,18 +1549,17 @@ mod tests {
             },
         );
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[doc], &mut ids, &mut caches);
-        let cache = caches.get_mut("/doc").unwrap();
 
         // Text length changed but no fresh extents arrived: stale geometry
         // must be dropped, not misapplied.
         let edited = TextState { text: "hey".into(), caret: Some(3), selection: None, extents: None };
-        let delta = rebuild_text_node(cache, "/doc", &edited, &mut ids);
-        let run_id = cache.runs[0].0;
+        let delta = rebuild_text_node(&mut caches, "/doc", &edited, &mut ids);
+        let run_id = caches.text["/doc"].runs[0].0;
         let (_, run) = delta.iter().find(|(id, _)| *id == run_id).unwrap();
         assert_eq!(run.bounds(), None, "rebuilt run carries no stale geometry");
-        assert_eq!(cache.extents, None, "stale cached extents cleared");
+        assert_eq!(caches.text["/doc"].extents, None, "stale cached extents cleared");
     }
 
     #[test]
@@ -1669,9 +1727,8 @@ mod tests {
             extents: Some(vec![ext(10, 20, 8, 16)]),
         });
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[root, entry], &mut ids, &mut caches);
-        let cache = caches.get_mut("/entry").unwrap();
 
         let cleared = TextState {
             text: String::new(),
@@ -1679,7 +1736,7 @@ mod tests {
             selection: None,
             extents: Some(Vec::new()),
         };
-        let changed = rebuild_text_node(cache, "/entry", &cleared, &mut ids);
+        let changed = rebuild_text_node(&mut caches, "/entry", &cleared, &mut ids);
         let run_id = ids.get("/entry#run0").unwrap();
         let (_, run) = changed
             .iter()
@@ -1704,7 +1761,7 @@ mod tests {
             extents: Some(Vec::new()),
         });
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[root, entry], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[root, entry], &mut ids, &mut WindowCache::default());
         let run_id = ids.get("/entry#run0").unwrap();
 
         let tree = accesskit_consumer::Tree::new(update, false);
@@ -1752,7 +1809,7 @@ mod tests {
         });
 
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[root, label], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[root, label], &mut ids, &mut WindowCache::default());
         let label_id = ids.get("/label").unwrap();
 
         let tree = accesskit_consumer::Tree::new(update, false);
@@ -1781,7 +1838,7 @@ mod tests {
         let mut root = leaf("/win", Role::Frame, "w");
         root.bounds = Some(ext(10, 20, 200, 30));
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[root], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[root], &mut ids, &mut WindowCache::default());
         assert_eq!(
             update.nodes[0].1.bounds(),
             Some(accesskit::Rect { x0: 10.0, y0: 20.0, x1: 210.0, y1: 50.0 })
@@ -1793,7 +1850,7 @@ mod tests {
         let mut root = leaf("/win", Role::Frame, "w");
         root.bounds = Some(ext(10, 20, 0, 30));
         let mut ids = NodeIdMap::new();
-        let update = build_window_update(&[root], &mut ids, &mut HashMap::new());
+        let update = build_window_update(&[root], &mut ids, &mut WindowCache::default());
         assert_eq!(update.nodes[0].1.bounds(), None);
     }
 
@@ -1823,7 +1880,7 @@ mod tests {
             &[],
             &known,
             &mut ids,
-            &mut HashMap::new(),
+            &mut WindowCache::default(),
         )
         .expect("chain splices");
 
@@ -1863,7 +1920,7 @@ mod tests {
             &["/table/a".to_owned(), "/table/b".to_owned()],
             &known,
             &mut ids,
-            &mut HashMap::new(),
+            &mut WindowCache::default(),
         )
         .expect("chain splices");
 
@@ -1888,7 +1945,7 @@ mod tests {
         let mut ids = NodeIdMap::new();
 
         let result =
-            splice_chain_update(&[fresh_table, cell], &[], &known, &mut ids, &mut HashMap::new())
+            splice_chain_update(&[fresh_table, cell], &[], &known, &mut ids, &mut WindowCache::default())
                 .expect("chain splices");
 
         let table_id = ids.get("/table").unwrap();
@@ -1916,7 +1973,7 @@ mod tests {
             &[],
             &known,
             &mut ids,
-            &mut HashMap::new(),
+            &mut WindowCache::default(),
         )
         .expect("chain splices");
 
@@ -1944,7 +2001,7 @@ mod tests {
                 &[],
                 &known,
                 ids,
-                &mut HashMap::new(),
+                &mut WindowCache::default(),
             )
             .expect("chain splices")
         };
@@ -1965,9 +2022,9 @@ mod tests {
         let table = leaf("/table", Role::Table, "grid");
         let known: HashSet<String> = ["/table".to_owned()].into();
         let mut ids = NodeIdMap::new();
-        assert!(splice_chain_update(&[table], &[], &known, &mut ids, &mut HashMap::new())
+        assert!(splice_chain_update(&[table], &[], &known, &mut ids, &mut WindowCache::default())
             .is_none());
-        assert!(splice_chain_update(&[], &[], &known, &mut ids, &mut HashMap::new()).is_none());
+        assert!(splice_chain_update(&[], &[], &known, &mut ids, &mut WindowCache::default()).is_none());
     }
 
     #[test]
@@ -1983,14 +2040,14 @@ mod tests {
         });
         let known: HashSet<String> = ["/doc".to_owned()].into();
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
 
         let result = splice_chain_update(&[fresh_doc, p], &[], &known, &mut ids, &mut caches)
             .expect("chain splices");
 
         let run_id = ids.get("/doc/p#run0").expect("run id allocated");
         assert!(result.update.nodes.iter().any(|(id, _)| *id == run_id));
-        assert!(caches.contains_key("/doc/p"), "text cache recorded for later deltas");
+        assert!(caches.text.contains_key("/doc/p"), "text cache recorded for later deltas");
     }
 
     #[test]
@@ -2005,9 +2062,9 @@ mod tests {
             extents: None,
         });
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         build_window_update(&[root, doc], &mut ids, &mut caches);
-        assert!(caches.contains_key("/doc"), "walked text leaf seeds a cache");
+        assert!(caches.text.contains_key("/doc"), "walked text leaf seeds a cache");
 
         let mut fresh_doc = leaf("/doc", Role::DocumentText, "");
         fresh_doc.children = vec!["/doc/p".into()];
@@ -2017,7 +2074,7 @@ mod tests {
             .expect("chain splices");
 
         assert!(
-            !caches.contains_key("/doc"),
+            !caches.text.contains_key("/doc"),
             "a chain node emitted without runs sheds its stale cache"
         );
     }
@@ -2036,7 +2093,7 @@ mod tests {
             &[],
             &known,
             &mut ids,
-            &mut HashMap::new(),
+            &mut WindowCache::default(),
         )
         .expect("chain splices");
 
@@ -2095,7 +2152,7 @@ mod tests {
         root.children = vec!["/table".into()];
         let table = leaf("/table", Role::Table, "grid");
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         let full = build_window_update(&[root, table], &mut ids, &mut caches);
         let mut tree = accesskit_consumer::Tree::new(full, false);
 
@@ -2137,7 +2194,7 @@ mod tests {
         };
 
         let mut ids = NodeIdMap::new();
-        let mut caches = HashMap::new();
+        let mut caches = WindowCache::default();
         let full_a = build_window_update(&walk_nodes, &mut ids, &mut caches);
         let mut tree = accesskit_consumer::Tree::new(full_a, false);
 
