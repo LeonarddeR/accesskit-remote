@@ -889,6 +889,7 @@ mod tests {
             actionable: false,
             children: Vec::new(),
             text: None,
+            bounds: None,
         }
     }
 

@@ -195,6 +195,14 @@ pub(crate) async fn read_node(
     } else {
         None
     };
+    let bounds = if interfaces
+        .as_ref()
+        .is_some_and(|set| set.contains(Interface::Component))
+    {
+        read_component_extents(zconn, obj).await
+    } else {
+        None
+    };
     let node = MirrorNode {
         path: obj.path_as_str().to_owned(),
         role,
@@ -204,6 +212,7 @@ pub(crate) async fn read_node(
         actionable,
         children,
         text,
+        bounds,
     };
     Some((node, child_refs))
 }
@@ -307,6 +316,26 @@ async fn read_char_extents(proxy: &TextProxy<'_>, len: usize) -> Option<Vec<Char
         extents.push(CharExtent { x, y, width, height });
     }
     Some(extents)
+}
+
+/// Reads an object's own window-relative extents off its `Component`
+/// interface; `None` on any failure.
+async fn read_component_extents(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Option<CharExtent> {
+    let name: BusName = obj.name()?.clone().into();
+    let path = obj.path().clone();
+    let proxy = ComponentProxy::builder(zconn)
+        .destination(name)
+        .ok()?
+        .path(path)
+        .ok()?
+        .build()
+        .await
+        .ok()?;
+    let (x, y, width, height) = proxy.get_extents(CoordType::Window).await.ok()?;
+    Some(CharExtent { x, y, width, height })
 }
 
 /// Reads the first AT-SPI text selection as a normalized `(start, end)` with

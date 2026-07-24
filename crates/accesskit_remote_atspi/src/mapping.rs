@@ -60,6 +60,9 @@ pub struct MirrorNode {
     pub children: Vec<String>,
     /// Text-interface state for text-input roles; `None` for non-text nodes.
     pub text: Option<TextState>,
+    /// The object's own window-relative extents from `Component.GetExtents`;
+    /// `None` when the interface is absent or the read failed.
+    pub bounds: Option<CharExtent>,
 }
 
 /// The AT-SPI `Text` interface state of one node. Offsets are Unicode scalar
@@ -74,7 +77,8 @@ pub struct TextState {
     pub extents: Option<Vec<CharExtent>>,
 }
 
-/// One code point's window-relative extent as AT-SPI reports it.
+/// One window-relative extent as AT-SPI reports it: a code point's, or a
+/// whole object's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharExtent {
     pub x: i32,
@@ -692,6 +696,16 @@ fn build_node(
     if node.focusable {
         container.add_action(accesskit::Action::Focus);
     }
+    if let Some(bounds) = node.bounds {
+        if bounds.width > 0 && bounds.height > 0 {
+            container.set_bounds(accesskit::Rect {
+                x0: bounds.x as f64,
+                y0: bounds.y as f64,
+                x1: (bounds.x + bounds.width) as f64,
+                y1: (bounds.y + bounds.height) as f64,
+            });
+        }
+    }
     match &node.text {
         Some(state) => {
             let (runs, layout) =
@@ -751,6 +765,7 @@ mod tests {
             actionable: false,
             children: Vec::new(),
             text: None,
+            bounds: None,
         }
     }
 
@@ -1484,6 +1499,27 @@ mod tests {
                 && close(rect.y1, expected.y1),
             "expected {expected:?}, got {rect:?}"
         );
+    }
+
+    #[test]
+    fn container_bounds_become_node_bounds() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.bounds = Some(ext(10, 20, 200, 30));
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[root], &mut ids, &mut HashMap::new());
+        assert_eq!(
+            update.nodes[0].1.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 20.0, x1: 210.0, y1: 50.0 })
+        );
+    }
+
+    #[test]
+    fn zero_area_container_bounds_are_dropped() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.bounds = Some(ext(10, 20, 0, 30));
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[root], &mut ids, &mut HashMap::new());
+        assert_eq!(update.nodes[0].1.bounds(), None);
     }
 
     // --- Chain splicing ---
