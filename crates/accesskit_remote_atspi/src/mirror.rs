@@ -20,7 +20,7 @@ use atspi::proxy::text::TextProxy;
 use atspi::zbus::fdo::DBusProxy;
 use atspi::zbus::names::BusName;
 use atspi::{CoordType, Interface, Role, State, StateSet};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Errors from the bridge are boxed so bus, session, and zbus error types can
 /// all flow through a single `?`.
@@ -206,6 +206,41 @@ pub(crate) async fn read_node(
         text,
     };
     Some((node, child_refs))
+}
+
+/// Bounds the parent climb from an unwalked descendant to a known ancestor.
+pub(crate) const MAX_SPLICE_HOPS: usize = 16;
+
+/// Reads `descendant`, then climbs `Accessible.Parent` until a path in
+/// `known` is reached, reading each object on the way. Returns the chain
+/// ancestor-first (`chain[0]` is the known ancestor's fresh read, the last
+/// element the descendant), or `None` when a read fails, a parent is null,
+/// or the hop budget runs out.
+pub(crate) async fn read_chain_to_known(
+    conn: &AccessibilityConnection,
+    descendant: &ObjectRefOwned,
+    known: &HashSet<String>,
+    max_hops: usize,
+) -> Option<Vec<(MirrorNode, ObjectRefOwned)>> {
+    let zconn = conn.connection();
+    let mut chain: Vec<(MirrorNode, ObjectRefOwned)> = Vec::new();
+    let mut current = descendant.clone();
+    for _ in 0..max_hops {
+        let (node, _) = read_node(zconn, &current).await?;
+        let reached_known = known.contains(&node.path);
+        chain.push((node, current.clone()));
+        if reached_known {
+            chain.reverse();
+            return Some(chain);
+        }
+        let proxy = current.as_accessible_proxy(zconn).await.ok()?;
+        let parent = proxy.parent().await.ok()?;
+        if parent.is_null() {
+            return None;
+        }
+        current = parent;
+    }
+    None
 }
 
 /// Reads the AT-SPI `Text` interface of `obj`: its text (capped at

@@ -7,7 +7,8 @@ use crate::app_id::AppIdResolver;
 use crate::coalesce::RewalkCoalescer;
 use crate::focus::FocusTracker;
 use crate::mapping::{
-    build_window_update, focus_update, rebuild_text_node, text_offset, NodeIdMap, TextNodeCache,
+    build_window_update, emitted_children, focus_update, rebuild_text_node, splice_chain_update,
+    text_offset, NodeIdMap, TextNodeCache,
 };
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
@@ -19,7 +20,9 @@ use atspi::events::object::{
     TextChangedEvent, TextSelectionChangedEvent,
 };
 use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
-use atspi::object_ref::ObjectRefOwned;
+use atspi::object_ref::{ObjectRef, ObjectRefOwned};
+use atspi::zbus::names::UniqueName;
+use atspi::zbus::zvariant::ObjectPath;
 use atspi::State;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
@@ -265,6 +268,9 @@ struct WindowState {
     /// Per-text-node cache (keyed by AT-SPI object path) for minimal caret and
     /// text-change deltas.
     text: HashMap<String, TextNodeCache>,
+    /// The element children each walked node was emitted with, by path — the
+    /// client tree's current structure, consulted when splicing new nodes in.
+    children: HashMap<String, Vec<String>>,
 }
 
 impl Mirror {
@@ -327,6 +333,7 @@ impl Mirror {
             objects,
             focus: update.focus,
             text,
+            children: emitted_children(&nodes),
         });
         Ok(Some((descriptor, update)))
     }
@@ -400,7 +407,11 @@ impl Mirror {
         }
         if let Event::Object(ObjectEvents::ActiveDescendantChanged(ev)) = &event {
             let sender = event.sender();
-            return self.handle_active_descendant(sender.as_str(), ev.descendant.path_as_str());
+            let path = ev.descendant.path_as_str();
+            return match self.handle_active_descendant(sender.as_str(), path) {
+                Some(out) => out,
+                None => self.splice_active_descendant(conn, sender.as_str(), path).await,
+            };
         }
         match &event {
             // Caret and selection moves change no text, so the cached run
@@ -512,18 +523,16 @@ impl Mirror {
     /// descendants (lists, trees, combo boxes). Resolves the new descendant to
     /// its window and node by the emitting app's bus name and the descendant's
     /// object path, and emits a node-level focus delta. A descendant absent from
-    /// the current tree resolves to nothing and emits nothing — an unknown focus
-    /// id is fatal to a consumer. Item selection *state* is not forwarded here;
-    /// that stays governed by re-walks.
+    /// the current tree returns `None`, signaling the caller to read and splice
+    /// it in on demand. Item selection *state* is not forwarded here; that stays
+    /// governed by re-walks.
     fn handle_active_descendant(
         &mut self,
         sender: &str,
         descendant_path: &str,
-    ) -> Vec<SourceEvent> {
-        match resolve_focus_target(&self.windows, sender, descendant_path) {
-            Some((window, node)) => self.emit_node_focus(window, node),
-            None => Vec::new(),
-        }
+    ) -> Option<Vec<SourceEvent>> {
+        resolve_focus_target(&self.windows, sender, descendant_path)
+            .map(|(window, node)| self.emit_node_focus(window, node))
     }
 
     /// Emits a node-level focus move: keeps the window's live `focus` in step,
@@ -541,6 +550,95 @@ impl Mirror {
             out.push(SourceEvent::FocusChanged(change));
         }
         out
+    }
+
+    /// Resolves an active descendant missing from the walked tree by reading
+    /// it and its ancestors up to a known node directly off the bus, splicing
+    /// the chain into the owning window, and focusing it. Emits nothing when
+    /// the chain cannot be read or no tracked window anchors it. The event
+    /// sender (not the event body's embedded name) addresses the objects,
+    /// matching `resolve_focus_target`'s sender pinning.
+    async fn splice_active_descendant(
+        &mut self,
+        conn: &AccessibilityConnection,
+        sender: &str,
+        descendant_path: &str,
+    ) -> Vec<SourceEvent> {
+        let Ok(name) = UniqueName::try_from(sender.to_owned()) else {
+            return Vec::new();
+        };
+        let Ok(path) = ObjectPath::try_from(descendant_path.to_owned()) else {
+            return Vec::new();
+        };
+        let descendant = ObjectRef::new_owned(name, path);
+        let candidates: Vec<usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.root.name().is_some_and(|n| n.as_str() == sender))
+            .map(|(index, _)| index)
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let known: HashSet<String> = candidates
+            .iter()
+            .flat_map(|&index| self.windows[index].children.keys().cloned())
+            .collect();
+        let Some(chain) =
+            mirror::read_chain_to_known(conn, &descendant, &known, mirror::MAX_SPLICE_HOPS).await
+        else {
+            return Vec::new();
+        };
+        let anchor = chain[0].0.path.clone();
+        let Some(index) = candidates
+            .into_iter()
+            .find(|&index| self.windows[index].children.contains_key(&anchor))
+        else {
+            return Vec::new();
+        };
+        let Some(update) = self.apply_spliced_chain(index, &chain) else {
+            return Vec::new();
+        };
+        let window = self.windows[index].id;
+        let mut out = vec![SourceEvent::TreeUpdate { window, update }];
+        if let Some(change) = self.focus.focus(window) {
+            out.push(SourceEvent::FocusChanged(change));
+        }
+        out
+    }
+
+    /// Applies a freshly read chain to the window at `index`: allocates ids,
+    /// builds the splice update, and folds the chain into `objects`,
+    /// `children`, and `focus`. `None` when the chain's first node is not a
+    /// known ancestor of this window.
+    fn apply_spliced_chain(
+        &mut self,
+        index: usize,
+        chain: &[(crate::mapping::MirrorNode, ObjectRefOwned)],
+    ) -> Option<accesskit::TreeUpdate> {
+        let nodes: Vec<crate::mapping::MirrorNode> =
+            chain.iter().map(|(node, _)| node.clone()).collect();
+        let state = &mut self.windows[index];
+        let ancestor_children = state.children.get(nodes.first()?.path.as_str())?.clone();
+        let known: HashSet<String> = state.children.keys().cloned().collect();
+        let result = splice_chain_update(
+            &nodes,
+            &ancestor_children,
+            &known,
+            &mut state.ids,
+            &mut state.text,
+        )?;
+        for (node, object) in chain {
+            if let Some(id) = state.ids.get(&node.path) {
+                state.objects.insert(id, object.clone());
+            }
+        }
+        for (path, children) in result.children {
+            state.children.insert(path, children);
+        }
+        state.focus = result.update.focus;
+        Some(result.update)
     }
 
     /// Reflects an AT-SPI text event (caret move, text change, selection change)
@@ -605,6 +703,7 @@ impl Mirror {
         let state = &mut self.windows[index];
         let update = build_window_update(&nodes, &mut state.ids, &mut state.text);
         state.objects = index_objects(&nodes, &state.ids, &objects_by_path);
+        state.children = emitted_children(&nodes);
         state.focus = update.focus;
         Some(SourceEvent::TreeUpdate { window, update })
     }
@@ -711,9 +810,6 @@ fn index_objects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atspi::object_ref::ObjectRef;
-    use atspi::zbus::names::UniqueName;
-    use atspi::zbus::zvariant::ObjectPath;
 
     /// Builds a one-node `WindowState`: the window root plus a single node whose
     /// id is allocated in `ids` and, when `walked`, present in `objects`.
@@ -740,6 +836,11 @@ mod tests {
                 ),
             );
         }
+        let mut children = HashMap::new();
+        if walked {
+            children.insert(root_path.to_owned(), vec![node_path.to_owned()]);
+            children.insert(node_path.to_owned(), Vec::new());
+        }
         WindowState {
             id: WindowId(id),
             root,
@@ -747,6 +848,27 @@ mod tests {
             objects,
             focus: node_id,
             text: HashMap::new(),
+            children,
+        }
+    }
+
+    fn obj(sender: &'static str, path: &'static str) -> ObjectRefOwned {
+        ObjectRef::new_owned(
+            UniqueName::from_static_str_unchecked(sender),
+            ObjectPath::from_static_str_unchecked(path),
+        )
+    }
+
+    fn mirror_node(path: &str, role: atspi::Role, name: &str) -> crate::mapping::MirrorNode {
+        crate::mapping::MirrorNode {
+            path: path.to_owned(),
+            role,
+            name: name.to_owned(),
+            focusable: false,
+            focused: false,
+            actionable: false,
+            children: Vec::new(),
+            text: None,
         }
     }
 
@@ -806,7 +928,9 @@ mod tests {
         let node = win.ids.get("/win/1/item").unwrap();
         let mut mirror = mirror_with(vec![win]);
 
-        let out = mirror.handle_active_descendant(":1.1", "/win/1/item");
+        let out = mirror
+            .handle_active_descendant(":1.1", "/win/1/item")
+            .expect("descendant resolves");
 
         assert_eq!(out.len(), 2, "a focus-only delta plus a window focus change");
         match &out[0] {
@@ -822,10 +946,74 @@ mod tests {
     }
 
     #[test]
-    fn active_descendant_absent_from_the_tree_emits_nothing() {
+    fn active_descendant_absent_from_the_tree_escalates() {
         let win = window_state(1, ":1.1", "/win/1", "/win/1/item", true);
         let mut mirror = mirror_with(vec![win]);
-        assert!(mirror.handle_active_descendant(":1.1", "/win/1/gone").is_empty());
+        assert!(mirror.handle_active_descendant(":1.1", "/win/1/gone").is_none());
+    }
+
+    #[test]
+    fn apply_spliced_chain_updates_objects_children_and_focus() {
+        let win = window_state(1, ":1.1", "/win/1", "/win/1/table", true);
+        let mut mirror = mirror_with(vec![win]);
+        let mut fresh_table = mirror_node("/win/1/table", atspi::Role::Table, "grid");
+        fresh_table.children = vec!["/win/1/table/cell".to_owned()];
+        let chain = vec![
+            (fresh_table, obj(":1.1", "/win/1/table")),
+            (
+                mirror_node("/win/1/table/cell", atspi::Role::TableCell, "A1"),
+                obj(":1.1", "/win/1/table/cell"),
+            ),
+        ];
+
+        let update = mirror.apply_spliced_chain(0, &chain).expect("splice applies");
+
+        let state = &mirror.windows[0];
+        let cell = state.ids.get("/win/1/table/cell").expect("cell id allocated");
+        assert_eq!(update.focus, cell);
+        assert!(update.tree.is_none());
+        assert!(state.objects.contains_key(&cell), "action routing reaches the cell");
+        assert_eq!(state.children["/win/1/table"], vec!["/win/1/table/cell".to_owned()]);
+        assert_eq!(state.focus, cell);
+    }
+
+    #[test]
+    fn apply_spliced_chain_twice_is_idempotent() {
+        let win = window_state(1, ":1.1", "/win/1", "/win/1/table", true);
+        let mut mirror = mirror_with(vec![win]);
+        let chain = || {
+            let mut fresh_table = mirror_node("/win/1/table", atspi::Role::Table, "grid");
+            fresh_table.children = vec!["/win/1/table/cell".to_owned()];
+            vec![
+                (fresh_table, obj(":1.1", "/win/1/table")),
+                (
+                    mirror_node("/win/1/table/cell", atspi::Role::TableCell, "A1"),
+                    obj(":1.1", "/win/1/table/cell"),
+                ),
+            ]
+        };
+        let first = mirror.apply_spliced_chain(0, &chain()).expect("splice applies");
+        let second = mirror.apply_spliced_chain(0, &chain()).expect("re-splice applies");
+        assert_eq!(first.focus, second.focus);
+        assert_eq!(
+            mirror.windows[0].children["/win/1/table"],
+            vec!["/win/1/table/cell".to_owned()],
+            "no duplicate child entries"
+        );
+    }
+
+    #[test]
+    fn apply_spliced_chain_without_an_anchored_ancestor_applies_nothing() {
+        let win = window_state(1, ":1.1", "/win/1", "/win/1/table", true);
+        let mut mirror = mirror_with(vec![win]);
+        let chain = vec![
+            (mirror_node("/elsewhere", atspi::Role::Table, ""), obj(":1.1", "/elsewhere")),
+            (
+                mirror_node("/elsewhere/cell", atspi::Role::TableCell, ""),
+                obj(":1.1", "/elsewhere/cell"),
+            ),
+        ];
+        assert!(mirror.apply_spliced_chain(0, &chain).is_none());
     }
 
     #[test]
@@ -852,7 +1040,9 @@ mod tests {
             focus: FocusTracker::new(Some(WindowId(1))),
             app_ids: AppIdResolver::default(),
         };
-        let out = mirror.handle_active_descendant(":1.1", "/win/1/item");
+        let out = mirror
+            .handle_active_descendant(":1.1", "/win/1/item")
+            .expect("descendant resolves");
         assert_eq!(out.len(), 1, "an already-focused window emits only the focus delta");
         assert!(matches!(&out[0], SourceEvent::TreeUpdate { .. }));
         assert_eq!(mirror.windows[0].focus, node);

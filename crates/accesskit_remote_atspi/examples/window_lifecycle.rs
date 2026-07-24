@@ -47,7 +47,14 @@ fn main() {
                     println!("- WindowRemoved {}", window.0);
                 }
                 SourceEvent::TreeUpdate { window, update } => {
-                    println!("  TreeUpdate {} ({} nodes)", window.0, update.nodes.len());
+                    let ids: Vec<u64> = update.nodes.iter().map(|(id, _)| id.0).collect();
+                    println!(
+                        "  TreeUpdate {} ({} nodes, focus {}) ids={:?}",
+                        window.0,
+                        update.nodes.len(),
+                        update.focus.0,
+                        &ids[..ids.len().min(6)]
+                    );
                 }
                 SourceEvent::FocusChanged(window) => {
                     println!("  FocusChanged {:?}", window.map(|w| w.0));
