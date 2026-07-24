@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: windows (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # The DVC plugin is a cdylib the integration tests load at runtime, so it
+      # must be built before `cargo test`.
+      - name: Build DVC plugin DLL
+        run: cargo build --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin
+      - name: Test Windows crates
+        run: cargo test --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin -p accesskit_remote_windows
+        env:
+          ACCESSKIT_DVC_DLL_PATH: target/${{ matrix.target }}/debug/accesskit_remote_dvc_plugin.dll
+
+  linux:
+    name: linux (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Never `--workspace` on Linux: the Windows-only members won't build.
+      - name: Test Linux and platform-agnostic crates
+        run: >
+          cargo test
+          -p accesskit_remote
+          -p accesskit_remote_transport
+          -p accesskit_remote_server
+          -p accesskit_remote_client
+          -p accesskit_remote_atspi
+          -p accesskit_remoted
+          -p xtask
