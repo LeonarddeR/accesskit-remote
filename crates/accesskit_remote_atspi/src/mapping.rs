@@ -658,6 +658,8 @@ pub fn splice_chain_update(
         nodes_out.extend(built.runs);
         if let Some(cache) = built.cache {
             text_caches.insert(node.path.clone(), cache);
+        } else {
+            text_caches.remove(&node.path);
         }
         focus = Some(id);
     }
@@ -1841,6 +1843,70 @@ mod tests {
         let run_id = ids.get("/doc/p#run0").expect("run id allocated");
         assert!(result.update.nodes.iter().any(|(id, _)| *id == run_id));
         assert!(caches.contains_key("/doc/p"), "text cache recorded for later deltas");
+    }
+
+    #[test]
+    fn splice_evicts_stale_text_cache_for_run_less_chain_nodes() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/doc".into()];
+        let mut doc = leaf("/doc", Role::DocumentText, "");
+        doc.text = Some(TextState {
+            text: "old".into(),
+            caret: None,
+            selection: None,
+            extents: None,
+        });
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        build_window_update(&[root, doc], &mut ids, &mut caches);
+        assert!(caches.contains_key("/doc"), "walked text leaf seeds a cache");
+
+        let mut fresh_doc = leaf("/doc", Role::DocumentText, "");
+        fresh_doc.children = vec!["/doc/p".into()];
+        let p = leaf("/doc/p", Role::Paragraph, "");
+        let known: HashSet<String> = ["/win".to_owned(), "/doc".to_owned()].into();
+        splice_chain_update(&[fresh_doc, p], &[], &known, &mut ids, &mut caches)
+            .expect("chain splices");
+
+        assert!(
+            !caches.contains_key("/doc"),
+            "a chain node emitted without runs sheds its stale cache"
+        );
+    }
+
+    #[test]
+    fn splice_filters_unknown_fresh_children_of_interior_nodes() {
+        let table = leaf("/table", Role::Table, "grid");
+        let mut row = leaf("/table/row", Role::Panel, "");
+        row.children = vec!["/table/row/x1".into(), "/table/row/cell".into()];
+        let cell = leaf("/table/row/cell", Role::TableCell, "A1");
+        let known: HashSet<String> = ["/table".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+
+        let result = splice_chain_update(
+            &[table, row, cell],
+            &[],
+            &known,
+            &mut ids,
+            &mut HashMap::new(),
+        )
+        .expect("chain splices");
+
+        let row_id = ids.get("/table/row").unwrap();
+        let cell_id = ids.get("/table/row/cell").unwrap();
+        let (_, row_node) = result
+            .update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == row_id)
+            .expect("interior node emitted");
+        assert_eq!(row_node.children(), &[cell_id], "unknown fresh child filtered out");
+        assert_eq!(
+            result.children.iter().find(|(p, _)| p == "/table/row").unwrap().1,
+            vec!["/table/row/cell".to_owned()],
+            "bookkeeping records only the filtered children"
+        );
+        assert!(ids.get("/table/row/x1").is_none(), "no id allocated for the unknown child");
     }
 
     #[test]

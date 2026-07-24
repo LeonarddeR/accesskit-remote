@@ -420,7 +420,8 @@ for the build-up.
     revisits re-splice under fresh ids — the fast path is unreachable against
     LO by toolkit design (it engages on GTK's stable paths); spliced ids
     accumulate between re-walks (append-only `NodeIdMap`), and each re-walk
-    prunes the spliced nodes from the tree.
+    prunes the spliced nodes from the tree — though the `NodeIdMap`'s path→id
+    entries persist for the window's lifetime by design.
   - *Container bounds + empty-field caret anchor* (the 5d tail): the walk
     reads `Component.GetExtents(CoordType::Window)` for every node exposing
     the Component interface — measured +1s on the Writer walk (7s vs 6s
