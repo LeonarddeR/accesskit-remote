@@ -3,6 +3,7 @@
 //! and the [`Mirror`] state; the sync side talks to it over channels —
 //! actions in via a tokio channel, tree events out via a std channel.
 
+use crate::coalesce::RewalkCoalescer;
 use crate::focus::FocusTracker;
 use crate::mapping::{
     build_window_update, focus_update, rebuild_text_node, text_offset, NodeIdMap, TextNodeCache,
@@ -22,7 +23,7 @@ use atspi::State;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio_stream::StreamExt;
 
@@ -31,6 +32,14 @@ use tokio_stream::StreamExt;
 /// window that becomes visible without re-signaling, or an app that dies without
 /// a root removal).
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Quiet period after the last deep `children-changed` of a burst before the
+/// affected window is re-walked.
+const REWALK_DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
+
+/// A window is re-walked at most this long after the first event of a burst,
+/// even while events keep arriving.
+const REWALK_DEBOUNCE_MAX_DELAY: Duration = Duration::from_secs(2);
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
@@ -162,7 +171,9 @@ async fn bridge_main(
     tokio::pin!(events);
     let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile_timer.tick().await; // Drop the immediate first tick; the initial enumeration just ran.
+    let mut pending = RewalkCoalescer::new(REWALK_DEBOUNCE_QUIET, REWALK_DEBOUNCE_MAX_DELAY);
     'pump: loop {
+        let next_rewalk = pending.next_deadline();
         tokio::select! {
             action = actions_rx.recv() => match action {
                 Some(msg) => {
@@ -176,7 +187,7 @@ async fn bridge_main(
             },
             item = events.next() => match item {
                 Some(Ok(event)) => {
-                    for source_event in mirror.handle_atspi_event(&conn, event).await {
+                    for source_event in mirror.handle_atspi_event(&conn, event, &mut pending).await {
                         if events_tx.send(source_event).is_err() {
                             break 'pump;
                         }
@@ -185,8 +196,26 @@ async fn bridge_main(
                 Some(Err(_)) => {}
                 None => break 'pump,
             },
+            // The sleep expression is evaluated even when the guard disables
+            // the arm, so the `None` case needs a valid (never-awaited) instant.
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                next_rewalk.unwrap_or_else(|| Instant::now() + RECONCILE_INTERVAL),
+            )), if next_rewalk.is_some() => {
+                // Events arriving while a re-walk runs queue on the event
+                // stream and re-note a fresh burst; nothing is lost.
+                for window in pending.take_due(Instant::now()) {
+                    if let Some(source_event) = mirror.rewalk(&conn, window).await {
+                        if events_tx.send(source_event).is_err() {
+                            break 'pump;
+                        }
+                    }
+                }
+            },
             _ = reconcile_timer.tick() => {
                 for source_event in mirror.reconcile(&conn).await {
+                    if let SourceEvent::WindowRemoved(window) = &source_event {
+                        pending.discard(*window);
+                    }
                     if events_tx.send(source_event).is_err() {
                         break 'pump;
                     }
@@ -340,17 +369,25 @@ impl Mirror {
     /// focus within a container, emits a node-level focus delta without a re-walk
     /// (see [`handle_focus_change`](Self::handle_focus_change) and
     /// [`handle_active_descendant`](Self::handle_active_descendant)).
-    /// Otherwise the event re-walks the affected window(s): a deep
-    /// `children-changed` is matched to its window by sender (app); an
-    /// activate/deactivate is matched to the frame by sender and path and also
-    /// advances window-level focus.
+    /// A deep `children-changed` is matched to its windows by sender (app) and
+    /// marked in `pending`; the debounce arm in [`bridge_main`] re-walks each
+    /// window once its burst settles. An activate/deactivate is matched to the
+    /// frame by sender and path, re-walks it immediately, and advances
+    /// window-level focus.
     async fn handle_atspi_event(
         &mut self,
         conn: &AccessibilityConnection,
         event: Event,
+        pending: &mut RewalkCoalescer,
     ) -> Vec<SourceEvent> {
         if is_window_lifecycle_event(&event) {
-            return self.reconcile(conn).await;
+            let out = self.reconcile(conn).await;
+            for source_event in &out {
+                if let SourceEvent::WindowRemoved(window) = source_event {
+                    pending.discard(*window);
+                }
+            }
+            return out;
         }
         if let Event::Object(ObjectEvents::StateChanged(ev)) = &event {
             if ev.state == State::Focused {
@@ -374,17 +411,17 @@ impl Mirror {
             }
             _ => {}
         }
+        if let Event::Object(ObjectEvents::ChildrenChanged(_)) = &event {
+            let sender = event.sender();
+            let now = Instant::now();
+            for window in self.windows_of_sender(sender.as_str()) {
+                pending.note(window, now);
+            }
+            return Vec::new();
+        }
         let activation = matches!(&event, Event::Window(WindowEvents::Activate(_)));
         let deactivation = matches!(&event, Event::Window(WindowEvents::Deactivate(_)));
         let targets: Vec<WindowId> = match &event {
-            Event::Object(ObjectEvents::ChildrenChanged(_)) => {
-                let sender = event.sender();
-                self.windows
-                    .iter()
-                    .filter(|w| w.root.name().is_some_and(|n| n.as_str() == sender.as_str()))
-                    .map(|w| w.id)
-                    .collect()
-            }
             Event::Window(WindowEvents::Activate(_) | WindowEvents::Deactivate(_)) => {
                 let sender = event.sender();
                 let path = event.path();
@@ -446,12 +483,7 @@ impl Mirror {
         {
             return self.emit_node_focus(window, node);
         }
-        let targets: Vec<WindowId> = self
-            .windows
-            .iter()
-            .filter(|w| w.root.name().is_some_and(|n| n.as_str() == sender.as_str()))
-            .map(|w| w.id)
-            .collect();
+        let targets = self.windows_of_sender(sender.as_str());
         let mut out = Vec::new();
         for window in targets {
             if let Some(source_event) = self.rewalk(conn, window).await {
@@ -459,6 +491,15 @@ impl Mirror {
             }
         }
         out
+    }
+
+    /// The ids of every tracked window owned by the app at `sender`.
+    fn windows_of_sender(&self, sender: &str) -> Vec<WindowId> {
+        self.windows
+            .iter()
+            .filter(|w| w.root.name().is_some_and(|n| n.as_str() == sender))
+            .map(|w| w.id)
+            .collect()
     }
 
     /// Reflects an `active-descendant-changed`: focus moving among a container's
@@ -775,6 +816,20 @@ mod tests {
         let win = window_state(1, ":1.1", "/win/1", "/win/1/item", true);
         let mut mirror = mirror_with(vec![win]);
         assert!(mirror.handle_active_descendant(":1.1", "/win/1/gone").is_empty());
+    }
+
+    #[test]
+    fn windows_of_sender_returns_all_and_only_that_senders_windows() {
+        let mirror = mirror_with(vec![
+            window_state(1, ":1.1", "/win/1", "/win/1/node", true),
+            window_state(2, ":1.1", "/win/2", "/win/2/node", true),
+            window_state(3, ":1.2", "/win/3", "/win/3/node", true),
+        ]);
+        assert_eq!(
+            mirror.windows_of_sender(":1.1"),
+            vec![WindowId(1), WindowId(2)]
+        );
+        assert_eq!(mirror.windows_of_sender(":1.9"), Vec::<WindowId>::new());
     }
 
     #[test]
