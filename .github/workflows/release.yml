@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Builds the shippable per-arch binaries and uploads them as artifacts. The
+# installer-assembly job (cargo xtask dist -> makensis) is added once the NSIS
+# script and Linux install assets land in the installer/WSL phases.
+
+jobs:
+  windows-dll:
+    name: dll (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release DLL
+        run: cargo build --release --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dll-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/accesskit_remote_dvc_plugin.dll
+          if-no-files-found: error
+
+  linux-daemon:
+    name: daemon (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Old glibc baseline so the daemon runs on stable distros.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release daemon
+        run: cargo build --release --target ${{ matrix.target }} -p accesskit_remoted
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/accesskit_remoted
+          if-no-files-found: error
