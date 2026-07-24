@@ -17,8 +17,9 @@ use atspi::proxy::action::ActionProxy;
 use atspi::proxy::application::ApplicationProxy;
 use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::text::TextProxy;
-use atspi::zbus::fdo::DBusProxy;
-use atspi::zbus::names::BusName;
+use atspi::zbus::fdo::{DBusProxy, PropertiesProxy};
+use atspi::zbus::names::{BusName, InterfaceName};
+use atspi::zbus::proxy::CacheProperties;
 use atspi::{CoordType, Interface, InterfaceSet, Role, State, StateSet};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -154,7 +155,7 @@ pub async fn walk_window(
         if objects.contains_key(&path) {
             continue;
         }
-        let Some((node, child_refs)) = read_node(zconn, &obj).await else {
+        let Some((node, child_refs)) = read_node(zconn, &obj, true).await else {
             continue;
         };
         queue.extend(child_refs);
@@ -170,48 +171,94 @@ pub async fn walk_window(
 pub(crate) async fn read_node(
     zconn: &atspi::zbus::Connection,
     obj: &ObjectRefOwned,
+    with_text: bool,
 ) -> Option<(MirrorNode, Vec<ObjectRefOwned>)> {
     let proxy = obj.as_accessible_proxy(zconn).await.ok()?;
-    let role = proxy.get_role().await.unwrap_or(Role::Invalid);
-    let name = proxy.name().await.unwrap_or_default();
-    let states = proxy.get_state().await.unwrap_or_else(|_| StateSet::empty());
-    // A failed read degrades to "advertises nothing", so every interface-gated
-    // read below is skipped rather than attempted blind.
-    let interfaces = proxy
-        .get_interfaces()
-        .await
-        .unwrap_or_else(|_| InterfaceSet::empty());
+    // One pipelined batch. The app still services these serially on its main
+    // loop, but issuing them together removes the client-side round-trip
+    // stacking that dominated the per-node cost.
+    let (role, identity, states, interfaces, child_refs) = tokio::join!(
+        proxy.get_role(),
+        read_identity(zconn, obj),
+        proxy.get_state(),
+        proxy.get_interfaces(),
+        proxy.get_children(),
+    );
+    let role = role.unwrap_or(Role::Invalid);
+    let (name, description) = identity;
+    // A failed interface read degrades to "advertises nothing", so every
+    // interface-gated read below is skipped rather than attempted blind.
+    let interfaces = interfaces.unwrap_or_else(|_| InterfaceSet::empty());
     let mut children = Vec::new();
-    let mut child_refs = Vec::new();
-    for child in proxy.get_children().await.unwrap_or_default() {
+    let mut refs = Vec::new();
+    for child in child_refs.unwrap_or_default() {
         if child.is_null() {
             continue;
         }
         children.push(child.path_as_str().to_owned());
-        child_refs.push(child);
+        refs.push(child);
     }
-    let text = if reads_text_runs(role, !children.is_empty()) && interfaces.contains(Interface::Text)
-    {
-        read_text_state(zconn, obj, has_text_caret(role), true).await
-    } else {
-        None
-    };
-    let bounds = if interfaces.contains(Interface::Component) {
-        read_component_extents(zconn, obj).await
-    } else {
-        None
-    };
+    let wants_text =
+        with_text && reads_text_runs(role, !children.is_empty()) && interfaces.contains(Interface::Text);
+    let (text, bounds) = tokio::join!(
+        async {
+            if wants_text {
+                read_text_state(zconn, obj, has_text_caret(role), true).await
+            } else {
+                None
+            }
+        },
+        async {
+            if interfaces.contains(Interface::Component) {
+                read_component_extents(zconn, obj).await
+            } else {
+                None
+            }
+        },
+    );
     let node = MirrorNode {
         path: obj.path_as_str().to_owned(),
         role,
         name,
+        description,
         interfaces,
-        states: node_states(states),
+        states: node_states(states.unwrap_or_else(|_| StateSet::empty())),
         children,
         text,
         bounds,
     };
-    Some((node, child_refs))
+    Some((node, refs))
+}
+
+/// Reads the `Accessible` interface's `Name` and `Description` in a single
+/// round trip via `Properties.GetAll`, rather than one call each. Verified
+/// supported by both GTK4's own bridge and at-spi2-atk. Any failure degrades to
+/// empty strings, matching how the walk treats every other unreadable property.
+async fn read_identity(zconn: &atspi::zbus::Connection, obj: &ObjectRefOwned) -> (String, String) {
+    async fn inner(
+        zconn: &atspi::zbus::Connection,
+        obj: &ObjectRefOwned,
+    ) -> BridgeResult<(String, String)> {
+        let name: BusName = obj.name().ok_or("null identity target")?.clone().into();
+        let proxy = PropertiesProxy::builder(zconn)
+            .destination(name)?
+            .path(obj.path().clone())?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?;
+        let props = proxy
+            .get_all(InterfaceName::try_from("org.a11y.atspi.Accessible")?)
+            .await?;
+        let read = |key: &str| -> String {
+            props
+                .get(key)
+                .cloned()
+                .and_then(|value| String::try_from(value).ok())
+                .unwrap_or_default()
+        };
+        Ok((read("Name"), read("Description")))
+    }
+    inner(zconn, obj).await.unwrap_or_default()
 }
 
 /// Bounds the parent climb from an unwalked descendant to a known ancestor.
@@ -232,7 +279,7 @@ pub(crate) async fn read_chain_to_known(
     let mut chain: Vec<(MirrorNode, ObjectRefOwned)> = Vec::new();
     let mut current = descendant.clone();
     for _ in 0..max_hops {
-        let (node, _) = read_node(zconn, &current).await?;
+        let (node, _) = read_node(zconn, &current, true).await?;
         let reached_known = known.contains(&node.path);
         chain.push((node, current.clone()));
         if reached_known {
@@ -269,6 +316,10 @@ pub async fn read_text_state(
         .ok()?
         .path(path)
         .ok()?
+        // zbus caches properties lazily by default, which costs an AddMatch and
+        // a GetAll on first property access and a RemoveMatch on drop -- pure
+        // overhead for a proxy built to serve one node and dropped.
+        .cache_properties(CacheProperties::No)
         .build()
         .await
         .ok()?;
@@ -328,6 +379,10 @@ async fn read_component_extents(
         .ok()?
         .path(path)
         .ok()?
+        // zbus caches properties lazily by default, which costs an AddMatch and
+        // a GetAll on first property access and a RemoveMatch on drop -- pure
+        // overhead for a proxy built to serve one node and dropped.
+        .cache_properties(CacheProperties::No)
         .build()
         .await
         .ok()?;

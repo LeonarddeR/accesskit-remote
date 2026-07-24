@@ -58,6 +58,9 @@ pub struct MirrorNode {
     pub path: String,
     pub role: Role,
     pub name: String,
+    /// The object's longer description; empty when absent. Read in the same
+    /// round trip as the name.
+    pub description: String,
     /// The interfaces the object advertises, gating the walk's optional reads
     /// and the actions that can be planned against it.
     pub interfaces: InterfaceSet,
@@ -76,6 +79,7 @@ impl Default for MirrorNode {
             path: String::new(),
             role: Role::Invalid,
             name: String::new(),
+            description: String::new(),
             interfaces: InterfaceSet::empty(),
             states: NodeStates::default(),
             children: Vec::new(),
@@ -896,6 +900,9 @@ fn build_node(
             container.set_label(node.name.clone());
         }
     }
+    if !node.description.is_empty() && node.description != node.name {
+        container.set_description(node.description.clone());
+    }
     if let Some(toggled) = node.states.toggled {
         container.set_toggled(toggled);
     }
@@ -1341,6 +1348,32 @@ mod tests {
         assert_eq!(node("/entry").invalid(), Some(accesskit::Invalid::True));
         assert_eq!(node("/bar").orientation(), Some(Orientation::Horizontal));
         assert!(node("/bar").is_busy());
+    }
+
+    #[test]
+    fn description_reaches_accesskit_and_never_duplicates_the_label() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/a".into(), "/b".into()];
+        let mut a = leaf("/a", Role::Button, "Save");
+        a.description = "Save the current document".into();
+        // GTK duplicates the name into the description on several widgets --
+        // forwarding that makes a screen reader say the label twice.
+        let mut b = leaf("/b", Role::Button, "Open");
+        b.description = "Open".into();
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, a, b], &mut ids);
+        let by_id: HashMap<NodeId, Node> = update.nodes.iter().cloned().collect();
+
+        assert_eq!(
+            by_id[&ids.get("/a").unwrap()].description(),
+            Some("Save the current document"),
+        );
+        assert_eq!(
+            by_id[&ids.get("/b").unwrap()].description(),
+            None,
+            "a description echoing the label is dropped",
+        );
     }
 
     #[test]

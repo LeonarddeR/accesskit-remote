@@ -6,6 +6,9 @@
 fn main() {
     use accesskit_remote_server::TreeSource;
 
+    // The bridge thread starts enumerating inside `new()`, so the clock has to
+    // start there: `initial_state()` only blocks for whatever walk remains.
+    let started = std::time::Instant::now();
     let mut source = match accesskit_remote_atspi::AtspiSource::new() {
         Ok(source) => source,
         Err(e) => {
@@ -13,7 +16,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // The walk cost is the budget this crate spends against every app, so the
+    // instrument reports it. Time against an *idle* app: AT-SPI calls serialize
+    // on the application's main loop, so a busy app inflates this many-fold.
     let (windows, focus) = source.initial_state();
+    let elapsed = started.elapsed();
+    let total: usize = windows.iter().map(|(_, update)| update.nodes.len()).sum();
+    println!(
+        "walk: {total} nodes across {} window(s) in {:?}",
+        windows.len(),
+        elapsed,
+    );
     println!("focused window: {focus:?}");
     println!("discovered {} window(s):", windows.len());
     for (descriptor, update) in &windows {
