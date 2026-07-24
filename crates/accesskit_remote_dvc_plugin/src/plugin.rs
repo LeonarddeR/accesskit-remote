@@ -86,6 +86,9 @@ fn handle_event(client: &SharedClient, shared: &Arc<RailShared>, event: ClientEv
             };
             drop(locked);
             shared.registry.lock().unwrap().window_added(window, title, app_id);
+            // A RAIL HWND whose creation events fired before this window was
+            // announced sits idle; nudge it into the hook. No locks held here.
+            rail::nudge_unattached_rail_windows(shared);
         }
         ClientEvent::WindowRemoved { window } => {
             info!("remote window removed: {}", window.0);

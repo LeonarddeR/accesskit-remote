@@ -21,11 +21,11 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId}
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE, GetClassNameW, GetMessageW,
-    GetPropW, GetWindowTextW, GetWindowThreadProcessId, MSG, OBJID_WINDOW, PostThreadMessageW,
-    TranslateMessage, WINEVENT_INCONTEXT, WM_QUIT,
+    DispatchMessageW, EVENT_OBJECT_CREATE, EVENT_OBJECT_NAMECHANGE, EnumWindows, GetClassNameW,
+    GetMessageW, GetPropW, GetWindowTextW, GetWindowThreadProcessId, MSG, OBJID_WINDOW,
+    PostThreadMessageW, SetWindowTextW, TranslateMessage, WINEVENT_INCONTEXT, WM_QUIT,
 };
-use windows::core::w;
+use windows::core::{BOOL, PCWSTR, w};
 
 use crate::association::{RailWindow, match_window};
 
@@ -103,6 +103,11 @@ impl Registry {
         let focus = new.and_then(|id| self.bound.get(&id).copied());
         self.focused = new;
         FocusTransition { unfocus, focus }
+    }
+
+    /// Whether any remote window still lacks a RAIL HWND.
+    fn has_unbound(&self) -> bool {
+        self.client_windows.keys().any(|id| !self.bound.contains_key(id))
     }
 
     fn unbound_windows(&self) -> Vec<(WindowId, accesskit_remote_client::WindowInfo)> {
@@ -201,6 +206,51 @@ pub fn start(shared_state: Arc<RailShared>) -> RailHook {
     });
     let thread_id = tid_rx.recv().unwrap_or(0);
     RailHook { thread_id, join: Some(join) }
+}
+
+unsafe extern "system" fn collect_rail_windows(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let out = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == unsafe { GetCurrentProcessId() } && is_rail_window(hwnd) {
+        out.push(hwnd);
+    }
+    true.into()
+}
+
+/// Fires a harmless in-range WinEvent at every unattached RAIL HWND so the
+/// in-context hook re-runs `try_attach` on each window's owning thread: a
+/// same-title `SetWindowTextW` is serviced as `WM_SETTEXT` *on the owning
+/// thread*, whose `DefWindowProc` raises `EVENT_OBJECT_NAMECHANGE` there.
+/// Must be called with no locks held — it blocks in a cross-thread send
+/// whose handler takes `shared.registry`.
+pub fn nudge_unattached_rail_windows(shared: &RailShared) {
+    let attached: HashSet<isize> = {
+        let registry = shared.registry.lock().unwrap();
+        if !registry.has_unbound() {
+            return;
+        }
+        registry.attached.clone()
+    };
+    let mut all: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(collect_rail_windows), LPARAM(&mut all as *mut _ as isize));
+    }
+    for hwnd in all {
+        if attached.contains(&(hwnd.0 as isize)) {
+            continue;
+        }
+        let mut buf = [0u16; 512];
+        let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
+        if len <= 0 {
+            // No title yet; the organic NAMECHANGE will attach it later.
+            continue;
+        }
+        debug!("nudging unattached RAIL hwnd {hwnd:?}");
+        if let Err(e) = unsafe { SetWindowTextW(hwnd, PCWSTR(buf.as_ptr())) } {
+            debug!("nudge SetWindowTextW failed for {hwnd:?}: {e:?}");
+        }
+    }
 }
 
 unsafe extern "system" fn win_event_proc(
@@ -352,6 +402,18 @@ mod tests {
             FocusTransition { unfocus: Some(0x111), focus: None }
         );
         assert_eq!(r.focused(), None);
+    }
+
+    #[test]
+    fn has_unbound_tracks_remote_windows_without_hwnds() {
+        let mut r = registry();
+        assert!(!r.has_unbound(), "empty registry has nothing unbound");
+        r.window_added(WindowId(1), "a".into(), None);
+        assert!(r.has_unbound(), "a fresh remote window is unbound");
+        r.bound.insert(1, 0x111);
+        assert!(!r.has_unbound(), "a bound window no longer counts");
+        r.window_added(WindowId(2), "b".into(), None);
+        assert!(r.has_unbound(), "a second unbound window counts again");
     }
 
     #[test]
