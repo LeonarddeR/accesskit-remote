@@ -3,6 +3,7 @@
 //! run on the bridge thread's tokio runtime; they hold no long-lived state of
 //! their own (the [`crate::source`] `Mirror` owns that).
 
+use crate::app_id::AppIdResolver;
 use crate::mapping::{clamp_text, has_text_caret, reads_text_runs, MirrorNode, TextState, MAX_TEXT_CHARS};
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
@@ -39,7 +40,10 @@ pub async fn connect() -> BridgeResult<AccessibilityConnection> {
 
 /// Enumerates the desktop's applications and returns their visible toplevel
 /// frames. Ids on the returned descriptors are placeholders for the caller.
-pub async fn discover_windows(conn: &AccessibilityConnection) -> BridgeResult<Vec<DiscoveredWindow>> {
+pub async fn discover_windows(
+    conn: &AccessibilityConnection,
+    app_ids: &mut AppIdResolver,
+) -> BridgeResult<Vec<DiscoveredWindow>> {
     let zconn = conn.connection();
     let registry = conn.root_accessible_on_registry().await?;
     let mut windows = Vec::new();
@@ -51,7 +55,7 @@ pub async fn discover_windows(conn: &AccessibilityConnection) -> BridgeResult<Ve
             continue;
         };
         let app_name = app.name().await.unwrap_or_default();
-        let app_info = read_app_info(zconn, &app_ref, app_name).await;
+        let app_info = read_app_info(zconn, &app_ref, app_name, app_ids).await;
         let frames = app.get_children().await.unwrap_or_default();
         for frame_ref in frames {
             if frame_ref.is_null() {
@@ -84,12 +88,14 @@ pub async fn discover_windows(conn: &AccessibilityConnection) -> BridgeResult<Ve
 }
 
 /// Reads an application's identity: toolkit name and version from its
-/// `Application` interface, pid from the a11y bus's `org.freedesktop.DBus`.
-/// Pieces that cannot be read are left `None`.
+/// `Application` interface, pid from the a11y bus's `org.freedesktop.DBus`,
+/// and the application id from the session-bus name that pid owns. Pieces
+/// that cannot be read are left `None`.
 async fn read_app_info(
     zconn: &atspi::zbus::Connection,
     app_ref: &ObjectRefOwned,
     name: String,
+    app_ids: &mut AppIdResolver,
 ) -> AppInfo {
     let mut info = AppInfo {
         name,
@@ -114,6 +120,9 @@ async fn read_app_info(
     }
     if let Ok(dbus) = DBusProxy::new(zconn).await {
         info.pid = dbus.get_connection_unix_process_id(bus_name).await.ok();
+    }
+    if let Some(pid) = info.pid {
+        info.app_id = app_ids.app_id_for_pid(pid).await;
     }
     info
 }

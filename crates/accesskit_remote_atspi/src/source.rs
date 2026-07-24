@@ -3,6 +3,7 @@
 //! and the [`Mirror`] state; the sync side talks to it over channels —
 //! actions in via a tokio channel, tree events out via a std channel.
 
+use crate::app_id::AppIdResolver;
 use crate::coalesce::RewalkCoalescer;
 use crate::focus::FocusTracker;
 use crate::mapping::{
@@ -250,6 +251,7 @@ struct Mirror {
     windows: Vec<WindowState>,
     next_id: u64,
     focus: FocusTracker,
+    app_ids: AppIdResolver,
 }
 
 struct WindowState {
@@ -271,13 +273,14 @@ impl Mirror {
             windows: Vec::new(),
             next_id: 1,
             focus: FocusTracker::default(),
+            app_ids: AppIdResolver::default(),
         }
     }
 
     /// Discovers every visible frame, walks each into a tree, and returns the
     /// initial snapshot (windows with full trees, plus the focused window).
     async fn enumerate(&mut self, conn: &AccessibilityConnection) -> BridgeResult<Snapshot> {
-        let discovered = mirror::discover_windows(conn).await?;
+        let discovered = mirror::discover_windows(conn, &mut self.app_ids).await?;
         let mut out = Vec::new();
         let mut focus = None;
         for window in discovered {
@@ -605,7 +608,7 @@ impl Mirror {
     /// A removed window is dropped from the focus tracker; the client nulls its
     /// own focus reference on `WindowRemoved`, so no `FocusChanged` is emitted.
     async fn reconcile(&mut self, conn: &AccessibilityConnection) -> Vec<SourceEvent> {
-        let discovered = match mirror::discover_windows(conn).await {
+        let discovered = match mirror::discover_windows(conn, &mut self.app_ids).await {
             Ok(discovered) => discovered,
             Err(_) => return Vec::new(),
         };
@@ -787,6 +790,7 @@ mod tests {
             windows,
             next_id: 100,
             focus: FocusTracker::new(None),
+            app_ids: AppIdResolver::default(),
         }
     }
 
@@ -840,6 +844,7 @@ mod tests {
             windows: vec![win],
             next_id: 100,
             focus: FocusTracker::new(Some(WindowId(1))),
+            app_ids: AppIdResolver::default(),
         };
         let out = mirror.handle_active_descendant(":1.1", "/win/1/item");
         assert_eq!(out.len(), 1, "an already-focused window emits only the focus delta");

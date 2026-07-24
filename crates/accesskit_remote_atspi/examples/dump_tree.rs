@@ -19,9 +19,10 @@ fn main() {
     for (descriptor, update) in &windows {
         let app = &descriptor.app;
         println!(
-            "  window {} | app {:?} pid={:?} toolkit={:?} {:?} | title {:?} | {} nodes",
+            "  window {} | app {:?} app_id={:?} pid={:?} toolkit={:?} {:?} | title {:?} | {} nodes",
             descriptor.id.0,
             app.name,
+            app.app_id,
             app.pid,
             app.toolkit,
             app.toolkit_version,
