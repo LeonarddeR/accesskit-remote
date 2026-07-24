@@ -403,14 +403,17 @@ impl Mirror {
             return self.handle_active_descendant(sender.as_str(), ev.descendant.path_as_str());
         }
         match &event {
+            // Caret and selection moves change no text, so the cached run
+            // geometry still applies and none is re-read. (Scrolling can
+            // stale it, but AT-SPI emits no event for that either way.)
             Event::Object(ObjectEvents::TextCaretMoved(ev)) => {
-                return self.refresh_text(conn, &ev.item).await
+                return self.refresh_text(conn, &ev.item, false).await
             }
             Event::Object(ObjectEvents::TextChanged(ev)) => {
-                return self.refresh_text(conn, &ev.item).await
+                return self.refresh_text(conn, &ev.item, true).await
             }
             Event::Object(ObjectEvents::TextSelectionChanged(ev)) => {
-                return self.refresh_text(conn, &ev.item).await
+                return self.refresh_text(conn, &ev.item, false).await
             }
             _ => {}
         }
@@ -549,6 +552,7 @@ impl Mirror {
         &mut self,
         conn: &AccessibilityConnection,
         item: &ObjectRefOwned,
+        with_geometry: bool,
     ) -> Vec<SourceEvent> {
         let Some(sender) = item.name() else {
             return Vec::new();
@@ -562,7 +566,7 @@ impl Mirror {
         };
         let with_caret = self.windows[index].text[path].caret_enabled;
         let Some(state) =
-            mirror::read_text_state(conn.connection(), item, with_caret, false).await
+            mirror::read_text_state(conn.connection(), item, with_caret, with_geometry).await
         else {
             return Vec::new();
         };

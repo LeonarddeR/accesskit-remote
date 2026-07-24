@@ -96,14 +96,22 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
         for event in source.poll_events() {
             if let SourceEvent::TreeUpdate { window, update } = event {
-                let runs: String = update
+                let run_nodes: Vec<_> = update
                     .nodes
                     .iter()
                     .filter(|(_, n)| n.role() == accesskit::Role::TextRun)
-                    .filter_map(|(_, n)| n.value())
                     .collect();
+                let with_geom = run_nodes.iter().filter(|(_, n)| n.bounds().is_some()).count();
+                let runs: String = run_nodes.iter().filter_map(|(_, n)| n.value()).collect();
                 if !update.nodes.is_empty() {
-                    println!("delta window {}: {} nodes, runs {:?}", window.0, update.nodes.len(), runs);
+                    println!(
+                        "delta window {}: {} nodes, geom {}/{} runs, runs {:?}",
+                        window.0,
+                        update.nodes.len(),
+                        with_geom,
+                        run_nodes.len(),
+                        runs
+                    );
                 }
                 if runs.contains(MARKER) {
                     hit = true;

@@ -103,6 +103,9 @@ pub struct TextNodeCache {
     /// Whether the node's role has a caret, so a later refresh re-reads the
     /// caret and selection instead of leaving them cleared.
     pub caret_enabled: bool,
+    /// The extents behind the runs' current geometry, reused by refreshes that
+    /// read no geometry (caret/selection moves) while the text is unchanged.
+    pub extents: Option<Vec<CharExtent>>,
 }
 
 /// Translates an AT-SPI [`Role`] into the nearest AccessKit role.
@@ -452,7 +455,17 @@ pub fn rebuild_text_node(
     state: &TextState,
     ids: &mut NodeIdMap,
 ) -> Vec<(NodeId, Node)> {
-    let (runs, layout) = build_text_runs(parent_path, &state.text, state.extents.as_deref(), ids);
+    // Fresh extents win; a refresh that read none (caret/selection move)
+    // reuses the cached ones as long as the text length still matches.
+    let effective: Option<Vec<CharExtent>> = match &state.extents {
+        Some(fresh) => Some(fresh.clone()),
+        None => cache
+            .extents
+            .as_ref()
+            .filter(|cached| cached.len() == state.text.chars().count())
+            .cloned(),
+    };
+    let (runs, layout) = build_text_runs(parent_path, &state.text, effective.as_deref(), ids);
     let mut parent = cache.parent.clone();
     let mut children = cache.element_children.clone();
     children.extend(runs.iter().map(|(id, _)| *id));
@@ -479,6 +492,7 @@ pub fn rebuild_text_node(
     cache.parent = parent;
     cache.runs = runs;
     cache.layout = layout;
+    cache.extents = effective;
     changed
 }
 
@@ -586,6 +600,7 @@ fn build_node(
                 runs: runs.clone(),
                 layout,
                 caret_enabled: has_text_caret(node.role),
+                extents: state.extents.clone(),
             };
             BuiltNode { container, runs, cache: Some(cache) }
         }
@@ -1036,6 +1051,94 @@ mod tests {
         let delta = rebuild_text_node(cache, "/doc", &shorter, &mut ids);
         let (_, parent) = delta.iter().find(|(id, _)| *id == node_id).unwrap();
         assert_eq!(parent.children().len(), 1, "container children shrink to one run");
+    }
+
+    #[test]
+    fn caret_move_reuses_cached_extents_and_stays_a_minimal_delta() {
+        let doc = text_node(
+            "/doc",
+            TextState {
+                text: "hi".into(),
+                caret: Some(0),
+                selection: None,
+                extents: Some(vec![ext(10, 0, 8, 16), ext(18, 0, 8, 16)]),
+            },
+        );
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        build_window_update(&[doc], &mut ids, &mut caches);
+        let cache = caches.get_mut("/doc").unwrap();
+
+        // A caret move re-reads no geometry; the cached extents keep the runs
+        // identical, so only the container changes.
+        let moved = TextState { text: "hi".into(), caret: Some(1), selection: None, extents: None };
+        let delta = rebuild_text_node(cache, "/doc", &moved, &mut ids);
+        assert_eq!(delta.len(), 1, "caret move stays a container-only delta");
+        assert_eq!(delta[0].0, cache.node_id);
+        assert!(
+            cache.runs[0].1.bounds().is_some(),
+            "cached run keeps its geometry across the caret move"
+        );
+    }
+
+    #[test]
+    fn text_change_with_fresh_extents_updates_run_geometry() {
+        let doc = text_node(
+            "/doc",
+            TextState {
+                text: "hi".into(),
+                caret: Some(0),
+                selection: None,
+                extents: Some(vec![ext(10, 0, 8, 16), ext(18, 0, 8, 16)]),
+            },
+        );
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        build_window_update(&[doc], &mut ids, &mut caches);
+        let cache = caches.get_mut("/doc").unwrap();
+
+        let fresh = vec![ext(10, 0, 8, 16), ext(18, 0, 9, 16)];
+        let edited = TextState {
+            text: "hx".into(),
+            caret: Some(2),
+            selection: None,
+            extents: Some(fresh.clone()),
+        };
+        let delta = rebuild_text_node(cache, "/doc", &edited, &mut ids);
+        let run_id = cache.runs[0].0;
+        let (_, run) = delta.iter().find(|(id, _)| *id == run_id).unwrap();
+        assert_eq!(
+            run.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 0.0, x1: 27.0, y1: 16.0 }),
+            "edited run carries the fresh geometry"
+        );
+        assert_eq!(cache.extents.as_deref(), Some(&fresh[..]), "fresh extents cached");
+    }
+
+    #[test]
+    fn text_change_without_extents_drops_stale_geometry() {
+        let doc = text_node(
+            "/doc",
+            TextState {
+                text: "hi".into(),
+                caret: Some(0),
+                selection: None,
+                extents: Some(vec![ext(10, 0, 8, 16), ext(18, 0, 8, 16)]),
+            },
+        );
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        build_window_update(&[doc], &mut ids, &mut caches);
+        let cache = caches.get_mut("/doc").unwrap();
+
+        // Text length changed but no fresh extents arrived: stale geometry
+        // must be dropped, not misapplied.
+        let edited = TextState { text: "hey".into(), caret: Some(3), selection: None, extents: None };
+        let delta = rebuild_text_node(cache, "/doc", &edited, &mut ids);
+        let run_id = cache.runs[0].0;
+        let (_, run) = delta.iter().find(|(id, _)| *id == run_id).unwrap();
+        assert_eq!(run.bounds(), None, "rebuilt run carries no stale geometry");
+        assert_eq!(cache.extents, None, "stale cached extents cleared");
     }
 
     #[test]
