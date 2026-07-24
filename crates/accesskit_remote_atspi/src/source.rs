@@ -561,7 +561,9 @@ impl Mirror {
             return Vec::new();
         };
         let with_caret = self.windows[index].text[path].caret_enabled;
-        let Some(state) = mirror::read_text_state(conn.connection(), item, with_caret).await else {
+        let Some(state) =
+            mirror::read_text_state(conn.connection(), item, with_caret, false).await
+        else {
             return Vec::new();
         };
         let window_state = &mut self.windows[index];

@@ -11,6 +11,11 @@ use std::collections::{HashMap, HashSet};
 /// document cannot bloat a single tree update.
 pub const MAX_TEXT_CHARS: usize = 65_536;
 
+/// Caps per-character geometry reads, in Unicode scalar values per node.
+/// Reading extents costs one bus round trip per character; nodes above this
+/// cap carry no geometry at all.
+pub const MAX_GEOMETRY_CHARS: usize = 512;
+
 /// Assigns stable, sequential AccessKit [`NodeId`]s to AT-SPI object paths
 /// within one window. The same path always maps to the same id for the life
 /// of the map.
@@ -64,6 +69,18 @@ pub struct TextState {
     pub text: String,
     pub caret: Option<usize>,
     pub selection: Option<(usize, usize)>,
+    /// Per-code-point window-relative extents, parallel to `text`'s code
+    /// points; `None` when geometry was unavailable or not read.
+    pub extents: Option<Vec<CharExtent>>,
+}
+
+/// One code point's window-relative extent as AT-SPI reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharExtent {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 /// One synthesized [`Role::TextRun`] child: its node id and code-point count,
@@ -258,16 +275,92 @@ fn word_starts(run: &str) -> Vec<u8> {
     starts.into_iter().map(|s| s as u8).collect()
 }
 
+/// Replaces unreported (all-zero) extents: a zero extent takes its
+/// predecessor's right edge (zero width, the predecessor's y and height);
+/// leading zeros take the first real extent's left edge. `None` when the node
+/// has no real extent at all.
+fn synthesize_extents(extents: &[CharExtent]) -> Option<Vec<CharExtent>> {
+    fn is_unreported(extent: &CharExtent) -> bool {
+        extent.x == 0 && extent.y == 0 && extent.width == 0 && extent.height == 0
+    }
+    let first_real = extents.iter().position(|e| !is_unreported(e))?;
+    let mut out: Vec<CharExtent> = Vec::with_capacity(extents.len());
+    for (index, extent) in extents.iter().enumerate() {
+        if !is_unreported(extent) {
+            out.push(*extent);
+        } else if index < first_real {
+            let donor = extents[first_real];
+            out.push(CharExtent { x: donor.x, y: donor.y, width: 0, height: donor.height });
+        } else {
+            let prev = out[index - 1];
+            out.push(CharExtent {
+                x: prev.x + prev.width,
+                y: prev.y,
+                width: 0,
+                height: prev.height,
+            });
+        }
+    }
+    Some(out)
+}
+
+/// A run's bounds plus run-relative per-char positions and advance widths,
+/// from its slice of the node's synthesized extents. An empty run (the
+/// trailing caret run) takes a zero-width rect at `prev_last`'s right edge.
+fn run_geometry(
+    chars: &[CharExtent],
+    prev_last: Option<CharExtent>,
+) -> Option<(accesskit::Rect, Vec<f32>, Vec<f32>)> {
+    if chars.is_empty() {
+        let prev = prev_last?;
+        let edge = (prev.x + prev.width) as f64;
+        let rect = accesskit::Rect {
+            x0: edge,
+            y0: prev.y as f64,
+            x1: edge,
+            y1: (prev.y + prev.height) as f64,
+        };
+        return Some((rect, Vec::new(), Vec::new()));
+    }
+    let mut x0 = i32::MAX;
+    let mut y0 = i32::MAX;
+    let mut x1 = i32::MIN;
+    let mut y1 = i32::MIN;
+    for extent in chars {
+        x0 = x0.min(extent.x);
+        y0 = y0.min(extent.y);
+        x1 = x1.max(extent.x + extent.width);
+        y1 = y1.max(extent.y + extent.height);
+    }
+    let positions = chars.iter().map(|e| (e.x - x0) as f32).collect();
+    let widths = chars.iter().map(|e| e.width as f32).collect();
+    let rect = accesskit::Rect {
+        x0: x0 as f64,
+        y0: y0 as f64,
+        x1: x1 as f64,
+        y1: y1 as f64,
+    };
+    Some((rect, positions, widths))
+}
+
 /// Builds the [`Role::TextRun`] child nodes for `text` and their layout. Each
 /// run carries its value, per-code-point `character_lengths`, and word starts.
+/// When `extents` is provided, each run additionally carries its bounds,
+/// run-relative character positions and widths, and text direction, derived
+/// from the node's synthesized extents.
 pub fn build_text_runs(
     parent_path: &str,
     text: &str,
+    extents: Option<&[CharExtent]>,
     ids: &mut NodeIdMap,
 ) -> (Vec<(NodeId, Node)>, Vec<TextRunLayout>) {
     let runs = split_runs(text);
     let mut nodes = Vec::with_capacity(runs.len());
     let mut layout = Vec::with_capacity(runs.len());
+    let synthesized = extents
+        .filter(|all| all.len() == text.chars().count())
+        .and_then(synthesize_extents);
+    let mut cursor = 0usize;
     for (index, run) in runs.iter().enumerate() {
         let id = ids.id_for(&run_path(parent_path, index));
         let lengths = character_lengths(run);
@@ -279,6 +372,17 @@ pub fn build_text_runs(
         if !words.is_empty() {
             node.set_word_starts(words);
         }
+        if let Some(all) = synthesized.as_deref() {
+            let prev_last = if cursor > 0 { all.get(cursor - 1).copied() } else { None };
+            let slice = &all[cursor..cursor + chars];
+            if let Some((rect, positions, widths)) = run_geometry(slice, prev_last) {
+                node.set_bounds(rect);
+                node.set_character_positions(positions);
+                node.set_character_widths(widths);
+                node.set_text_direction(accesskit::TextDirection::LeftToRight);
+            }
+        }
+        cursor += chars;
         nodes.push((id, node));
         layout.push(TextRunLayout { id, chars });
     }
@@ -348,7 +452,7 @@ pub fn rebuild_text_node(
     state: &TextState,
     ids: &mut NodeIdMap,
 ) -> Vec<(NodeId, Node)> {
-    let (runs, layout) = build_text_runs(parent_path, &state.text, ids);
+    let (runs, layout) = build_text_runs(parent_path, &state.text, state.extents.as_deref(), ids);
     let mut parent = cache.parent.clone();
     let mut children = cache.element_children.clone();
     children.extend(runs.iter().map(|(id, _)| *id));
@@ -465,7 +569,8 @@ fn build_node(
     }
     match &node.text {
         Some(state) => {
-            let (runs, layout) = build_text_runs(&node.path, &state.text, ids);
+            let (runs, layout) =
+                build_text_runs(&node.path, &state.text, state.extents.as_deref(), ids);
             let mut children = element_children.clone();
             children.extend(runs.iter().map(|(rid, _)| *rid));
             if !children.is_empty() {
@@ -709,7 +814,7 @@ mod tests {
     #[test]
     fn build_text_runs_concatenate_to_input_with_stable_ids() {
         let mut ids = NodeIdMap::new();
-        let (runs, layout) = build_text_runs("/doc", "hi\nyo", &mut ids);
+        let (runs, layout) = build_text_runs("/doc", "hi\nyo", None, &mut ids);
         assert_eq!(runs.len(), 2);
         let joined: String = runs.iter().map(|(_, n)| n.value().unwrap()).collect();
         assert_eq!(joined, "hi\nyo");
@@ -720,7 +825,7 @@ mod tests {
         assert_eq!(char_lengths(&runs[1].1), vec![1, 1]);
         assert_eq!(layout.iter().map(|r| r.chars).collect::<Vec<_>>(), vec![3, 2]);
 
-        let (runs2, _) = build_text_runs("/doc", "hi\nyo", &mut ids);
+        let (runs2, _) = build_text_runs("/doc", "hi\nyo", None, &mut ids);
         assert_eq!(
             runs.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
             runs2.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
@@ -731,7 +836,7 @@ mod tests {
     #[test]
     fn empty_text_yields_one_empty_run() {
         let mut ids = NodeIdMap::new();
-        let (runs, layout) = build_text_runs("/doc", "", &mut ids);
+        let (runs, layout) = build_text_runs("/doc", "", None, &mut ids);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].1.value(), Some(""));
         assert_eq!(layout[0].chars, 0);
@@ -740,7 +845,7 @@ mod tests {
     #[test]
     fn text_position_maps_offsets_across_runs_and_clamps() {
         let mut ids = NodeIdMap::new();
-        let (_, layout) = build_text_runs("/doc", "ab\ncd", &mut ids);
+        let (_, layout) = build_text_runs("/doc", "ab\ncd", None, &mut ids);
         let (r0, r1) = (layout[0].id, layout[1].id);
         assert_eq!(text_position(&layout, 0), TextPosition { node: r0, character_index: 0 });
         // Offset 2 lands ON the line break inside run 0.
@@ -755,7 +860,7 @@ mod tests {
     #[test]
     fn text_offset_is_the_inverse_of_text_position() {
         let mut ids = NodeIdMap::new();
-        let (_, layout) = build_text_runs("/doc", "ab\ncd", &mut ids);
+        let (_, layout) = build_text_runs("/doc", "ab\ncd", None, &mut ids);
         let total: usize = layout.iter().map(|r| r.chars).sum();
         // Round-trips at the start, an interior offset, a run boundary, and the
         // end-of-text boundary (where off-by-one bugs live).
@@ -774,7 +879,7 @@ mod tests {
     #[test]
     fn text_position_counts_code_points_not_bytes() {
         let mut ids = NodeIdMap::new();
-        let (_, layout) = build_text_runs("/doc", "é\nb", &mut ids);
+        let (_, layout) = build_text_runs("/doc", "é\nb", None, &mut ids);
         // Offset 1 is the '\n' after the 2-byte 'é', still index 1 (code points).
         assert_eq!(text_position(&layout, 1), TextPosition { node: layout[0].id, character_index: 1 });
         assert_eq!(text_position(&layout, 2), TextPosition { node: layout[1].id, character_index: 0 });
@@ -783,36 +888,36 @@ mod tests {
     #[test]
     fn text_selection_direction_and_degenerate_cases() {
         let mut ids = NodeIdMap::new();
-        let (_, layout) = build_text_runs("/doc", "abcdef", &mut ids);
+        let (_, layout) = build_text_runs("/doc", "abcdef", None, &mut ids);
         let run = layout[0].id;
         let pos = |i| TextPosition { node: run, character_index: i };
 
         // Caret only: degenerate selection.
-        let caret = TextState { text: "abcdef".into(), caret: Some(3), selection: None };
+        let caret = TextState { text: "abcdef".into(), caret: Some(3), selection: None, extents: None };
         assert_eq!(text_selection(&caret, &layout), Some(TextSelection { anchor: pos(3), focus: pos(3) }));
 
         // Forward selection: caret at the end.
-        let fwd = TextState { text: "abcdef".into(), caret: Some(4), selection: Some((1, 4)) };
+        let fwd = TextState { text: "abcdef".into(), caret: Some(4), selection: Some((1, 4)), extents: None };
         assert_eq!(text_selection(&fwd, &layout), Some(TextSelection { anchor: pos(1), focus: pos(4) }));
 
         // Backward selection: caret at the start.
-        let back = TextState { text: "abcdef".into(), caret: Some(1), selection: Some((1, 4)) };
+        let back = TextState { text: "abcdef".into(), caret: Some(1), selection: Some((1, 4)), extents: None };
         assert_eq!(text_selection(&back, &layout), Some(TextSelection { anchor: pos(4), focus: pos(1) }));
 
         // Neither caret nor selection: nothing.
-        let none = TextState { text: "abcdef".into(), caret: None, selection: None };
+        let none = TextState { text: "abcdef".into(), caret: None, selection: None, extents: None };
         assert_eq!(text_selection(&none, &layout), None);
     }
 
     #[test]
     fn word_starts_mark_word_boundaries_and_cap_at_u8() {
         let mut ids = NodeIdMap::new();
-        let (runs, _) = build_text_runs("/doc", "foo bar\n", &mut ids);
+        let (runs, _) = build_text_runs("/doc", "foo bar\n", None, &mut ids);
         assert_eq!(runs[0].1.word_starts().to_vec(), vec![0u8, 4]);
 
         // A word start past 255 collapses word info to empty.
         let long = format!("{} b", "a".repeat(300));
-        let (long_runs, _) = build_text_runs("/doc2", &long, &mut ids);
+        let (long_runs, _) = build_text_runs("/doc2", &long, None, &mut ids);
         assert!(long_runs[0].1.word_starts().is_empty());
     }
 
@@ -820,7 +925,7 @@ mod tests {
     fn build_window_update_appends_runs_and_populates_cache() {
         let mut root = leaf("/win", Role::Frame, "w");
         root.children = vec!["/doc".into()];
-        let doc = text_node("/doc", TextState { text: "hi\n".into(), caret: Some(3), selection: None });
+        let doc = text_node("/doc", TextState { text: "hi\n".into(), caret: Some(3), selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
         let mut caches = HashMap::new();
@@ -846,9 +951,9 @@ mod tests {
     #[test]
     fn text_cache_records_caret_enabled_per_role() {
         let mut editable = leaf("/e", Role::Text, "");
-        editable.text = Some(TextState { text: "x".into(), caret: Some(1), selection: None });
+        editable.text = Some(TextState { text: "x".into(), caret: Some(1), selection: None, extents: None });
         let mut label = leaf("/l", Role::Label, "hi");
-        label.text = Some(TextState { text: "hi".into(), caret: None, selection: None });
+        label.text = Some(TextState { text: "hi".into(), caret: None, selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
         let mut caches = HashMap::new();
@@ -861,7 +966,7 @@ mod tests {
     #[test]
     fn static_label_with_text_keeps_value_and_gains_runs() {
         let mut label = leaf("/l", Role::Label, "Status: OK");
-        label.text = Some(TextState { text: "Status: OK".into(), caret: None, selection: None });
+        label.text = Some(TextState { text: "Status: OK".into(), caret: None, selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
         let update = build_window_update(&[label], &mut ids, &mut HashMap::new());
@@ -880,8 +985,8 @@ mod tests {
     fn no_duplicate_child_ids_across_text_nodes() {
         let mut root = leaf("/win", Role::Frame, "w");
         root.children = vec!["/a".into(), "/b".into()];
-        let a = text_node("/a", TextState { text: "x\ny".into(), caret: None, selection: None });
-        let b = text_node("/b", TextState { text: "z".into(), caret: None, selection: None });
+        let a = text_node("/a", TextState { text: "x\ny".into(), caret: None, selection: None, extents: None });
+        let b = text_node("/b", TextState { text: "z".into(), caret: None, selection: None, extents: None });
 
         let mut ids = NodeIdMap::new();
         let update = build_window_update(&[root, a, b], &mut ids, &mut HashMap::new());
@@ -893,14 +998,14 @@ mod tests {
 
     #[test]
     fn rebuild_text_node_emits_minimal_deltas() {
-        let doc = text_node("/doc", TextState { text: "one\ntwo".into(), caret: Some(0), selection: None });
+        let doc = text_node("/doc", TextState { text: "one\ntwo".into(), caret: Some(0), selection: None, extents: None });
         let mut ids = NodeIdMap::new();
         let mut caches = HashMap::new();
         build_window_update(&[doc], &mut ids, &mut caches);
         let cache = caches.get_mut("/doc").unwrap();
 
         // Caret-only move: exactly the container changes.
-        let moved = TextState { text: "one\ntwo".into(), caret: Some(5), selection: None };
+        let moved = TextState { text: "one\ntwo".into(), caret: Some(5), selection: None, extents: None };
         let delta = rebuild_text_node(cache, "/doc", &moved, &mut ids);
         assert_eq!(delta.len(), 1, "caret move is a single-node delta");
         assert_eq!(delta[0].0, cache.node_id);
@@ -909,7 +1014,7 @@ mod tests {
         assert!(rebuild_text_node(cache, "/doc", &moved, &mut ids).is_empty());
 
         // Editing the second line: container (its selection tracks) + that run.
-        let edited = TextState { text: "one\nTWO".into(), caret: Some(7), selection: None };
+        let edited = TextState { text: "one\nTWO".into(), caret: Some(7), selection: None, extents: None };
         let ids_before = (cache.runs[0].0, cache.runs[1].0);
         let delta = rebuild_text_node(cache, "/doc", &edited, &mut ids);
         let changed_ids: HashSet<NodeId> = delta.iter().map(|(id, _)| *id).collect();
@@ -920,14 +1025,14 @@ mod tests {
 
     #[test]
     fn rebuild_text_node_shrinks_run_children() {
-        let doc = text_node("/doc", TextState { text: "a\nb\nc".into(), caret: None, selection: None });
+        let doc = text_node("/doc", TextState { text: "a\nb\nc".into(), caret: None, selection: None, extents: None });
         let mut ids = NodeIdMap::new();
         let mut caches = HashMap::new();
         build_window_update(&[doc], &mut ids, &mut caches);
         let cache = caches.get_mut("/doc").unwrap();
         let node_id = cache.node_id;
 
-        let shorter = TextState { text: "a".into(), caret: None, selection: None };
+        let shorter = TextState { text: "a".into(), caret: None, selection: None, extents: None };
         let delta = rebuild_text_node(cache, "/doc", &shorter, &mut ids);
         let (_, parent) = delta.iter().find(|(id, _)| *id == node_id).unwrap();
         assert_eq!(parent.children().len(), 1, "container children shrink to one run");
@@ -938,5 +1043,178 @@ mod tests {
         assert_eq!(clamp_text("short"), "short");
         let long = "a".repeat(MAX_TEXT_CHARS + 10);
         assert_eq!(clamp_text(&long).chars().count(), MAX_TEXT_CHARS);
+    }
+
+    // --- Text-run geometry ---
+
+    fn ext(x: i32, y: i32, width: i32, height: i32) -> CharExtent {
+        CharExtent { x, y, width, height }
+    }
+
+    #[test]
+    fn runs_carry_geometry_when_extents_provided() {
+        let extents = [
+            ext(10, 0, 8, 16),
+            ext(18, 0, 8, 16),
+            ext(0, 0, 0, 0),
+            ext(10, 16, 8, 16),
+            ext(18, 16, 8, 16),
+        ];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "ab\ncd", Some(&extents), &mut ids);
+
+        assert_eq!(
+            runs[0].1.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 0.0, x1: 26.0, y1: 16.0 })
+        );
+        assert_eq!(runs[0].1.character_positions(), Some(&[0.0, 8.0, 16.0][..]));
+        assert_eq!(runs[0].1.character_widths(), Some(&[8.0, 8.0, 0.0][..]));
+        assert_eq!(runs[0].1.text_direction(), Some(accesskit::TextDirection::LeftToRight));
+
+        assert_eq!(
+            runs[1].1.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 16.0, x1: 26.0, y1: 32.0 })
+        );
+        assert_eq!(runs[1].1.character_positions(), Some(&[0.0, 8.0][..]));
+        assert_eq!(runs[1].1.character_widths(), Some(&[8.0, 8.0][..]));
+    }
+
+    #[test]
+    fn zero_extent_newline_is_synthesized_from_predecessor() {
+        let extents = [ext(10, 0, 8, 16), ext(0, 0, 0, 0)];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "a\n", Some(&extents), &mut ids);
+
+        assert_eq!(runs[0].1.character_positions(), Some(&[0.0, 8.0][..]));
+        assert_eq!(runs[0].1.character_widths(), Some(&[8.0, 0.0][..]));
+        assert_eq!(
+            runs[0].1.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 0.0, x1: 18.0, y1: 16.0 }),
+            "the zero-extent newline must not pollute x0"
+        );
+    }
+
+    #[test]
+    fn trailing_empty_run_gets_a_zero_width_caret_rect() {
+        let extents = [ext(10, 0, 8, 16), ext(0, 0, 0, 0)];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "a\n", Some(&extents), &mut ids);
+
+        assert_eq!(
+            runs[1].1.bounds(),
+            Some(accesskit::Rect { x0: 18.0, y0: 0.0, x1: 18.0, y1: 16.0 })
+        );
+        assert_eq!(runs[1].1.character_positions(), Some(&[][..]));
+        assert_eq!(runs[1].1.character_widths(), Some(&[][..]));
+        assert_eq!(runs[1].1.text_direction(), Some(accesskit::TextDirection::LeftToRight));
+    }
+
+    #[test]
+    fn extent_length_mismatch_drops_geometry_entirely() {
+        let extents = [ext(10, 0, 8, 16)];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "ab", Some(&extents), &mut ids);
+
+        assert_eq!(runs[0].1.bounds(), None);
+        assert_eq!(runs[0].1.character_positions(), None);
+        assert_eq!(runs[0].1.character_widths(), None);
+        assert_eq!(runs[0].1.text_direction(), None);
+    }
+
+    #[test]
+    fn no_extents_means_no_geometry_properties() {
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "ab", None, &mut ids);
+
+        assert_eq!(runs[0].1.bounds(), None);
+        assert_eq!(runs[0].1.character_positions(), None);
+        assert_eq!(runs[0].1.character_widths(), None);
+        assert_eq!(runs[0].1.text_direction(), None);
+        assert_eq!(runs[0].1.value(), Some("ab"));
+        assert_eq!(char_lengths(&runs[0].1), vec![1, 1]);
+    }
+
+    #[test]
+    fn positions_are_run_relative_not_window_relative() {
+        let extents = [ext(30, 0, 8, 16), ext(0, 0, 0, 0), ext(40, 16, 8, 16)];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "x\ny", Some(&extents), &mut ids);
+
+        assert_eq!(runs[1].1.character_positions(), Some(&[0.0][..]), "run-relative, not 40.0");
+        assert_eq!(
+            runs[1].1.bounds(),
+            Some(accesskit::Rect { x0: 40.0, y0: 16.0, x1: 48.0, y1: 32.0 })
+        );
+    }
+
+    #[test]
+    fn empty_text_has_no_geometry() {
+        let extents: [CharExtent; 0] = [];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "", Some(&extents), &mut ids);
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1.bounds(), None);
+        assert_eq!(runs[0].1.character_positions(), None);
+        assert_eq!(runs[0].1.character_widths(), None);
+        assert_eq!(runs[0].1.text_direction(), None);
+    }
+
+    #[test]
+    fn leading_zero_extent_backfills_from_first_real_char() {
+        let extents = [ext(0, 0, 0, 0), ext(10, 16, 8, 16)];
+        let mut ids = NodeIdMap::new();
+        let (runs, _) = build_text_runs("/n", "\na", Some(&extents), &mut ids);
+
+        assert_eq!(
+            runs[0].1.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 16.0, x1: 10.0, y1: 32.0 })
+        );
+        assert_eq!(runs[0].1.character_positions(), Some(&[0.0][..]));
+        assert_eq!(runs[0].1.character_widths(), Some(&[0.0][..]));
+
+        assert_eq!(
+            runs[1].1.bounds(),
+            Some(accesskit::Rect { x0: 10.0, y0: 16.0, x1: 18.0, y1: 32.0 })
+        );
+        assert_eq!(runs[1].1.character_positions(), Some(&[0.0][..]));
+        assert_eq!(runs[1].1.character_widths(), Some(&[8.0][..]));
+    }
+
+    #[test]
+    fn consumer_computes_bounding_boxes_from_run_geometry() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/label".into()];
+        let mut label = leaf("/label", Role::Label, "");
+        label.text = Some(TextState {
+            text: "ab".into(),
+            caret: None,
+            selection: None,
+            extents: Some(vec![ext(10, 0, 8, 16), ext(18, 0, 8, 16)]),
+        });
+
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[root, label], &mut ids, &mut HashMap::new());
+        let label_id = ids.get("/label").unwrap();
+
+        let tree = accesskit_consumer::Tree::new(update, false);
+        let state = tree.state();
+        let node = state
+            .node_by_tree_local_id(label_id, accesskit::TreeId::ROOT)
+            .expect("label node present in consumer tree");
+        let range = node.document_range();
+        let boxes = range.bounding_boxes();
+
+        assert_eq!(boxes.len(), 1, "expected exactly one bounding box");
+        let rect = boxes[0];
+        let expected = accesskit::Rect { x0: 10.0, y0: 0.0, x1: 26.0, y1: 16.0 };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-6;
+        assert!(
+            close(rect.x0, expected.x0)
+                && close(rect.y0, expected.y0)
+                && close(rect.x1, expected.x1)
+                && close(rect.y1, expected.y1),
+            "expected {expected:?}, got {rect:?}"
+        );
     }
 }

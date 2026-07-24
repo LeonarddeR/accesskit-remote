@@ -4,7 +4,10 @@
 //! their own (the [`crate::source`] `Mirror` owns that).
 
 use crate::app_id::AppIdResolver;
-use crate::mapping::{clamp_text, has_text_caret, reads_text_runs, MirrorNode, TextState, MAX_TEXT_CHARS};
+use crate::mapping::{
+    clamp_text, has_text_caret, reads_text_runs, CharExtent, MirrorNode, TextState,
+    MAX_GEOMETRY_CHARS, MAX_TEXT_CHARS,
+};
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
 use atspi::connection::AccessibilityConnection;
@@ -16,7 +19,7 @@ use atspi::proxy::component::ComponentProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::zbus::fdo::DBusProxy;
 use atspi::zbus::names::BusName;
-use atspi::{Interface, Role, State, StateSet};
+use atspi::{CoordType, Interface, Role, State, StateSet};
 use std::collections::{HashMap, VecDeque};
 
 /// Errors from the bridge are boxed so bus, session, and zbus error types can
@@ -172,7 +175,7 @@ pub async fn walk_window(
         let text = if reads_text_runs(role, !children.is_empty())
             && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
         {
-            read_text_state(zconn, &obj, has_text_caret(role)).await
+            read_text_state(zconn, &obj, has_text_caret(role), true).await
         } else {
             None
         };
@@ -192,15 +195,17 @@ pub async fn walk_window(
 }
 
 /// Reads the AT-SPI `Text` interface of `obj`: its text (capped at
-/// [`MAX_TEXT_CHARS`] code points) and, when `with_caret`, its caret offset and
-/// first selection. All offsets are Unicode scalar value (code point) indices.
-/// With `with_caret` false the caret and selection stay `None`. Returns `None`
-/// if the text itself cannot be read; caret and selection degrade to `None`
-/// individually.
+/// [`MAX_TEXT_CHARS`] code points), when `with_caret` its caret offset and
+/// first selection, and when `with_geometry` its per-character window-relative
+/// extents (only up to [`MAX_GEOMETRY_CHARS`] code points — one bus call per
+/// character). All offsets are Unicode scalar value (code point) indices.
+/// Returns `None` if the text itself cannot be read; caret, selection, and
+/// extents degrade to `None` individually.
 pub async fn read_text_state(
     zconn: &atspi::zbus::Connection,
     obj: &ObjectRefOwned,
     with_caret: bool,
+    with_geometry: bool,
 ) -> Option<TextState> {
     let name: BusName = obj.name()?.clone().into();
     let path = obj.path().clone();
@@ -231,7 +236,28 @@ pub async fn read_text_state(
         (None, None)
     };
 
-    Some(TextState { text, caret, selection })
+    let extents = if with_geometry && len <= MAX_GEOMETRY_CHARS {
+        read_char_extents(&proxy, len).await
+    } else {
+        None
+    };
+
+    Some(TextState { text, caret, selection, extents })
+}
+
+/// Reads one window-relative extent per code point in `[0, len)`. Any single
+/// failure returns `None` — geometry is all-or-nothing per node, so the
+/// mapping never emits partial arrays.
+async fn read_char_extents(proxy: &TextProxy<'_>, len: usize) -> Option<Vec<CharExtent>> {
+    let mut extents = Vec::with_capacity(len);
+    for offset in 0..len {
+        let (x, y, width, height) = proxy
+            .get_character_extents(offset as i32, CoordType::Window)
+            .await
+            .ok()?;
+        extents.push(CharExtent { x, y, width, height });
+    }
+    Some(extents)
 }
 
 /// Reads the first AT-SPI text selection as a normalized `(start, end)` with

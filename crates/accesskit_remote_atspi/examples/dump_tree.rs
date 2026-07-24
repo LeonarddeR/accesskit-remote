@@ -40,13 +40,24 @@ fn main() {
                 )
             });
             if text.is_some() || clickable || is_run || selection.is_some() {
+                let geom = node.bounds().map(|b| {
+                    format!(
+                        "({},{})-({},{}) pos={}",
+                        b.x0,
+                        b.y0,
+                        b.x1,
+                        b.y1,
+                        node.character_positions().map_or(0, |p| p.len()),
+                    )
+                });
                 println!(
-                    "      node {} {:?} click={} runs={} sel={:?} {:?}",
+                    "      node {} {:?} click={} runs={} sel={:?} geom={:?} {:?}",
                     id.0,
                     node.role(),
                     clickable,
                     node.children().len(),
                     selection,
+                    geom,
                     text,
                 );
             }

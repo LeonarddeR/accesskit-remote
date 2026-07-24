@@ -37,6 +37,7 @@ name = "accesskit_remote_atspi"
 version = "0.1.0"
 dependencies = [
  "accesskit",
+ "accesskit_consumer",
  "accesskit_remote",
  "accesskit_remote_server",
  "atspi",
