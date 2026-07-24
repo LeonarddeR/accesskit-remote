@@ -1,6 +1,6 @@
 # Continuation notes
 
-State as of 2026-07-23. Everything below "works and is committed" was
+State as of 2026-07-24. Everything below "works and is committed" was
 verified live; see `docs/spikes.md` for environment findings and git log
 for the build-up.
 
@@ -289,6 +289,95 @@ for the build-up.
     **disproven**: WSLg's desktop mode renders black with dead input (full
     findings in Spike 5). New examples committed as 055e3cb.
 
+- **Re-walk debounce, app_id, idle-attach nudge, AUMID, text geometry — all
+  four remaining items landed and live-verified in one combined RAIL run.**
+  - *Debounce* (was Remaining #3): deep `children-changed` no longer re-walks
+    inline; `RewalkCoalescer` (pure, clock-injected; quiet 250ms, hard cap 2s
+    from a burst's first event) marks the sender's windows dirty and a fourth
+    `select!` arm in `bridge_main` re-walks once the burst settles. Lifecycle
+    (root-path), focus, active-descendant, and text paths stay immediate.
+    Measured on New Tab: **24 re-walk updates in 8s → 3**, passive reflection
+    intact, `WindowAdded` still immediate. Note: `passive_reflect`'s PASS gate
+    now compares later walks against the immediate post-action walk — on
+    current gnome-text-editor the settled two-tab tree (122 nodes) is *smaller*
+    than the fresh one-tab tree (130; TextRun era), so grow-past-initial is
+    unsatisfiable and the pre-change code failed it identically (stash A/B).
+    Commit cdd75de.
+  - *app_id* (was DVC follow-up #2): `AppIdResolver` sweeps the session bus for
+    well-known names owned by the app's pid (a GApplication owns its
+    application id as a bus name; candidate filter = reverse-DNS ≥2 dots minus
+    org.freedesktop./org.a11y./org.gtk.; sorted first pick; per-pid cache incl.
+    negatives; lazy session connect, never blocks discovery). AT-SPI itself has
+    **no** desktop-id property (Application exposes only toolkit/version and a
+    deprecated numeric id), hence the sideband. Verified live E2E: the DVC log
+    shows `remote window added: … app=Some("org.gnome.TextEditor")`;
+    LibreOffice (non-GApplication) yields `app_id=None` with discovery intact —
+    the real negative probe (an env-var one is impossible: atspi finds the a11y
+    bus *via* the session bus). Commit 9e1a3bc.
+  - *Text geometry* (was 5d): every synthesized TextRun now carries the four
+    properties `accesskit_consumer` requires for range rects — `bounds`
+    (union of the run's char rects), run-relative `character_positions`,
+    `character_widths`, `text_direction` (LTR; RTL future work) — read via
+    `Text.GetCharacterExtents(CoordType::Window)`, one bus call per code point,
+    capped at `MAX_GEOMETRY_CHARS = 512` per node (above the cap: no geometry,
+    never partial arrays). Unreported `(0,0,0,0)` extents (GTK newlines) are
+    synthesized from the predecessor's right edge (leading ones from the first
+    real char's left edge); the trailing empty run gets a zero-width caret rect;
+    an all-unreported node or length mismatch carries none. A consumer
+    round-trip test (dev-dep accesskit_consumer 0.38) pins the contract.
+    Refresh path: `text-changed` re-reads extents; caret/selection moves reuse
+    the cache when the text length is unchanged, drop it otherwise. Verified
+    live at every layer: `dump_tree` shows plausible window-relative rects from
+    **both** GTK4 and LibreOffice/gtk3 headlessly; `caret_reflect`'s minimal
+    3-node text-changed delta carries geometry on 2/2 runs; and a Windows
+    PowerShell UIA client read **real TextPattern bounding rectangles off the
+    RAIL window** (`'Open'` → 43×17px at screen coords) — the magnifier path
+    works end to end. Known gap: an empty text field has no anchor, so its runs
+    carry no geometry (rects=0 on the empty document). Commits 72812e4, d694504.
+  - *Idle-attach nudge* (was DVC follow-up #1): on `WindowAdded`, after the
+    registry insert releases its lock, the pump enumerates the process's
+    `RAIL_WINDOW` toplevels and fires a same-title `SetWindowTextW` at each
+    unattached one — the `WM_SETTEXT` executes on the *owning* thread, whose
+    `DefWindowProc` raises `EVENT_OBJECT_NAMECHANGE` there, re-running the
+    whole existing `try_attach` path on exactly the right thread. A new
+    owning-thread guard in `try_attach` turns any wrong-thread delivery into a
+    logged skip (none observed). Verified live with **zero interaction**:
+    editor launched first (registry empty through its creation burst), daemon
+    second → `nudge sweep: 1 RAIL hwnd(s)` → `nudging …` → `attaching … event
+    0x800c, owning thread == current thread` → `visible adapter installed`,
+    then UIA read the tree (FrameworkId AccessKit, 12 descendants). The old
+    minimize/restore workaround is gone. Commits 7ceb8cf, c2af53e, c2ed8b3.
+  - *AUMID* (was the Windows half of DVC #2): `try_attach` reads
+    `PKEY_AppUserModel_ID` from the RAIL HWND's shell property store and logs
+    it. **Format finding: msrdc sets an opaque hashed RemoteApp id**
+    (`Microsoft.RemoteApp.R1qEaHzQr/…=`), *not* the Linux app id — the
+    `RailWindow.app_user_model_id` doc-comment's assumption was wrong, AUMID
+    equality with `app_id` can never hold on WSLg, and `normalize_aumid` is
+    moot (it's a hash, not a decoration). Same-title disambiguation needs a
+    different signal — the `WslgServerWindowId` ↔ appId association PDU flows
+    through the *stock* plugin's channel (WSLDVCCallback.cpp
+    `OnAssociateWindowId`), out of scope for now. windows-rs footgun recorded:
+    windows 0.62's `PROPVARIANT` is **not** POD — the crate's `extensions/`
+    module adds `Drop` (PropVariantClear) and `From<&str>`; a hand-built
+    `VT_LPWSTR` pointing at Rust memory dies with STATUS_HEAP_CORRUPTION when
+    Drop frees it. Commit cafe28b.
+  - Session note: the first WSLg boot of the day showed `chain=false, stock=0`
+    (stock plugin not chain-loaded) during a double-msrdc state; the next boot
+    chain-loaded normally (`reporting 2, chain=true`, stock from
+    `C:\Program Files\WSL\WSLDVCPlugin.dll`). Watch for recurrence; not
+    reproduced since.
+
+- **LibreOffice (Writer + Calc, gtk3 AND gtk4 VCL backends) is installed in
+  the distro as the rich a11y test target.** Under `SAL_USE_VCLPLUGIN=gtk3`
+  Writer publishes a 2093-node tree headlessly (plus the Welcome dialog);
+  status-bar labels carry text runs with geometry at real scale. Launch:
+  `SAL_USE_VCLPLUGIN=gtk3 LIBGL_ALWAYS_SOFTWARE=1 setsid soffice --writer
+  --norestore`. Note: Writer's document body (`document text` → `paragraph`
+  objects) gets **no TextRuns yet** — AT-SPI `Paragraph` is not in
+  `reads_text_runs`'s role set; mapping Paragraph (and wiring it into the
+  static-run gate) is new follow-up work if document-content mirroring from
+  LO matters.
+
 ## Remaining
 
 1. **Periodic reconcile** (mirror): ~~future work~~ **done** — a 60s
@@ -308,9 +397,9 @@ for the build-up.
    `state-changed:focused` gain now emits a focus-only delta with no re-walk
    (see the focus/caret milestone above). The re-walk-storm concern is avoided
    because the handler filters in O(1) and never re-walks on state changes.
-3. **Coalesce children-changed bursts**: New Tab fires ~28 full re-walks in 8s
-   before settling. Full-tree re-walks are convergent, so this is a cost, not
-   a correctness, issue; debounce is a future optimization.
+3. **Coalesce children-changed bursts**: ~~debounce is a future optimization~~
+   **done** — `RewalkCoalescer` + debounce arm, 24 → 3 updates per burst (see
+   the combined milestone above). Commit cdd75de.
 4. **`probe` example**: ~~latent hvsocket receive-timeout bug~~ **done** — probe
    now returns the hvsocket flag from `connect` and retries `ConnectionAborted`
    like the `viewer` fix (18542fd). Commit ad24120.
@@ -325,9 +414,13 @@ for the build-up.
    `Role::Label`/`Document`/`Terminal` text runs too~~ **done** (see the static
    text runs milestone above — leaf-gated, caret suppressed for the caret-less
    static roles; Terminal caret and selectable-Document caret noted there);
-   (d) geometry (`character_positions`/`widths`) for
-   magnifiers; (e) a `GetForegroundWindow` gate on `post_focus(true)` if RAIL
-   testing shows Narrator/NVDA focus theft.
+   (d) ~~geometry (`character_positions`/`widths`) for
+   magnifiers~~ **done** (see the combined milestone above — TextRun bounds +
+   positions + widths + LTR direction, 512-char cap, UIA TextPattern rects
+   verified on the RAIL window; remaining geometry follow-ups: RTL direction,
+   container/element bounds via `Component.GetExtents`, empty-field caret
+   anchor, LO `Paragraph` runs); (e) a `GetForegroundWindow` gate on
+   `post_focus(true)` if RAIL testing shows Narrator/NVDA focus theft.
 
 ## Notes / corrections
 
@@ -340,17 +433,18 @@ for the build-up.
 
 ## After that — DVC plugin follow-ups (full E2E done above)
 
-1. **Idle-window attach gap**: the hook attaches on the first in-range event
-   from an unattached RAIL window, but an idle window emits none — in the live
-   run the attach only fired after a minimize/restore nudge (event 0x8002).
-   Fix ideas: when the pump learns a new remote window, trigger events on
-   candidate RAIL HWNDs (e.g. a harmless `SetWindowPos` frame-change from the
-   hook thread), or sweep `EnumThreadWindows` from the hook proc on every event,
-   or widen the hook range. Until then, first focus/interaction attaches.
-2. **`app_id` is None from `AtspiSource`** (`remote window added … app=None`):
-   the mirror fills pid/toolkit but not the desktop-file id, so association
-   disambiguation-by-app-id never engages; same-title windows across apps stay
-   unmatched. Plumb the app id through `AppInfo` on the Linux side.
+1. **Idle-window attach gap**: ~~first focus/interaction attaches~~ **done** —
+   same-title `SetWindowTextW` nudge on `WindowAdded`, verified attaching with
+   zero interaction (see the combined milestone above). Commits 7ceb8cf,
+   c2af53e, c2ed8b3.
+2. **`app_id` is None from `AtspiSource`**: ~~plumb the app id~~ **done** on
+   the Linux side (session-bus ownership; `app=Some("org.gnome.TextEditor")`
+   live) and the AUMID is now read on the Windows side — but **disambiguation
+   by AUMID equality is dead on WSLg by design**: msrdc's RAIL AUMID is an
+   opaque `Microsoft.RemoteApp.<hash>`, not the Linux app id. Same-title
+   cross-app windows still need a different signal (the appId↔windowId
+   association PDU rides the *stock* plugin's channel). Commits 9e1a3bc,
+   cafe28b.
 3. **Window focus → UIA**: **done** — `ClientEvent::FocusChanged` now routes
    through `Registry::focus_changed` to `post_focus` on the bound RAIL windows
    (see the focus/caret milestone above). Local WM_SETFOCUS/KILLFOCUS handling
@@ -453,6 +547,28 @@ for the build-up.
 - A bare `wait` hangs a `bash -lc` script that `setsid`-launched GUI apps
   earlier in the same script (they stay children and never exit) — `wait` on
   the explicit watcher pids instead.
+- Killing gnome-text-editor safely from a script whose text mentions it:
+  `me=$$; pgrep -af gnome-text-editor | while read pid cmd; do [ "$cmd" =
+  "gnome-text-editor" ] && [ "$pid" != "$me" ] && kill "$pid"; done` — an
+  `awk /gnome-text-editor$/` filter matches the script's own bash cmdline
+  (it ends with the pgrep argument) and self-terminates. Clean-slate launch:
+  also `rm -rf ~/.local/share/gnome-text-editor` (session/draft restore
+  changes node counts).
+- The debug DLL is locked while any msrdc holds it — `cargo build -p
+  accesskit_remote_dvc_plugin` fails with os error 5. `wsl --shutdown` (watch
+  for a *second* msrdc lingering; kill it too), rebuild, then the next WSLg
+  boot loads the fresh DLL. Combined-run order that exercises the nudge: build
+  DLL → build daemon in WSL → a11y enable + launch app (msrdc boots, RAIL
+  window maps, registry empty) → start daemon → read %TEMP%\AccessKitDvc.log
+  untouched.
+- LibreOffice: `SAL_USE_VCLPLUGIN=gtk3|gtk4 LIBGL_ALWAYS_SOFTWARE=1 setsid
+  soffice --writer --norestore`; kill with `pkill -x soffice.bin`. gtk3 is the
+  ATK-bridge path (write methods expected); the first launch shows a Welcome
+  dialog window.
+- xdotool XTEST input regression (2026-07-24): clicks deliver focus events but
+  keys/typing no longer reach the GTK4 text widget in this headless X session
+  (Spike 5's caret recipe worked earlier under the same shell). Caret-move
+  live checks ride LibreOffice's `SetCaretOffset` (caret_drive) instead.
 - If the harness timeout kills a long `wsl.exe` invocation, the WSL VM can
   idle-terminate with it (no remaining client), taking `/tmp` logs and the
   launched apps along. Keep driver scripts comfortably under the tool timeout
