@@ -39,7 +39,13 @@ fn main() {
                     (s.focus.node.0, s.focus.character_index),
                 )
             });
-            if text.is_some() || clickable || is_run || selection.is_some() {
+            let toggled = node.toggled();
+            let expanded = node.is_expanded();
+            let selected = node.is_selected();
+            let has_popup = node.has_popup();
+            let has_state =
+                toggled.is_some() || expanded.is_some() || selected.is_some() || has_popup.is_some();
+            if text.is_some() || clickable || is_run || selection.is_some() || has_state {
                 let geom = node.bounds().map(|b| {
                     format!(
                         "({},{})-({},{}) pos={}",
@@ -50,14 +56,22 @@ fn main() {
                         node.character_positions().map_or(0, |p| p.len()),
                     )
                 });
+                let state = if has_state {
+                    format!(
+                        " tog={toggled:?} exp={expanded:?} sel={selected:?} pop={has_popup:?}"
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "      node {} {:?} click={} runs={} sel={:?} geom={:?} {:?}",
+                    "      node {} {:?} click={} runs={} sel={:?} geom={:?}{} {:?}",
                     id.0,
                     node.role(),
                     clickable,
                     node.children().len(),
                     selection,
                     geom,
+                    state,
                     text,
                 );
             }

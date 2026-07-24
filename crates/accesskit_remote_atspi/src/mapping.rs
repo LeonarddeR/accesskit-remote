@@ -56,6 +56,14 @@ pub struct MirrorNode {
     pub name: String,
     pub focusable: bool,
     pub focused: bool,
+    /// Expanded/collapsed when the node is expandable; `None` otherwise.
+    pub expanded: Option<bool>,
+    /// Selected/unselected when the node is selectable; `None` otherwise.
+    pub selected: Option<bool>,
+    /// Toggle state for checkable or pressable nodes; `None` otherwise.
+    pub toggled: Option<accesskit::Toggled>,
+    /// Whether the node advertises a popup (menu button, combo box, etc.).
+    pub has_popup: bool,
     pub actionable: bool,
     pub children: Vec<String>,
     /// Text-interface state for text-input roles; `None` for non-text nodes.
@@ -168,10 +176,45 @@ pub fn map_role(role: Role) -> accesskit::Role {
     }
 }
 
-/// Distills the subset of AT-SPI state the mapping cares about from a
-/// [`StateSet`].
-pub fn node_flags(states: StateSet) -> (bool, bool) {
-    (states.contains(State::Focusable), states.contains(State::Focused))
+/// The subset of AT-SPI state the mapping forwards to AccessKit, distilled from
+/// a [`StateSet`]. An `Option` field is `None` when the concept does not apply
+/// to the node, distinguishing that from an explicit `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NodeStates {
+    pub focusable: bool,
+    pub focused: bool,
+    pub expanded: Option<bool>,
+    pub selected: Option<bool>,
+    pub toggled: Option<accesskit::Toggled>,
+    pub has_popup: bool,
+}
+
+/// Distills the subset of AT-SPI state the mapping forwards from a [`StateSet`].
+pub fn node_states(states: StateSet) -> NodeStates {
+    use accesskit::Toggled;
+    let expanded = (states.contains(State::Expandable)
+        || states.contains(State::Expanded)
+        || states.contains(State::Collapsed))
+    .then(|| states.contains(State::Expanded));
+    let selected = (states.contains(State::Selectable) || states.contains(State::Selected))
+        .then(|| states.contains(State::Selected));
+    let toggled = if states.contains(State::Indeterminate) {
+        Some(Toggled::Mixed)
+    } else if states.contains(State::Checked) || states.contains(State::Pressed) {
+        Some(Toggled::True)
+    } else if states.contains(State::Checkable) {
+        Some(Toggled::False)
+    } else {
+        None
+    };
+    NodeStates {
+        focusable: states.contains(State::Focusable),
+        focused: states.contains(State::Focused),
+        expanded,
+        selected,
+        toggled,
+        has_popup: states.contains(State::HasPopup),
+    }
 }
 
 /// Whether a role is one whose default action a consumer should expose as
@@ -713,6 +756,18 @@ fn build_node(
             container.set_label(node.name.clone());
         }
     }
+    if let Some(toggled) = node.toggled {
+        container.set_toggled(toggled);
+    }
+    if let Some(expanded) = node.expanded {
+        container.set_expanded(expanded);
+    }
+    if let Some(selected) = node.selected {
+        container.set_selected(selected);
+    }
+    if node.has_popup {
+        container.set_has_popup(accesskit::HasPopup::Menu);
+    }
     let element_children: Vec<NodeId> = node
         .children
         .iter()
@@ -797,6 +852,10 @@ mod tests {
             name: name.to_owned(),
             focusable: false,
             focused: false,
+            expanded: None,
+            selected: None,
+            toggled: None,
+            has_popup: false,
             actionable: false,
             children: Vec::new(),
             text: None,
@@ -842,6 +901,83 @@ mod tests {
         ] {
             assert_eq!(map_role(role), accesskit::Role::Document, "{role:?}");
         }
+    }
+
+    fn states(flags: &[State]) -> StateSet {
+        flags.iter().collect()
+    }
+
+    #[test]
+    fn node_states_distills_toggle_expand_select_popup() {
+        use accesskit::Toggled;
+
+        // Checkable/checked/indeterminate → Toggled.
+        assert_eq!(
+            node_states(states(&[State::Focusable, State::Checkable, State::Checked])).toggled,
+            Some(Toggled::True),
+        );
+        assert_eq!(
+            node_states(states(&[State::Checkable, State::Indeterminate])).toggled,
+            Some(Toggled::Mixed),
+        );
+        assert_eq!(
+            node_states(states(&[State::Checkable])).toggled,
+            Some(Toggled::False),
+        );
+        // A pressed toggle button reports Pressed, not Checkable.
+        assert_eq!(node_states(states(&[State::Pressed])).toggled, Some(Toggled::True));
+
+        // Expandable / Collapsed / Expanded → expanded flag.
+        assert_eq!(node_states(states(&[State::Expandable])).expanded, Some(false));
+        assert_eq!(
+            node_states(states(&[State::Expandable, State::Expanded])).expanded,
+            Some(true),
+        );
+
+        // Selectable / Selected → selected flag.
+        assert_eq!(node_states(states(&[State::Selectable])).selected, Some(false));
+        assert_eq!(
+            node_states(states(&[State::Selectable, State::Selected])).selected,
+            Some(true),
+        );
+
+        // Plain nodes leave every applicable-state as absent.
+        let plain = node_states(states(&[State::Showing]));
+        assert_eq!(plain.toggled, None);
+        assert_eq!(plain.expanded, None);
+        assert_eq!(plain.selected, None);
+        assert!(!plain.has_popup);
+
+        assert!(node_states(states(&[State::HasPopup])).has_popup);
+        assert!(node_states(states(&[State::Focusable])).focusable);
+        assert!(node_states(states(&[State::Focused])).focused);
+    }
+
+    #[test]
+    fn build_node_forwards_states_to_accesskit() {
+        use accesskit::{HasPopup, Toggled};
+
+        let mut root = leaf("/win", Role::Frame, "App");
+        root.children = vec!["/check".into(), "/combo".into(), "/opt".into()];
+        let mut check = leaf("/check", Role::CheckMenuItem, "Bold");
+        check.toggled = Some(Toggled::True);
+        let mut combo = leaf("/combo", Role::ComboBox, "Font");
+        combo.has_popup = true;
+        combo.expanded = Some(false);
+        let mut opt = leaf("/opt", Role::ListItem, "Item");
+        opt.selected = Some(true);
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, check, combo, opt], &mut ids);
+
+        let node = |path: &str| {
+            let id = ids.get(path).unwrap();
+            update.nodes.iter().find(|(i, _)| *i == id).unwrap().1.clone()
+        };
+        assert_eq!(node("/check").toggled(), Some(Toggled::True));
+        assert_eq!(node("/combo").has_popup(), Some(HasPopup::Menu));
+        assert_eq!(node("/combo").is_expanded(), Some(false));
+        assert_eq!(node("/opt").is_selected(), Some(true));
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use crate::app_id::AppIdResolver;
 use crate::mapping::{
-    clamp_text, has_text_caret, reads_text_runs, CharExtent, MirrorNode, TextState,
+    clamp_text, has_text_caret, node_states, reads_text_runs, CharExtent, MirrorNode, TextState,
     MAX_GEOMETRY_CHARS, MAX_TEXT_CHARS,
 };
 use accesskit_remote::{AppInfo, WindowId};
@@ -203,12 +203,17 @@ pub(crate) async fn read_node(
     } else {
         None
     };
+    let st = node_states(states);
     let node = MirrorNode {
         path: obj.path_as_str().to_owned(),
         role,
         name,
-        focusable: states.contains(State::Focusable),
-        focused: states.contains(State::Focused),
+        focusable: st.focusable,
+        focused: st.focused,
+        expanded: st.expanded,
+        selected: st.selected,
+        toggled: st.toggled,
+        has_popup: st.has_popup,
         actionable,
         children,
         text,
