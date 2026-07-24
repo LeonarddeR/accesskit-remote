@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use tracing::{debug, info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Storage::EnhancedStorage::PKEY_AppUserModel_ID;
+use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantToString};
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
+use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -290,6 +293,24 @@ fn server_window_id(hwnd: HWND) -> u64 {
     unsafe { GetPropW(hwnd, w!("WslgServerWindowId")) }.0 as u64
 }
 
+/// A PROPVARIANT's string content; `None` for VT_EMPTY, non-string values,
+/// or an empty string.
+fn propvariant_to_string(value: &PROPVARIANT) -> Option<String> {
+    let mut buf = [0u16; 512];
+    unsafe { PropVariantToString(value, &mut buf) }.ok()?;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
+}
+
+/// The HWND's AppUserModelID from its shell property store, if any. msrdc
+/// sets it on RAIL windows via the RAIL GET_APPID exchange; absence is
+/// normal (the stock WSLDVCPlugin sets only Relaunch* properties).
+fn read_app_user_model_id(hwnd: HWND) -> Option<String> {
+    let store: IPropertyStore = unsafe { SHGetPropertyStoreForWindow(hwnd) }.ok()?;
+    let value = unsafe { store.GetValue(&PKEY_AppUserModel_ID) }.ok()?;
+    propvariant_to_string(&value)
+}
+
 fn try_attach(shared: &Arc<RailShared>, hwnd: HWND, event: u32) {
     let hwnd_key = hwnd.0 as isize;
     let mut registry = shared.registry.lock().unwrap();
@@ -318,16 +339,21 @@ fn try_attach(shared: &Arc<RailShared>, hwnd: HWND, event: u32) {
     let rail = RailWindow {
         server_window_id: server_window_id(hwnd),
         title,
-        app_user_model_id: None,
+        app_user_model_id: read_app_user_model_id(hwnd),
     };
+    debug!(
+        "RAIL candidate {hwnd:?}: title {:?}, server id {:#x}, aumid {:?}",
+        rail.title, rail.server_window_id, rail.app_user_model_id
+    );
     let distro = shared.distro.as_deref().unwrap_or("");
     let Some(window) = match_window(&rail, distro, &candidates) else {
         return;
     };
     info!(
         "attaching remote window {} to RAIL hwnd {hwnd:?} (server id {:#x}, title {:?}, \
-         event {event:#06x}, owning thread {owning_thread}, current thread {current_thread})",
-        window.0, rail.server_window_id, rail.title
+         aumid {:?}, event {event:#06x}, owning thread {owning_thread}, current thread \
+         {current_thread})",
+        window.0, rail.server_window_id, rail.title, rail.app_user_model_id
     );
     // Seed host-focus from local focus or a remote FocusChanged that arrived
     // before this window attached.
@@ -402,6 +428,22 @@ mod tests {
             FocusTransition { unfocus: Some(0x111), focus: None }
         );
         assert_eq!(r.focused(), None);
+    }
+
+    #[test]
+    fn propvariant_empty_is_none() {
+        let value = PROPVARIANT::default();
+        assert_eq!(propvariant_to_string(&value), None);
+    }
+
+    #[test]
+    fn propvariant_string_round_trips() {
+        // From<&str> builds an owned VT_BSTR; PROPVARIANT's Drop clears it.
+        let value = PROPVARIANT::from("org.gnome.TextEditor");
+        assert_eq!(
+            propvariant_to_string(&value),
+            Some("org.gnome.TextEditor".to_owned())
+        );
     }
 
     #[test]
