@@ -239,6 +239,11 @@ pub fn nudge_unattached_rail_windows(shared: &RailShared) {
     unsafe {
         let _ = EnumWindows(Some(collect_rail_windows), LPARAM(&mut all as *mut _ as isize));
     }
+    debug!(
+        "nudge sweep: {} RAIL hwnd(s) in process, {} attached",
+        all.len(),
+        attached.len()
+    );
     for hwnd in all {
         if attached.contains(&(hwnd.0 as isize)) {
             continue;
@@ -247,6 +252,7 @@ pub fn nudge_unattached_rail_windows(shared: &RailShared) {
         let len = unsafe { GetWindowTextW(hwnd, &mut buf) };
         if len <= 0 {
             // No title yet; the organic NAMECHANGE will attach it later.
+            debug!("nudge: {hwnd:?} has no title yet; skipping");
             continue;
         }
         debug!("nudging unattached RAIL hwnd {hwnd:?}");
