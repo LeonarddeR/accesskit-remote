@@ -130,12 +130,12 @@ pub fn map_role(role: Role) -> accesskit::Role {
         Role::Dialog => A::Dialog,
         Role::Alert => A::Alert,
         Role::Label => A::Label,
-        Role::Button | Role::ToggleButton => A::Button,
+        Role::Button | Role::ToggleButton | Role::PushButtonMenu => A::Button,
         Role::CheckBox => A::CheckBox,
         Role::CheckMenuItem => A::MenuItemCheckBox,
         Role::RadioButton => A::RadioButton,
         Role::RadioMenuItem => A::MenuItemRadio,
-        Role::Menu => A::Menu,
+        Role::Menu | Role::PopupMenu => A::Menu,
         Role::MenuBar => A::MenuBar,
         Role::MenuItem => A::MenuItem,
         Role::Panel | Role::Filler => A::GenericContainer,
@@ -886,6 +886,18 @@ mod tests {
         assert_eq!(map_role(Role::Button), accesskit::Role::Button);
         assert_eq!(map_role(Role::PageTab), accesskit::Role::Tab);
         assert_eq!(map_role(Role::Separator), accesskit::Role::GenericContainer);
+    }
+
+    #[test]
+    fn map_role_covers_menu_roles() {
+        assert_eq!(map_role(Role::MenuBar), accesskit::Role::MenuBar);
+        assert_eq!(map_role(Role::Menu), accesskit::Role::Menu);
+        assert_eq!(map_role(Role::MenuItem), accesskit::Role::MenuItem);
+        assert_eq!(map_role(Role::CheckMenuItem), accesskit::Role::MenuItemCheckBox);
+        assert_eq!(map_role(Role::RadioMenuItem), accesskit::Role::MenuItemRadio);
+        // Previously fell through to GenericContainer, losing menu semantics.
+        assert_eq!(map_role(Role::PopupMenu), accesskit::Role::Menu);
+        assert_eq!(map_role(Role::PushButtonMenu), accesskit::Role::Button);
     }
 
     #[test]
