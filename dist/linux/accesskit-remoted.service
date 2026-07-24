@@ -1,0 +1,16 @@
+[Unit]
+Description=AccessKit Remote daemon (bridges AT-SPI to Windows screen readers)
+After=dbus.service
+Wants=dbus.service
+
+[Service]
+Type=simple
+# Tell GTK/Qt apps assistive tech is present so they export AT-SPI trees.
+# Non-fatal (-): the a11y bus may not be up yet on the very first start.
+ExecStartPre=-/bin/sh -c 'busctl --user set-property org.a11y.Bus /org/a11y/bus org.a11y.Status IsEnabled b true'
+ExecStart=%h/.local/bin/accesskit_remoted --atspi --vsock 4750
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
