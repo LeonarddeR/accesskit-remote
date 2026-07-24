@@ -486,6 +486,64 @@ for the build-up.
     `Slider`/`SpinButton`/`ScrollBar` expose `Value`. `DoAction` genuinely
     activates on GTK4 (`menu.popup` returned true).
 
+- **Broad GTK4 support, phases 0-3 of 10** (2026-07-24, later still). Plan:
+  `C:\Users\LeonarddeRuijter\.claude\plans\i-want-to-continue-quiet-puffin.md`.
+  Motivated by three verified deficits: most semantics were dropped on the way to
+  Windows, what *was* forwarded never refreshed, and UIA actions were swallowed.
+  Reference decision: **`accesskit_windows` is what to mirror against, not
+  `accesskit_atspi_common`** — AccessKit's own AT-SPI adapter is deliberately
+  lossy (no Table/TableCell interface, one relation type, five attributes, a
+  single `"click"` action), whereas `platforms/windows/src/node.rs` consumes the
+  full property set. Suite 95 → 104 tests.
+  - *Phase 0 — data reshape* (5df5c1c): `MirrorNode` embeds `NodeStates` and
+    carries the object's `InterfaceSet` (deriving `is_actionable()` from it);
+    `impl Default` makes later phases touch zero construction sites. New
+    `WindowCache { nodes, text }` replaces the bare text-cache map and
+    **`TextNodeCache::parent` is deleted** — a text node's last-emitted container
+    now lives in the same slot as every other node's, so the two cannot disagree
+    (the per-node refresh in phase 6 depends on that being one authority).
+    Behaviour-preserving: `dump_tree` byte-identical before/after.
+  - *Phase 1 — role breadth* (7aef483): ~30 roles added.
+    **Counter-intuitive finding: the `GenericContainer` fallback is load-bearing.**
+    `accesskit_consumer::common_filter` excludes exactly `GenericContainer` and
+    `TextRun`, so promoting `Grouping`/`Panel`/`Viewport`/`SplitPane` would surface
+    every GTK layout box. Structural roles stay transparent; `refine_role` promotes
+    only a *named* `Grouping` (ARIA `group`). Measured: gnome-text-editor
+    unchanged at 13/85 reaching the client tree; Writer 1706 → 1998/2101, the
+    +292 entirely `Separator → Splitter` in menus, with `GenericContainer`
+    falling 373 → 81. Also: **`Switch` is unreachable via the role map** —
+    `atspi-common 0.14` has no such variant and GTK4 emits `ToggleButton`; the
+    only route is the `xml-roles` attribute (phase 5, still unverified).
+  - *Phase 2 — state breadth* (aa35493): sensitive/read_only/required/invalid/
+    modal/multiselectable/busy/orientation. **`disabled` is derived, not
+    mirrored**: GTK4 never emits `State::Enabled` at all and omits `Sensitive`
+    only when the widget is explicitly disabled (`collect_states` in
+    `gtk/a11y/gtkatspicontext.c`), while at-spi2-atk emits both — so absence of
+    either marks a control disabled, gated by `is_control()` so layout boxes are
+    not announced disabled. Verified on gtk4-widget-factory: 27 nodes lack
+    `Sensitive` raw on the bus, the mirror marks exactly the 25 that are controls.
+    **`Showing`/`Visible` are deliberately NOT mapped to `hidden`** — `is_hidden()`
+    makes the consumer drop the whole subtree and GTK reports `Showing=false` for
+    scrolled-out rows a screen reader still needs; `no_node_is_ever_hidden` pins it.
+  - *Phase 3 — bus budget* (afa6527): the five per-node calls now go out as one
+    `tokio::join!` batch (Text/Component as a second batch once interfaces are
+    known); Name+Description come from one `Properties.GetAll` (probed working on
+    both bridges first) so description costs nothing, and a description equal to
+    the name is dropped. `cache_properties(CacheProperties::No)` on the per-node
+    Text/Component proxies kills zbus's default lazy cache (an `AddMatch` +
+    `GetAll` on first property access, `RemoveMatch` on drop — pure overhead for
+    a one-shot proxy). **Measured on idle Writer, 2446 nodes, 3 runs each against
+    the same instance: 8.115/8.078/8.123s → 4.824/4.769/4.651s, 41% faster while
+    adding a read.** Acceptance was merely "no slower", so phases 4-5 inherit
+    real headroom. Note the timer must start at `AtspiSource::new()` — the bridge
+    thread begins enumerating there.
+  - *Remaining phases 4-10*: numeric value + table coordinates (interface-gated);
+    object attributes + relations (role-gated, and the measurement that settles
+    whether GTK4 emits `level`/`posinset`/`xml-roles` at all); pure
+    `refresh_node`; live-update routing (`invalidate.rs`, the fix for
+    `state-changed:checked` being dropped today); pure `plan_action` router
+    (`drive.rs`); drive-back glue; Newton design note.
+
 ## Remaining
 
 1. **Periodic reconcile** (mirror): ~~future work~~ **done** — a 60s
