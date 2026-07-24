@@ -85,6 +85,19 @@ fn nsis_defines(version: &str, staging: &Path, outfile: &Path) -> Vec<String> {
     ]
 }
 
+/// The CPU architecture segment of a target triple ("x86_64", "aarch64").
+fn arch_of(triple: &str) -> &str {
+    triple.split('-').next().unwrap_or(triple)
+}
+
+/// Where a target's DLL is staged for the installer, grouped by CPU arch.
+fn windows_dll_dst(staging: &Path, triple: &str) -> PathBuf {
+    staging
+        .join("windows")
+        .join(arch_of(triple))
+        .join(format!("{DVC_PLUGIN}.dll"))
+}
+
 /// The repository root, one level above this crate's manifest.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -147,6 +160,29 @@ fn run_dist(staging: Option<&Path>) -> Result<(), String> {
     let staging = staging
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.join("target").join("dist"));
+
+    // Stage the per-arch DLLs from their release build directories.
+    for target in WINDOWS_TARGETS {
+        let src = root
+            .join("target")
+            .join(target)
+            .join("release")
+            .join(format!("{DVC_PLUGIN}.dll"));
+        if !src.is_file() {
+            return Err(format!(
+                "missing release DLL for {target}: {} (run: cargo xtask build-windows)",
+                src.display()
+            ));
+        }
+        let dst = windows_dll_dst(&staging, target);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::copy(&src, &dst)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    }
+
     let outfile = root
         .join("target")
         .join(format!("AccessKitRemote-Setup-{VERSION}.exe"));
@@ -245,6 +281,23 @@ mod tests {
                 "-DSTAGING=stage".to_string(),
                 "-DOUTFILE=out.exe".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn arch_of_extracts_cpu() {
+        assert_eq!(arch_of("x86_64-pc-windows-msvc"), "x86_64");
+        assert_eq!(arch_of("aarch64-pc-windows-msvc"), "aarch64");
+    }
+
+    #[test]
+    fn windows_dll_dst_groups_by_arch() {
+        assert_eq!(
+            windows_dll_dst(Path::new("stage"), "aarch64-pc-windows-msvc"),
+            Path::new("stage")
+                .join("windows")
+                .join("aarch64")
+                .join("accesskit_remote_dvc_plugin.dll"),
         );
     }
 }
