@@ -382,7 +382,64 @@ for the build-up.
   nothing and `handle_active_descendant` emits nothing. Surfacing
   active-descendant for large grids (walk-on-demand around the active cell, or
   resolve the descendant path directly rather than via the walked `objects`
-  map) is mirror follow-up work.
+  map) is mirror follow-up work. **Both follow-ups are now done — see the
+  mirror-follow-ups milestone below.**
+
+- **MILESTONE — mirror follow-ups: LO Paragraph text runs, Calc
+  active-descendant splice, container bounds + empty-field caret anchor.**
+  All three landed red-green TDD per stage; the crate suite grew 70 → 90
+  tests. Plan: `docs/superpowers/plans/2026-07-24-atspi-mirror-follow-ups.md`.
+  - *Paragraph runs* (LO follow-up (i)): `Role::Paragraph` joined the static
+    text roles — leaf-gated like Label/Document, caret-less (a paragraph with
+    inline element children keeps its structure). Verified live: typing into
+    the Writer body produced a body-paragraph `TextRun` carrying the typed
+    text with per-char geometry, `sel=None`. Commit 4dca659.
+  - *Calc active-descendant* (LO follow-up (ii)): an unresolved descendant now
+    splices on demand. `read_node` factored out of the walk (2152c3b). Pure
+    `splice_chain_update`/`merge_update`/`emitted_children` (+ `SpliceResult`)
+    build a partial update from a freshly read ancestor chain; the re-emitted
+    ancestor keeps the *client tree's* children (plus the chain child), never
+    the fresh bus child list, so a lazy grid can neither bloat nor orphan the
+    tree; re-splicing is idempotent via `NodeIdMap` stability (9412445).
+    `handle_active_descendant` escalates via `None` to async
+    `splice_active_descendant` — event-sender-addressed;
+    `read_chain_to_known` climbs ≤16 parent hops to a known path;
+    `apply_spliced_chain` folds ids/objects/children/focus in, keeping
+    `objects` exactly equal to the client tree (106daee). A re-walk that
+    cannot see the focused spliced node re-splices it and merges before
+    emitting; on failure the walk's own focus stands — a stale focus id is
+    never retained (f265d57). **Verified live on Calc/gtk3** (`xdotool`
+    clicks + arrows): every cell move emitted the splice signature
+    `TreeUpdate (2 nodes, focus <new>) ids=[<grid>, <new>]`, Name-Box text
+    deltas carried the spliced focus, and a typing-induced debounced re-walk
+    emitted `(2005 nodes, focus 2004)` — the 2004-node walk plus the
+    re-spliced cell, focus preserved (without the guard: `(2004, focus 0)`).
+    gnome-text-editor regression clean, including live `(0 nodes)` fast-path
+    focus deltas and deduped `FocusChanged` pairs. **Toolkit finding**: LO
+    mints a *transient* accessible object (fresh path) per cell selection, so
+    revisits re-splice under fresh ids — the fast path is unreachable against
+    LO by toolkit design (it engages on GTK's stable paths); spliced ids
+    accumulate between re-walks (append-only `NodeIdMap`), and each re-walk
+    prunes the spliced nodes from the tree.
+  - *Container bounds + empty-field caret anchor* (the 5d tail): the walk
+    reads `Component.GetExtents(CoordType::Window)` for every node exposing
+    the Component interface — measured +1s on the Writer walk (7s vs 6s
+    baseline, ~+17%, within the predicted +20%; no gating needed); zero-area
+    rects are dropped in the pure layer; `build_node` sets container bounds
+    (9ed9a7f). An empty text field's single run takes a zero-width caret rect
+    at the container's left edge (`build_text_runs` gained a
+    `container_bounds` parameter; the rect is cached on `TextNodeCache` and
+    NOT re-read on text events — same staleness class as cached char
+    extents). Verified live: clean-slate gnome-text-editor's empty document
+    run shows `geom=(0,46)-(0,520)` under container `(0,46)-(700,520)`; GTE
+    buttons/window all carry plausible rects. Caveat: the anchor spans the
+    full container height (approximate v1; widget padding ignored).
+    Commit 95051fb.
+  - `window_lifecycle` now prints each update's focus id and leading node ids
+    (the instrument the splice/guard verifications read). Walk-cost variance
+    note: the same Writer tree walked in 6-7s idle but 79s while LO was busy
+    right after X11 typing — AT-SPI calls serialize on the app's main loop,
+    so time walks against an idle app.
 
 ## Remaining
 
@@ -423,9 +480,10 @@ for the build-up.
    (d) ~~geometry (`character_positions`/`widths`) for
    magnifiers~~ **done** (see the combined milestone above — TextRun bounds +
    positions + widths + LTR direction, 512-char cap, UIA TextPattern rects
-   verified on the RAIL window; remaining geometry follow-ups: RTL direction,
-   container/element bounds via `Component.GetExtents`, empty-field caret
-   anchor, LO `Paragraph` runs); (e) a `GetForegroundWindow` gate on
+   verified on the RAIL window; remaining geometry follow-up: RTL direction —
+   container/element bounds via `Component.GetExtents`, the empty-field caret
+   anchor, and LO `Paragraph` runs are all **done**, see the mirror-follow-ups
+   milestone); (e) a `GetForegroundWindow` gate on
    `post_focus(true)` if RAIL testing shows Narrator/NVDA focus theft.
 
 ## Notes / corrections
@@ -575,6 +633,11 @@ for the build-up.
   keys/typing no longer reach the GTK4 text widget in this headless X session
   (Spike 5's caret recipe worked earlier under the same shell). Caret-move
   live checks ride LibreOffice's `SetCaretOffset` (caret_drive) instead.
+  The regression is GTK4-specific: under `GDK_BACKEND=x11`, LO/gtk3 accepts
+  XTEST typing and arrow keys fine (Writer body typing and Calc cell
+  navigation both verified live 2026-07-24). `xdotool windowfocus` can throw
+  BadMatch on unmapped candidate ids from `search` — try each id and keep the
+  ones that focus.
 - If the harness timeout kills a long `wsl.exe` invocation, the WSL VM can
   idle-terminate with it (no remaining client), taking `/tmp` logs and the
   launched apps along. Keep driver scripts comfortably under the tool timeout
