@@ -11,7 +11,7 @@ fn main() {
     use atspi::proxy::component::ComponentProxy;
     use atspi::proxy::text::TextProxy;
     use atspi::zbus::names::BusName;
-    use atspi::Role;
+    use atspi::{Interface, Role};
     use std::collections::VecDeque;
     use std::time::Duration;
 
@@ -56,16 +56,24 @@ fn main() {
                 let mut seen = 0;
                 while let Some(obj) = queue.pop_front() {
                     seen += 1;
-                    if seen > 800 || (button.is_some() && text.is_some()) {
+                    if seen > 4000 || (button.is_some() && text.is_some()) {
                         break;
                     }
                     let Ok(p) = obj.as_accessible_proxy(zconn).await else {
                         continue;
                     };
-                    match p.get_role().await.unwrap_or(Role::Invalid) {
-                        Role::Button if button.is_none() => button = Some(obj.clone()),
-                        Role::Text if text.is_none() => text = Some(obj.clone()),
-                        _ => {}
+                    let role = p.get_role().await.unwrap_or(Role::Invalid);
+                    if role == Role::Button && button.is_none() {
+                        button = Some(obj.clone());
+                    }
+                    // Match the caret target by interface, not role: LibreOffice's
+                    // editable body is a `paragraph`/`document text`, not `Role::Text`.
+                    if text.is_none()
+                        && p.get_interfaces()
+                            .await
+                            .is_ok_and(|set| set.contains(Interface::EditableText))
+                    {
+                        text = Some(obj.clone());
                     }
                     for c in p.get_children().await.unwrap_or_default() {
                         if !c.is_null() {

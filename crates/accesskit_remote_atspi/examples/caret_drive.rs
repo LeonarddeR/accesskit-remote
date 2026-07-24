@@ -13,7 +13,7 @@ fn main() {
     use atspi::proxy::accessible::ObjectRefExt;
     use atspi::proxy::editable_text::EditableTextProxy;
     use atspi::zbus::names::BusName;
-    use atspi::{Interface, Role};
+    use atspi::Interface;
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
@@ -23,7 +23,9 @@ fn main() {
         .unwrap();
     let conn = rt.block_on(AccessibilityConnection::new()).expect("raw connection");
 
-    // Locate the first editable Role::Text document.
+    // Locate the first editable text object by interface, not role:
+    // LibreOffice's editable body is a `paragraph`/`document text`, not
+    // `Role::Text` as in gnome-text-editor.
     let doc: ObjectRefOwned = rt
         .block_on(async {
             let zconn = conn.connection();
@@ -44,15 +46,16 @@ fn main() {
                     let mut seen = 0;
                     while let Some(obj) = queue.pop_front() {
                         seen += 1;
-                        if seen > 800 {
+                        if seen > 4000 {
                             break;
                         }
                         let Ok(p) = obj.as_accessible_proxy(zconn).await else {
                             continue;
                         };
-                        let role = p.get_role().await.unwrap_or(Role::Invalid);
                         let ifaces = p.get_interfaces().await.ok();
-                        if role == Role::Text && ifaces.is_some_and(|s| s.contains(Interface::Text)) {
+                        if ifaces.is_some_and(|s| {
+                            s.contains(Interface::Text) && s.contains(Interface::EditableText)
+                        }) {
                             return Some(obj.clone());
                         }
                         for c in p.get_children().await.unwrap_or_default() {
@@ -65,7 +68,7 @@ fn main() {
             }
             None
         })
-        .expect("an editable Role::Text document");
+        .expect("an editable text object");
     println!("document: {}", doc.path_as_str());
 
     // Seed known multi-line text so the caret has room to move.

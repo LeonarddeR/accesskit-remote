@@ -221,6 +221,52 @@ distro env; see `WSLGd/main.cpp:154-181`), which makes WSLGd launch
   headlessly" reading was too narrow: driving focus/caret *into* GTK4 over
   AT-SPI is a toolkit gap, not an environment gap.
 
+## LibreOffice / VCL as the rich test target (2026-07-24)
+
+Installed `libreoffice-writer libreoffice-calc libreoffice-gtk3
+libreoffice-gtk4`; the VCL backend is chosen per launch with
+`SAL_USE_VCLPLUGIN=gtk3|gtk4`. Launch (X11 so xdotool can drive it):
+`GDK_BACKEND=x11 SAL_USE_VCLPLUGIN=gtk3 LIBGL_ALWAYS_SOFTWARE=1 setsid
+soffice --writer --norestore`; kill with `pkill -x soffice.bin`; the config
+lock is `~/.config/libreoffice/4/.lock`.
+
+- **The AT-SPI write-method gap is the GTK4 bridge, not the app — proven by a
+  controlled A/B on one app.** Same LibreOffice Writer, editable document body:
+  - `SAL_USE_VCLPLUGIN=gtk3` (ATK / at-spi2-atk): `Component.GrabFocus ->
+    Ok(true)` and `Text.SetCaretOffset(3) -> Ok(true)` — **both implemented and
+    effective**.
+  - `SAL_USE_VCLPLUGIN=gtk4` (GTK4's own AT-SPI stack): `GrabFocus ->
+    Err(NotSupported)` — identical to gnome-text-editor.
+  So a toolkit that implements the writes drives fine; GTK4 is the outlier.
+- **Both drive instruments PASS against gtk3 VCL** (the deferred 5a/5b live
+  verifications): `focus_drive` — UIA `Action::Focus` → `grab_focus` →
+  `state-changed:focused` → focus-only delta; `caret_drive` — UIA
+  `Action::SetTextSelection` → `set_caret_offset` → `text-caret-moved` → delta
+  with the caret at the requested run/index. `state_probe` and `caret_drive`
+  were generalized to locate the editable object by the **EditableText
+  interface** (LibreOffice's body is a `paragraph`/`document text`, not
+  gnome-text-editor's `Role::Text`) with a raised BFS cap.
+- **Calc emits `object:active-descendant-changed`** on cell navigation (raw
+  bus shows it 5× for arrow keys) — the list/tree widget gnome-text-editor
+  lacks. But the mirror does *not* yet surface it as a focus-only delta: the
+  selected cell isn't in the walked tree (the grid exceeds the walk, and cells
+  are lazy), so `resolve_focus_target` finds nothing. Surfacing
+  active-descendant for large grids is a mirror follow-up, not a toolkit gap.
+- LibreOffice is **not** a GApplication: it owns no reverse-DNS session-bus
+  name, so `AppInfo.app_id` is `None` (the resolver's negative case, discovery
+  unaffected). `soffice.bin`'s a11y ids live under
+  `/org/gtk/application/soffice/a11y/...` on gtk4 but plain
+  `/org/a11y/atspi/accessible/N` on gtk3.
+- **Writer's document paragraphs get no TextRuns yet**: the body exposes
+  `paragraph` / `document text` roles, which are not in `reads_text_runs`'s
+  role set — only chrome labels (status bar, toolbars) get runs + geometry.
+  Mapping `Role::Paragraph` (and gating it into the static-run path) is the
+  follow-up for mirroring LO document content.
+- Caveat: a first-run **Tip of the Day** modal can block the document; dismiss
+  it or it steals focus. On gtk4 the BFS may reach the status-bar `Page:` spin
+  field before the document body — match by interface and give the body focus
+  (click) first.
+
 ## WSLg reliability quirks observed
 
 - msrdc exits when the last GUI app closes; WSLGd restarts it on demand.

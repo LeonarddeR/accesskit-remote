@@ -372,11 +372,17 @@ for the build-up.
   Writer publishes a 2093-node tree headlessly (plus the Welcome dialog);
   status-bar labels carry text runs with geometry at real scale. Launch:
   `SAL_USE_VCLPLUGIN=gtk3 LIBGL_ALWAYS_SOFTWARE=1 setsid soffice --writer
-  --norestore`. Note: Writer's document body (`document text` → `paragraph`
-  objects) gets **no TextRuns yet** — AT-SPI `Paragraph` is not in
-  `reads_text_runs`'s role set; mapping Paragraph (and wiring it into the
-  static-run gate) is new follow-up work if document-content mirroring from
-  LO matters.
+  --norestore`. Two new follow-ups this exposed: (i) Writer's document body
+  (`document text` → `paragraph`) gets **no TextRuns yet** — AT-SPI `Paragraph`
+  is not in `reads_text_runs`'s role set; mapping Paragraph (and gating it into
+  the static-run path) is needed to mirror LO document content. (ii) Calc fires
+  `object:active-descendant-changed` on cell navigation (verified on the raw
+  bus), but the mirror can't surface it: the selected cell isn't in the walked
+  tree (grid exceeds the walk; cells are lazy), so `resolve_focus_target` finds
+  nothing and `handle_active_descendant` emits nothing. Surfacing
+  active-descendant for large grids (walk-on-demand around the active cell, or
+  resolve the descendant path directly rather than via the walked `objects`
+  map) is mirror follow-up work.
 
 ## Remaining
 
@@ -406,11 +412,11 @@ for the build-up.
 5. **Focus/caret follow-ups**: (a) ~~subscribe
    `object:active-descendant-changed`~~ **done** (see the milestone above);
    (b) ~~map UIA `Action::SetTextSelection` → AT-SPI `set_caret_offset`/selection~~
-   **wired; live-blocked by GTK4** (unit-tested; `state_probe` proved
-   `SetCaretOffset` — and `GrabFocus` — return `NotSupported` from GTK4's AT-SPI
-   bridge in every environment, so this is a toolkit gap, not an environment
-   gap; `caret_drive`/`focus_drive` stand ready for a toolkit that implements
-   the writes); (c) ~~give
+   **done and live-verified on LibreOffice/gtk3** — `caret_drive` and
+   `focus_drive` both PASS against VCL (the toolkit that implements the writes),
+   and a same-app gtk3-vs-gtk4 A/B proves the block is the GTK4 AT-SPI bridge,
+   not the environment (see the LibreOffice section in `docs/spikes.md`); (c)
+   ~~give
    `Role::Label`/`Document`/`Terminal` text runs too~~ **done** (see the static
    text runs milestone above — leaf-gated, caret suppressed for the caret-less
    static roles; Terminal caret and selectable-Document caret noted there);
