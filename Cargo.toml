@@ -44,4 +44,4 @@ accesskit_remote_windows = { path = "crates/accesskit_remote_windows" }
 [profile.release]
 lto = true
 codegen-units = 1
-strip = "debuginfo"
+strip = "symbols"
