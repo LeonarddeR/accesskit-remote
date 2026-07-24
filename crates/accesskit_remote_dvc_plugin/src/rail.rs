@@ -254,6 +254,17 @@ fn try_attach(shared: &Arc<RailShared>, hwnd: HWND, event: u32) {
     if title.is_empty() {
         return;
     }
+    // The adapter install swaps the wndproc, which is only safe on the
+    // window's owning thread; an in-context hook normally guarantees that.
+    let owning_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    let current_thread = unsafe { GetCurrentThreadId() };
+    if owning_thread != current_thread {
+        warn!(
+            "hook proc for {hwnd:?} ran on thread {current_thread}, owner is {owning_thread} \
+             (event {event:#06x}); skipping install"
+        );
+        return;
+    }
     let rail = RailWindow {
         server_window_id: server_window_id(hwnd),
         title,
@@ -263,8 +274,6 @@ fn try_attach(shared: &Arc<RailShared>, hwnd: HWND, event: u32) {
     let Some(window) = match_window(&rail, distro, &candidates) else {
         return;
     };
-    let owning_thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
-    let current_thread = unsafe { GetCurrentThreadId() };
     info!(
         "attaching remote window {} to RAIL hwnd {hwnd:?} (server id {:#x}, title {:?}, \
          event {event:#06x}, owning thread {owning_thread}, current thread {current_thread})",
