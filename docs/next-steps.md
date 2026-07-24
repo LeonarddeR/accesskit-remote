@@ -264,6 +264,31 @@ for the build-up.
   unit-tested but gnome-text-editor has no such node to exercise them live. 44 unit
   tests. Commit 438a852.
 
+- **Focus & caret reflection live-verified; drive paths are GTK4-blocked, not
+  environment-blocked.** The deferred live verifications from the focus/caret
+  milestone ran headlessly via a new recipe — `GDK_BACKEND=x11` + `xdotool`
+  (see Spike 5 in `docs/spikes.md` and Workflow notes) — under the **default
+  rdprail-shell**, no interactive RAIL session needed:
+  - *Window focus*: `xdotool windowfocus` toggles between two editor windows
+    produced raw `window:activate`/`deactivate` and clean deduped
+    `FocusChanged None → Some(new)` pairs from the mirror.
+  - *Node focus*: `state-changed:focused` gains arrived and `handle_focus_change`
+    emitted the focus-only 0-node delta on the right window — the exact
+    `TreeUpdate n (0 nodes)` signature, twice across environments.
+  - *Caret/text/selection reflection*: real arrow keys / typing / shift-select
+    produced `text-caret-moved` ×4, `text-changed` ×5, `text-selection-changed`
+    ×3, each reflected as the minimal 1–2-node `refresh_text` deltas (no
+    re-walk).
+  - *Drive paths cannot pass against GTK4*: `state_probe` shows GTK4's AT-SPI
+    bridge answers `org.freedesktop.DBus.Error.NotSupported` for
+    `Component.GrabFocus` **and** `Text.SetCaretOffset` in *every* environment
+    (headless, desktop shell, X11-focused). `focus_drive`/`caret_drive` (new
+    examples, PASS-gated on the real deltas) are the ready-made instruments for
+    a toolkit that implements the write methods; against GTK4 they fail by
+    toolkit design. The `WSL2_WESTON_SHELL_DESKTOP=1` hypothesis itself was
+    **disproven**: WSLg's desktop mode renders black with dead input (full
+    findings in Spike 5). New examples committed as 055e3cb.
+
 ## Remaining
 
 1. **Periodic reconcile** (mirror): ~~future work~~ **done** — a 60s
@@ -292,8 +317,11 @@ for the build-up.
 5. **Focus/caret follow-ups**: (a) ~~subscribe
    `object:active-descendant-changed`~~ **done** (see the milestone above);
    (b) ~~map UIA `Action::SetTextSelection` → AT-SPI `set_caret_offset`/selection~~
-   **wired** (unit-tested; live verification of the AT-SPI write deferred to the
-   RAIL path, as GTK returns `NotSupported` headlessly); (c) ~~give
+   **wired; live-blocked by GTK4** (unit-tested; `state_probe` proved
+   `SetCaretOffset` — and `GrabFocus` — return `NotSupported` from GTK4's AT-SPI
+   bridge in every environment, so this is a toolkit gap, not an environment
+   gap; `caret_drive`/`focus_drive` stand ready for a toolkit that implements
+   the writes); (c) ~~give
    `Role::Label`/`Document`/`Terminal` text runs too~~ **done** (see the static
    text runs milestone above — leaf-gated, caret suppressed for the caret-less
    static roles; Terminal caret and selectable-Document caret noted there);
@@ -350,21 +378,23 @@ for the build-up.
    so msrdc logging is unchanged (verified live). The debug DLL stays registered
    on this machine via the **HKLM** key + `.wslgconfig` (dev); `regsvr32 <dll>`
    switches to the per-user path. Commit 8c108fd.
-5. **Test — `WSL2_WESTON_SHELL_DESKTOP=1` (full desktop shell).** Set it under
-   `[system-distro-env]` in `.wslgconfig` so weston runs its **desktop shell** (a
-   real window manager) instead of `rdprail-shell`. *Hypothesis:* headless WSL
-   has no WM, so GTK4 emits no `state-changed:focused`/`window:activate` — a
-   desktop-shell session *does* manage window focus, so GTK should emit focus +
-   window-lifecycle events over AT-SPI. If so, the deferred live verification of
-   **node focus, active-descendant, and caret drive** (wired + unit-tested; only
-   exercisable where a WM delivers focus events — Remaining 5a/5b + the
-   focus/caret milestone) can run against the mirror
-   (`dump_tree`/`caret_reflect`/focus examples) **without** the full interactive
-   msrdc/RAIL Windows round-trip. Also characterize the Windows side: desktop
-   mode has no per-window `RAIL_WINDOW`s, so the RAIL `SetWinEventHook` +
-   visible-adapter attach (`rail.rs`, `association.rs`) won't bind the same way —
-   record whether the plugin still loads and what UIA surface the single desktop
-   window exposes.
+5. **Test — `WSL2_WESTON_SHELL_DESKTOP=1` (full desktop shell)**: ~~hypothesis:
+   a WM makes GTK emit focus events~~ **done — hypothesis disproven, goal
+   achieved anyway** (see the live-verification milestone above and Spike 5 in
+   `docs/spikes.md`). WSLg's desktop mode runs (weston `desktop-shell.so`,
+   msrdc shows one `wslg_desktop` window) but renders **black with dead RDP
+   input**, so it verifies nothing; GTK4-Wayland stays `Active`-less under it.
+   The working substitute is `GDK_BACKEND=x11` + `xdotool` under the *default*
+   rdprail-shell, which delivered every reflection-path verification (window +
+   node focus, caret/text/selection). Drive paths (5a live-drive, 5b) are
+   toolkit-blocked: GTK4 answers `NotSupported` for `GrabFocus`/`SetCaretOffset`
+   everywhere. Active-descendant remains deferred (gnome-text-editor has no
+   such widget; needs a list/tree app). Windows-side desktop-mode record: the
+   plugin loads, chain-load reports 2, the `AccessKit` channel connects, the
+   RAIL hook installs with nothing to bind, and the desktop window's UIA
+   surface is plain RDP chrome (`TscShellContainerClass` → BBar + panes →
+   `UIMainClass`). `.wslgconfig` restored to rdprail-shell afterward. Examples
+   055e3cb.
 
 ## Workflow notes
 
@@ -409,3 +439,22 @@ for the build-up.
   `System.Windows.Automation`): find the RootElement child whose FrameworkId
   is 'AccessKit'. The AccessKit UIA provider collapses filtered/generic nodes,
   so the 83-node AT-SPI tree shows as ~13 UIA descendants (the real controls).
+- Focus/caret live testing without Windows (works under stock rdprail-shell):
+  launch the app with `GDK_BACKEND=x11` added to the usual env (kill any
+  Wayland-backed instance by pid first — single-instance D-Bus activation),
+  then drive real input with the preinstalled `xdotool`:
+  `xdotool windowfocus --sync <id>` toggles between two windows (focus events),
+  an XTEST click into the text area sets the focus widget, `xdotool key
+  Left/Home` moves the caret, `type` edits. Watch with `window_lifecycle`
+  (focus-only deltas print as `TreeUpdate n (0 nodes)`); `state_probe` prints
+  states + verbatim GrabFocus/SetCaretOffset results. Raw-signal check:
+  `busctl --address $(busctl --user call org.a11y.Bus /org/a11y/bus
+  org.a11y.Bus GetAddress | sed -e 's/^s "//' -e 's/"$//') monitor`.
+- A bare `wait` hangs a `bash -lc` script that `setsid`-launched GUI apps
+  earlier in the same script (they stay children and never exit) — `wait` on
+  the explicit watcher pids instead.
+- If the harness timeout kills a long `wsl.exe` invocation, the WSL VM can
+  idle-terminate with it (no remaining client), taking `/tmp` logs and the
+  launched apps along. Keep driver scripts comfortably under the tool timeout
+  and dump logs in the same script that produced them, or in a quick follow-up
+  call.

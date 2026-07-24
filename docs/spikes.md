@@ -182,6 +182,45 @@ distro env; see `WSLGd/main.cpp:154-181`), which makes WSLGd launch
   (mstsc kept exiting and being relaunched by WSLGd) — do not mistake that for
   "mstsc doesn't support the `/wslg` transport"; a genuine OK connects fine.
 
+## Spike 5 — `WSL2_WESTON_SHELL_DESKTOP=1`: display dead, but X11+xdotool unlocks focus testing
+
+- The flag (in `.wslgconfig` `[system-distro-env]`; value must be exactly `1` or
+  `true` — `WSLGd/main.cpp:374-384`) does switch weston to `desktop-shell.so`
+  and `weston-desktop-shell` launches cleanly. msrdc connects in desktop mode:
+  a single full-screen `wslg_desktop - <GUID> - Remote Desktop` window
+  (`TscShellContainerClass`), no per-app RAIL windows. Its UIA surface is plain
+  RDP-client chrome (BBar toolbar + nested panes down to `UIMainClass`).
+- **But the desktop is unusable as a display/input vehicle in this build**: the
+  window renders solid black, and RDP input goes nowhere — with msrdc genuinely
+  foregrounded, four clicks verified to land inside the window plus keystrokes
+  produced *zero* AT-SPI reaction in the apps (raw a11y-bus monitor silent);
+  weston.log shows no errors. GTK4-Wayland windows under the desktop shell look
+  exactly like headless: `Showing|Visible`, never `Active`, no focus events.
+- The DVC plugin is unaffected by desktop mode: chain-load probe reports 2,
+  the `AccessKit` channel connects, the RAIL hook installs (nothing to bind),
+  and the hvsocket pump retries normally.
+- **The actual unlock is Xwayland, not the desktop shell**: launch the GTK app
+  with `GDK_BACKEND=x11` and weston's XWM manages and activates its X windows
+  even with the display dead. `xdotool` (preinstalled in the distro) then
+  delivers *real* focus and input — `windowfocus --sync` (raw `XSetInputFocus`)
+  and XTEST keys/clicks. GTK4-X11 responds with genuine `window:activate`/
+  `deactivate`, `state-changed:focused`/`active`, `text-caret-moved`,
+  `text-changed`, and `text-selection-changed` over AT-SPI. **Verified under
+  the default `rdprail-shell` too — no config switch needed**, so focus/caret
+  live tests run headlessly against the stock setup.
+- Caveats: gnome-text-editor is single-instance via D-Bus activation — kill any
+  Wayland-backed instance first or `--new-window` reuses the old backend. A
+  window is `Active` without any widget `Focused` until a real (XTEST) click
+  sets the focus widget; Tab *inserts* a tab character in a text view rather
+  than moving focus. `_NET_ACTIVE_WINDOW` requests (`xdotool windowactivate`)
+  are honored, but a freshly mapped second window does not steal focus.
+- **GTK4's AT-SPI write methods are not implemented, period**: `Component.
+  GrabFocus` and `Text.SetCaretOffset` return `org.freedesktop.DBus.Error.
+  NotSupported` in every environment (headless, desktop shell, X11-focused —
+  `state_probe` example prints the verbatim errors). The earlier "NotSupported
+  headlessly" reading was too narrow: driving focus/caret *into* GTK4 over
+  AT-SPI is a toolkit gap, not an environment gap.
+
 ## WSLg reliability quirks observed
 
 - msrdc exits when the last GUI app closes; WSLGd restarts it on demand.
