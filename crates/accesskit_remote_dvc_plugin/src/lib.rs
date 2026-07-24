@@ -16,17 +16,20 @@ mod channel;
 mod listener;
 mod plugin;
 mod rail;
+mod register;
 pub mod transport;
+mod wslgconfig;
 
 use core::ffi::c_void;
 use std::panic::{self, AssertUnwindSafe};
 use std::str::FromStr;
+use std::sync::Once;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, E_UNEXPECTED, HMODULE, S_OK};
 use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
 use windows::Win32::System::RemoteDesktop::IWTSPlugin;
-use windows::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
+use windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows::core::{GUID, HRESULT, Interface};
 use windows_core::BOOL;
 
@@ -41,42 +44,39 @@ pub(crate) fn instance() -> HMODULE {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
-    match reason {
-        DLL_PROCESS_ATTACH => {
-            INSTANCE.store(hinst.0 as _, Ordering::Release);
-            let file_appender =
-                tracing_appender::rolling::never(std::env::temp_dir(), "AccessKitDvc.log");
-            let log_level = std::env::var("ACCESSKIT_DVC_LOG")
-                .ok()
-                .and_then(|s| tracing::Level::from_str(&s).ok())
-                .unwrap_or(tracing::Level::DEBUG);
-            tracing_subscriber::fmt()
-                .compact()
-                .with_writer(file_appender)
-                .with_ansi(false)
-                .with_max_level(log_level)
-                .init();
-            panic::set_hook(Box::new(|info| {
-                error!("{:?}", info);
-            }));
-            trace!(
-                "DllMain: DLL_PROCESS_ATTACH, arch {}, log level {log_level}",
-                std::env::consts::ARCH
-            );
-            match unsafe { DisableThreadLibraryCalls(hinst) } {
-                Ok(_) => trace!("Disabled thread library calls"),
-                Err(e) => {
-                    error!("Failed to disable thread library calls: {e:?}");
-                    return false.into();
-                }
-            }
+    if reason == DLL_PROCESS_ATTACH {
+        INSTANCE.store(hinst.0 as _, Ordering::Release);
+        if unsafe { DisableThreadLibraryCalls(hinst) }.is_err() {
+            return false.into();
         }
-        DLL_PROCESS_DETACH => {
-            debug!("DllMain: DLL_PROCESS_DETACH");
-        }
-        _ => {}
     }
     true.into()
+}
+
+/// Install the file-logging subscriber + panic hook exactly once. Called from
+/// the DVC entry point, **not** `DllMain`: a host that only calls
+/// `DllRegisterServer` (regsvr32) and then exits cleanly aborts at teardown when
+/// the global `fmt` subscriber is installed, so logging is set up only on the
+/// msrdc path that actually needs it.
+fn init_tracing() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let file_appender =
+            tracing_appender::rolling::never(std::env::temp_dir(), "AccessKitDvc.log");
+        let log_level = std::env::var("ACCESSKIT_DVC_LOG")
+            .ok()
+            .and_then(|s| tracing::Level::from_str(&s).ok())
+            .unwrap_or(tracing::Level::DEBUG);
+        let _ = tracing_subscriber::fmt()
+            .compact()
+            .with_writer(file_appender)
+            .with_ansi(false)
+            .with_max_level(log_level)
+            .try_init();
+        panic::set_hook(Box::new(|info| {
+            error!("{info:?}");
+        }));
+    });
 }
 
 /// The DVC instance entry point. Exported by name so the RDC client can
@@ -108,7 +108,35 @@ pub unsafe extern "system" fn VirtualChannelGetInstance(
     }
 }
 
+/// Self-registration entry point for `regsvr32 <dll>`. Writes the HKCU
+/// `OptionalAddIns\WSLDVC_PRIVATE` entry and the `.wslgconfig` flag (no
+/// elevation).
+#[unsafe(no_mangle)]
+pub extern "system" fn DllRegisterServer() -> HRESULT {
+    match panic::catch_unwind(register::register) {
+        Ok(hr) => hr,
+        Err(_) => {
+            error!("DllRegisterServer panicked");
+            E_UNEXPECTED
+        }
+    }
+}
+
+/// Unregistration entry point for `regsvr32 /u <dll>`. Reverses
+/// [`DllRegisterServer`].
+#[unsafe(no_mangle)]
+pub extern "system" fn DllUnregisterServer() -> HRESULT {
+    match panic::catch_unwind(register::unregister) {
+        Ok(hr) => hr,
+        Err(_) => {
+            error!("DllUnregisterServer panicked");
+            E_UNEXPECTED
+        }
+    }
+}
+
 unsafe fn get_instance(refiid: *const GUID, pnumobjs: *mut u32, ppo: *mut *mut c_void) -> HRESULT {
+    init_tracing();
     debug!("VirtualChannelGetInstance called (ppObjArray null = {})", ppo.is_null());
     if refiid.is_null() || pnumobjs.is_null() {
         return E_POINTER;
