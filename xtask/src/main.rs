@@ -13,8 +13,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The DVC plugin crate whose DLL ships in the installer.
 const DVC_PLUGIN: &str = "accesskit_remote_dvc_plugin";
 
+/// The daemon binary shipped for the WSL side.
+const DAEMON: &str = "accesskit_remoted";
+
 /// Windows targets shipped by default (x64 + arm64).
 const WINDOWS_TARGETS: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
+
+/// Linux targets shipped for the WSL daemon (x64 + arm64).
+const LINUX_TARGETS: [&str; 2] = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"];
 
 /// The parsed subcommand.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +104,20 @@ fn windows_dll_dst(staging: &Path, triple: &str) -> PathBuf {
         .join(format!("{DVC_PLUGIN}.dll"))
 }
 
+/// Where a target's Linux daemon is staged for the installer, grouped by arch.
+fn linux_bin_dst(staging: &Path, triple: &str) -> PathBuf {
+    staging.join("linux").join(arch_of(triple)).join(DAEMON)
+}
+
+/// Copy `src` to `dst`, creating parent directories as needed.
+fn stage_copy(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    Ok(())
+}
+
 /// The repository root, one level above this crate's manifest.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -174,13 +194,25 @@ fn run_dist(staging: Option<&Path>) -> Result<(), String> {
                 src.display()
             ));
         }
-        let dst = windows_dll_dst(&staging, target);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        stage_copy(&src, &windows_dll_dst(&staging, target))?;
+    }
+
+    // Stage the per-arch Linux daemons and the shared WSL install assets.
+    for target in LINUX_TARGETS {
+        let src = root.join("target").join(target).join("release").join(DAEMON);
+        if !src.is_file() {
+            return Err(format!(
+                "missing release daemon for {target}: {} (build it and place it there)",
+                src.display()
+            ));
         }
-        std::fs::copy(&src, &dst)
-            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        stage_copy(&src, &linux_bin_dst(&staging, target))?;
+    }
+    for asset in ["install.sh", "accesskit-remoted.service"] {
+        stage_copy(
+            &root.join("dist").join("linux").join(asset),
+            &staging.join("linux").join(asset),
+        )?;
     }
 
     let outfile = root
@@ -298,6 +330,17 @@ mod tests {
                 .join("windows")
                 .join("aarch64")
                 .join("accesskit_remote_dvc_plugin.dll"),
+        );
+    }
+
+    #[test]
+    fn linux_bin_dst_groups_by_arch() {
+        assert_eq!(
+            linux_bin_dst(Path::new("stage"), "aarch64-unknown-linux-gnu"),
+            Path::new("stage")
+                .join("linux")
+                .join("aarch64")
+                .join("accesskit_remoted"),
         );
     }
 }
