@@ -12,6 +12,12 @@ use windows::Win32::System::RemoteDesktop::IWTSPlugin;
 use windows::core::{GUID, Interface};
 
 #[test]
+fn target_triple_tracks_arch() {
+    assert_eq!(common::triple_for("x86_64"), "x86_64-pc-windows-msvc");
+    assert_eq!(common::triple_for("aarch64"), "aarch64-pc-windows-msvc");
+}
+
+#[test]
 fn export_is_present() {
     // `load()` resolves `VirtualChannelGetInstance`; it panics if the export
     // is missing, so a successful load proves the export exists.

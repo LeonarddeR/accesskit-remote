@@ -6,6 +6,17 @@
 
 use std::path::PathBuf;
 
+/// The MSVC target triple whose build output holds the DLL, for a given CPU
+/// architecture string (matching `std::env::consts::ARCH`).
+pub fn triple_for(arch: &str) -> String {
+    format!("{arch}-pc-windows-msvc")
+}
+
+/// The target triple this test binary was compiled for.
+pub fn target_triple() -> String {
+    triple_for(std::env::consts::ARCH)
+}
+
 /// Resolve the path to the built `accesskit_remote_dvc_plugin.dll`.
 ///
 /// Resolution order:
@@ -28,8 +39,7 @@ pub fn dll_path() -> PathBuf {
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     const DLL: &str = "accesskit_remote_dvc_plugin.dll";
 
-    let triple_path =
-        target_dir.join("x86_64-pc-windows-msvc").join(profile).join(DLL);
+    let triple_path = target_dir.join(target_triple()).join(profile).join(DLL);
     if triple_path.is_file() {
         return triple_path;
     }
