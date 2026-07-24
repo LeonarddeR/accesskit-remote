@@ -202,8 +202,69 @@ pub fn map_role(role: Role) -> accesskit::Role {
         Role::Application => A::Application,
         Role::Section => A::Section,
         Role::Paragraph => A::Paragraph,
+
+        Role::Separator => A::Splitter,
+        Role::LevelBar => A::Meter,
+        Role::Rating => A::Meter,
+        Role::Dial => A::Slider,
+        Role::TableRow => A::Row,
+        Role::RowHeader | Role::TableRowHeader => A::RowHeader,
+        Role::ColumnHeader | Role::TableColumnHeader => A::ColumnHeader,
+        Role::TreeTable => A::TreeGrid,
+        Role::ToolTip => A::Tooltip,
+        Role::Static => A::Label,
+        Role::Notification | Role::InfoBar => A::Alert,
+        Role::TitleBar => A::TitleBar,
+        Role::Header => A::Header,
+        Role::Footer => A::Footer,
+        Role::Canvas | Role::DrawingArea => A::Canvas,
+        Role::Audio => A::Audio,
+        Role::Video => A::Video,
+        Role::Editbar => A::TextInput,
+        Role::Embedded => A::EmbeddedObject,
+        Role::ImageMap => A::Image,
+        Role::CHART => A::Figure,
+        Role::Autocomplete => A::ListBox,
+        Role::TearoffMenuItem => A::MenuItem,
+        // AT-SPI defines these three as specialized dialogs, not as the
+        // controls that open them.
+        Role::FileChooser | Role::FontChooser | Role::ColorChooser => A::Dialog,
+        Role::DateEditor => A::DateInput,
+        Role::Article => A::Article,
+        Role::BlockQuote => A::Blockquote,
+        Role::Caption => A::Caption,
+        Role::Comment => A::Comment,
+        Role::Form => A::Form,
+        Role::Landmark => A::Region,
+        Role::Log => A::Log,
+        Role::Marquee => A::Marquee,
+        Role::Math | Role::MathFraction | Role::MathRoot => A::Math,
+        Role::Footnote => A::DocFootnote,
+        Role::Timer => A::Timer,
+        Role::Definition | Role::DescriptionValue => A::Definition,
+        Role::DescriptionList => A::DescriptionList,
+        Role::DescriptionTerm => A::Term,
+        Role::Mark => A::Mark,
+        Role::Suggestion => A::Suggestion,
+        Role::ContentDeletion => A::ContentDeletion,
+        Role::ContentInsertion => A::ContentInsertion,
+
         _ => A::GenericContainer,
     }
+}
+
+/// Sharpens a mapped role using the rest of the node, for the cases AT-SPI's
+/// role alone cannot distinguish.
+///
+/// A named `Grouping` is ARIA's `group` — a deliberate semantic grouping — so
+/// it is promoted out of the transparent-container fallback. `Panel` (what GTK
+/// emits for a plain layout box) is left alone whether named or not, because
+/// promoting it would surface every box in the client tree.
+pub fn refine_role(base: accesskit::Role, node: &MirrorNode) -> accesskit::Role {
+    if node.role == Role::Grouping && !node.name.is_empty() {
+        return accesskit::Role::Group;
+    }
+    base
 }
 
 /// The subset of AT-SPI state the mapping forwards to AccessKit, distilled from
@@ -790,7 +851,7 @@ fn build_node(
     ids: &mut NodeIdMap,
     walked: &HashSet<&str>,
 ) -> BuiltNode {
-    let role = map_role(node.role);
+    let role = refine_role(map_role(node.role), node);
     let mut container = Node::new(role);
     if !node.name.is_empty() {
         if role == accesskit::Role::Label {
@@ -948,7 +1009,7 @@ mod tests {
         assert_eq!(map_role(Role::Label), accesskit::Role::Label);
         assert_eq!(map_role(Role::Button), accesskit::Role::Button);
         assert_eq!(map_role(Role::PageTab), accesskit::Role::Tab);
-        assert_eq!(map_role(Role::Separator), accesskit::Role::GenericContainer);
+        assert_eq!(map_role(Role::Viewport), accesskit::Role::GenericContainer);
     }
 
     #[test]
@@ -976,6 +1037,128 @@ mod tests {
         ] {
             assert_eq!(map_role(role), accesskit::Role::Document, "{role:?}");
         }
+    }
+
+    #[test]
+    fn map_role_covers_the_gtk4_and_libreoffice_role_surface() {
+        use accesskit::Role as A;
+
+        for (atspi, expected) in [
+            (Role::Separator, A::Splitter),
+            (Role::LevelBar, A::Meter),
+            (Role::TableRow, A::Row),
+            (Role::RowHeader, A::RowHeader),
+            (Role::TableRowHeader, A::RowHeader),
+            (Role::ColumnHeader, A::ColumnHeader),
+            (Role::TableColumnHeader, A::ColumnHeader),
+            (Role::TreeTable, A::TreeGrid),
+            (Role::ToolTip, A::Tooltip),
+            (Role::Static, A::Label),
+            (Role::Notification, A::Alert),
+            (Role::InfoBar, A::Alert),
+            (Role::TitleBar, A::TitleBar),
+            (Role::Header, A::Header),
+            (Role::Footer, A::Footer),
+            (Role::Canvas, A::Canvas),
+            (Role::DrawingArea, A::Canvas),
+            (Role::Audio, A::Audio),
+            (Role::Video, A::Video),
+            (Role::Editbar, A::TextInput),
+            (Role::Article, A::Article),
+            (Role::BlockQuote, A::Blockquote),
+            (Role::Caption, A::Caption),
+            (Role::Comment, A::Comment),
+            (Role::Form, A::Form),
+            (Role::Landmark, A::Region),
+            (Role::Log, A::Log),
+            (Role::Marquee, A::Marquee),
+            (Role::Math, A::Math),
+            (Role::MathFraction, A::Math),
+            (Role::MathRoot, A::Math),
+            (Role::Footnote, A::DocFootnote),
+            (Role::Timer, A::Timer),
+            (Role::Definition, A::Definition),
+            (Role::DescriptionList, A::DescriptionList),
+            (Role::DescriptionTerm, A::Term),
+            (Role::DescriptionValue, A::Definition),
+            (Role::Mark, A::Mark),
+            (Role::Suggestion, A::Suggestion),
+            (Role::ContentDeletion, A::ContentDeletion),
+            (Role::ContentInsertion, A::ContentInsertion),
+            (Role::Embedded, A::EmbeddedObject),
+            (Role::ImageMap, A::Image),
+            (Role::Dial, A::Slider),
+            (Role::Rating, A::Meter),
+            (Role::CHART, A::Figure),
+            (Role::Autocomplete, A::ListBox),
+            (Role::TearoffMenuItem, A::MenuItem),
+            (Role::FileChooser, A::Dialog),
+            (Role::FontChooser, A::Dialog),
+            (Role::ColorChooser, A::Dialog),
+            (Role::DateEditor, A::DateInput),
+        ] {
+            assert_eq!(map_role(atspi), expected, "{atspi:?}");
+        }
+    }
+
+    #[test]
+    fn structural_roles_stay_filter_transparent() {
+        // These carry no semantics a screen reader can use; mapping them to real
+        // roles would surface every layout box in the client tree.
+        for role in [
+            Role::Panel,
+            Role::Filler,
+            Role::Grouping,
+            Role::OptionPane,
+            Role::RootPane,
+            Role::LayeredPane,
+            Role::GlassPane,
+            Role::Viewport,
+            Role::SplitPane,
+            Role::Page,
+            Role::Ruler,
+            Role::RedundantObject,
+            Role::Extended,
+            Role::Unknown,
+            Role::Invalid,
+        ] {
+            assert_eq!(map_role(role), accesskit::Role::GenericContainer, "{role:?}");
+        }
+    }
+
+    #[test]
+    fn consumer_keeps_unnamed_containers_out_of_the_tree() {
+        use accesskit_consumer::FilterResult;
+
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/plain".into(), "/named".into()];
+        let mut plain = leaf("/plain", Role::Grouping, "");
+        plain.children = vec!["/plain/b".into()];
+        let mut named = leaf("/named", Role::Grouping, "Formatting");
+        named.children = vec!["/named/b".into()];
+        let one = leaf("/plain/b", Role::Button, "One");
+        let two = leaf("/named/b", Role::Button, "Two");
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, plain, named, one, two], &mut ids);
+        let tree = accesskit_consumer::Tree::new(update, false);
+        let state = tree.state();
+        let node = |path: &str| {
+            state
+                .node_by_tree_local_id(ids.get(path).unwrap(), TreeId::ROOT)
+                .expect("node present in consumer tree")
+        };
+
+        assert_eq!(
+            accesskit_consumer::common_filter(&node("/plain")),
+            FilterResult::ExcludeNode,
+            "an unnamed layout container stays transparent",
+        );
+        assert_eq!(
+            accesskit_consumer::common_filter(&node("/named")),
+            FilterResult::Include,
+            "a named group carries semantics worth surfacing",
+        );
     }
 
     fn states(flags: &[State]) -> StateSet {

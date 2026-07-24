@@ -29,6 +29,32 @@ fn main() {
             descriptor.title,
             update.nodes.len(),
         );
+        // The consumer filters GenericContainer and TextRun out of the tree, so
+        // everything else is what a UIA client actually sees. Watch this count
+        // when broadening the role map: it is the tree-inflation metric.
+        let mut by_role = std::collections::BTreeMap::<String, usize>::new();
+        for (_, node) in update.nodes.iter() {
+            *by_role.entry(format!("{:?}", node.role())).or_default() += 1;
+        }
+        let reaching = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                !matches!(
+                    node.role(),
+                    accesskit::Role::GenericContainer | accesskit::Role::TextRun
+                )
+            })
+            .count();
+        println!(
+            "      {reaching}/{} nodes reach the client tree | roles: {}",
+            update.nodes.len(),
+            by_role
+                .iter()
+                .map(|(role, count)| format!("{role}={count}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         for (id, node) in update.nodes.iter() {
             let text = node.value().or_else(|| node.label());
             let clickable = node.supports_action(accesskit::Action::Click);
