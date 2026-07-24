@@ -69,8 +69,30 @@ fn main() {
             let expanded = node.is_expanded();
             let selected = node.is_selected();
             let has_popup = node.has_popup();
-            let has_state =
-                toggled.is_some() || expanded.is_some() || selected.is_some() || has_popup.is_some();
+            let mut flags: Vec<String> = Vec::new();
+            for (label, set) in [
+                ("disabled", node.is_disabled()),
+                ("read_only", node.is_read_only()),
+                ("required", node.is_required()),
+                ("modal", node.is_modal()),
+                ("multiselectable", node.is_multiselectable()),
+                ("busy", node.is_busy()),
+            ] {
+                if set {
+                    flags.push(label.to_owned());
+                }
+            }
+            if let Some(invalid) = node.invalid() {
+                flags.push(format!("invalid={invalid:?}"));
+            }
+            if let Some(orientation) = node.orientation() {
+                flags.push(format!("{orientation:?}"));
+            }
+            let has_state = toggled.is_some()
+                || expanded.is_some()
+                || selected.is_some()
+                || has_popup.is_some()
+                || !flags.is_empty();
             if text.is_some() || clickable || is_run || selection.is_some() || has_state {
                 let geom = node.bounds().map(|b| {
                     format!(
@@ -84,7 +106,8 @@ fn main() {
                 });
                 let state = if has_state {
                     format!(
-                        " tog={toggled:?} exp={expanded:?} sel={selected:?} pop={has_popup:?}"
+                        " tog={toggled:?} exp={expanded:?} sel={selected:?} pop={has_popup:?} [{}]",
+                        flags.join(","),
                     )
                 } else {
                     String::new()

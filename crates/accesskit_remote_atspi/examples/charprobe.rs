@@ -144,6 +144,17 @@ fn main() {
                 ("pressed", State::Pressed),
                 ("has_popup", State::HasPopup),
                 ("showing", State::Showing),
+                ("sensitive", State::Sensitive),
+                ("enabled", State::Enabled),
+                ("editable", State::Editable),
+                ("read_only", State::ReadOnly),
+                ("required", State::Required),
+                ("invalid_entry", State::InvalidEntry),
+                ("modal", State::Modal),
+                ("multiselectable", State::Multiselectable),
+                ("busy", State::Busy),
+                ("horizontal", State::Horizontal),
+                ("vertical", State::Vertical),
             ] {
                 if states.contains(st) {
                     sflags.push(label);

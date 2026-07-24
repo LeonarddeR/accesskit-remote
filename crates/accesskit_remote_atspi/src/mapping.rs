@@ -253,6 +253,12 @@ pub fn map_role(role: Role) -> accesskit::Role {
     }
 }
 
+/// Whether the node is a control the user can operate, as opposed to a layout
+/// container or a piece of static content.
+fn is_control(node: &MirrorNode) -> bool {
+    node.states.focusable || is_clickable_role(node.role) || node.is_actionable()
+}
+
 /// Sharpens a mapped role using the rest of the node, for the cases AT-SPI's
 /// role alone cannot distinguish.
 ///
@@ -278,6 +284,20 @@ pub struct NodeStates {
     pub selected: Option<bool>,
     pub toggled: Option<accesskit::Toggled>,
     pub has_popup: bool,
+    /// Whether the object reports itself operable. GTK4 sets only `Sensitive`
+    /// (and omits it when the widget is explicitly disabled); at-spi2-atk sets
+    /// `Sensitive` and `Enabled` together. Its *absence* is what marks a
+    /// control disabled, so this is stored positively and gated on the node
+    /// being a control at all — see [`build_node`].
+    pub sensitive: bool,
+    pub read_only: bool,
+    pub required: bool,
+    pub invalid: bool,
+    pub modal: bool,
+    pub multiselectable: bool,
+    pub busy: bool,
+    /// `None` when the object reports neither or both orientations.
+    pub orientation: Option<accesskit::Orientation>,
 }
 
 /// Distills the subset of AT-SPI state the mapping forwards from a [`StateSet`].
@@ -298,6 +318,14 @@ pub fn node_states(states: StateSet) -> NodeStates {
     } else {
         None
     };
+    let orientation = match (
+        states.contains(State::Horizontal),
+        states.contains(State::Vertical),
+    ) {
+        (true, false) => Some(accesskit::Orientation::Horizontal),
+        (false, true) => Some(accesskit::Orientation::Vertical),
+        _ => None,
+    };
     NodeStates {
         focusable: states.contains(State::Focusable),
         focused: states.contains(State::Focused),
@@ -305,6 +333,14 @@ pub fn node_states(states: StateSet) -> NodeStates {
         selected,
         toggled,
         has_popup: states.contains(State::HasPopup),
+        sensitive: states.contains(State::Sensitive) || states.contains(State::Enabled),
+        read_only: states.contains(State::ReadOnly),
+        required: states.contains(State::Required),
+        invalid: states.contains(State::InvalidEntry),
+        modal: states.contains(State::Modal),
+        multiselectable: states.contains(State::Multiselectable),
+        busy: states.contains(State::Busy),
+        orientation,
     }
 }
 
@@ -872,6 +908,32 @@ fn build_node(
     if node.states.has_popup {
         container.set_has_popup(accesskit::HasPopup::Menu);
     }
+    // Only a control can be disabled. Layout boxes report no Sensitive either,
+    // and announcing every one of them as disabled would be worse than silence.
+    if !node.states.sensitive && is_control(node) {
+        container.set_disabled();
+    }
+    if node.states.read_only {
+        container.set_read_only();
+    }
+    if node.states.required {
+        container.set_required();
+    }
+    if node.states.invalid {
+        container.set_invalid(accesskit::Invalid::True);
+    }
+    if node.states.modal {
+        container.set_modal();
+    }
+    if node.states.multiselectable {
+        container.set_multiselectable();
+    }
+    if node.states.busy {
+        container.set_busy();
+    }
+    if let Some(orientation) = node.states.orientation {
+        container.set_orientation(orientation);
+    }
     let element_children: Vec<NodeId> = node
         .children
         .iter()
@@ -1209,6 +1271,108 @@ mod tests {
         assert!(node_states(states(&[State::HasPopup])).has_popup);
         assert!(node_states(states(&[State::Focusable])).focusable);
         assert!(node_states(states(&[State::Focused])).focused);
+    }
+
+    #[test]
+    fn node_states_distills_the_full_forwarded_state_set() {
+        use accesskit::Orientation;
+
+        // GTK4 never emits State::Enabled (it sets only Sensitive, and omits
+        // that when the widget is explicitly disabled); at-spi2-atk emits both.
+        // Either one therefore means "not disabled".
+        assert!(node_states(states(&[State::Sensitive])).sensitive);
+        assert!(node_states(states(&[State::Enabled])).sensitive);
+        assert!(!node_states(states(&[State::Focusable])).sensitive);
+
+        assert!(node_states(states(&[State::ReadOnly])).read_only);
+        assert!(node_states(states(&[State::Required])).required);
+        assert!(node_states(states(&[State::InvalidEntry])).invalid);
+        assert!(node_states(states(&[State::Modal])).modal);
+        assert!(node_states(states(&[State::Multiselectable])).multiselectable);
+        assert!(node_states(states(&[State::Busy])).busy);
+
+        assert_eq!(
+            node_states(states(&[State::Horizontal])).orientation,
+            Some(Orientation::Horizontal),
+        );
+        assert_eq!(
+            node_states(states(&[State::Vertical])).orientation,
+            Some(Orientation::Vertical),
+        );
+        assert_eq!(
+            node_states(states(&[State::Horizontal, State::Vertical])).orientation,
+            None,
+            "a contradictory orientation is dropped rather than guessed",
+        );
+        assert_eq!(node_states(states(&[])).orientation, None);
+    }
+
+    #[test]
+    fn build_node_forwards_the_new_states() {
+        use accesskit::Orientation;
+
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/off".into(), "/entry".into(), "/bar".into()];
+
+        // Focusable but not sensitive: a genuinely disabled control.
+        let mut off = leaf("/off", Role::Button, "Off");
+        off.states.focusable = true;
+
+        let mut entry = leaf("/entry", Role::Entry, "E");
+        entry.states.sensitive = true;
+        entry.states.read_only = true;
+        entry.states.required = true;
+        entry.states.invalid = true;
+
+        let mut bar = leaf("/bar", Role::ScrollBar, "B");
+        bar.states.sensitive = true;
+        bar.states.orientation = Some(Orientation::Horizontal);
+        bar.states.busy = true;
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, off, entry, bar], &mut ids);
+        let by_id: HashMap<NodeId, Node> = update.nodes.iter().cloned().collect();
+        let node = |path: &str| by_id.get(&ids.get(path).unwrap()).unwrap().clone();
+
+        assert!(node("/off").is_disabled(), "insensitive control is disabled");
+        assert!(!node("/entry").is_disabled());
+        assert!(node("/entry").is_read_only());
+        assert!(node("/entry").is_required());
+        assert_eq!(node("/entry").invalid(), Some(accesskit::Invalid::True));
+        assert_eq!(node("/bar").orientation(), Some(Orientation::Horizontal));
+        assert!(node("/bar").is_busy());
+    }
+
+    #[test]
+    fn disabled_is_not_stamped_on_inert_containers() {
+        // A layout box reports no Sensitive either, but it is not a control and
+        // must not reach the client announced as disabled.
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/panel".into()];
+        let panel = leaf("/panel", Role::Panel, "");
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, panel], &mut ids);
+        let by_id: HashMap<NodeId, Node> = update.nodes.iter().cloned().collect();
+        assert!(!by_id[&ids.get("/panel").unwrap()].is_disabled());
+        assert!(!by_id[&ids.get("/win").unwrap()].is_disabled());
+    }
+
+    #[test]
+    fn no_node_is_ever_hidden() {
+        // is_hidden() makes the consumer drop the whole subtree, and GTK reports
+        // Showing=false for scrolled-out rows a screen reader still needs. The
+        // walk filters visibility at the window level instead.
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/a".into()];
+        let a = leaf("/a", Role::Button, "A");
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, a], &mut ids);
+        assert!(
+            update.nodes.iter().all(|(_, node)| !node.is_hidden()),
+            "no mirrored node is ever marked hidden",
+        );
     }
 
     #[test]
