@@ -195,12 +195,13 @@ fn is_editable_text_role(role: Role) -> bool {
     matches!(role, Role::Text | Role::Entry | Role::PasswordText)
 }
 
-/// Whether a role is static text: a label, terminal, or document.
+/// Whether a role is static text: a label, terminal, document, or paragraph.
 fn is_static_text_role(role: Role) -> bool {
     matches!(
         role,
         Role::Label
             | Role::Terminal
+            | Role::Paragraph
             | Role::DocumentFrame
             | Role::DocumentText
             | Role::DocumentWeb
@@ -781,6 +782,47 @@ mod tests {
         for role in [Role::Button, Role::Panel, Role::Frame] {
             assert!(!reads_text_runs(role, false), "{role:?}");
         }
+    }
+
+    #[test]
+    fn paragraph_reads_runs_as_leaf_and_stays_caret_less() {
+        assert!(reads_text_runs(Role::Paragraph, false));
+        assert!(!reads_text_runs(Role::Paragraph, true));
+        assert!(!has_text_caret(Role::Paragraph));
+    }
+
+    #[test]
+    fn consumer_reads_document_text_through_paragraph_runs() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/doc".into()];
+        let mut doc = leaf("/doc", Role::DocumentText, "");
+        doc.children = vec!["/doc/p1".into(), "/doc/p2".into()];
+        let mut p1 = leaf("/doc/p1", Role::Paragraph, "");
+        p1.text = Some(TextState {
+            text: "One.".into(),
+            caret: None,
+            selection: None,
+            extents: None,
+        });
+        let mut p2 = leaf("/doc/p2", Role::Paragraph, "");
+        p2.text = Some(TextState {
+            text: "Two.".into(),
+            caret: None,
+            selection: None,
+            extents: None,
+        });
+
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&[root, doc, p1, p2], &mut ids, &mut HashMap::new());
+        let doc_id = ids.get("/doc").unwrap();
+
+        let tree = accesskit_consumer::Tree::new(update, false);
+        let state = tree.state();
+        let doc_node = state
+            .node_by_tree_local_id(doc_id, accesskit::TreeId::ROOT)
+            .expect("document present in consumer tree");
+        assert!(doc_node.supports_text_ranges());
+        assert_eq!(doc_node.document_range().text(), "One.Two.");
     }
 
     #[test]
