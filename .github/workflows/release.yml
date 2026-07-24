@@ -60,3 +60,36 @@ jobs:
           name: daemon-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/accesskit_remoted
           if-no-files-found: error
+
+  installer:
+    name: installer
+    needs: [windows-dll, linux-daemon]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      # xtask dist reads the binaries from target/<triple>/release/.
+      - name: Stage binaries into the target layout
+        shell: bash
+        run: |
+          for t in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            mkdir -p "target/$t/release"
+            cp "artifacts/dll-$t/accesskit_remote_dvc_plugin.dll" "target/$t/release/"
+          done
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            mkdir -p "target/$t/release"
+            cp "artifacts/daemon-$t/accesskit_remoted" "target/$t/release/"
+          done
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Build installer
+        run: cargo xtask dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: target/AccessKitRemote-Setup-*.exe
+          if-no-files-found: error
