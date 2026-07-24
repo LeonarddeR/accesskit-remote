@@ -154,44 +154,58 @@ pub async fn walk_window(
         if objects.contains_key(&path) {
             continue;
         }
-        let Ok(proxy) = obj.as_accessible_proxy(zconn).await else {
+        let Some((node, child_refs)) = read_node(zconn, &obj).await else {
             continue;
         };
-        let role = proxy.get_role().await.unwrap_or(Role::Invalid);
-        let name = proxy.name().await.unwrap_or_default();
-        let states = proxy.get_state().await.unwrap_or_else(|_| StateSet::empty());
-        let interfaces = proxy.get_interfaces().await.ok();
-        let actionable = interfaces
-            .as_ref()
-            .is_some_and(|set| set.contains(Interface::Action));
-        let mut children = Vec::new();
-        for child in proxy.get_children().await.unwrap_or_default() {
-            if child.is_null() {
-                continue;
-            }
-            children.push(child.path_as_str().to_owned());
-            queue.push_back(child);
-        }
-        let text = if reads_text_runs(role, !children.is_empty())
-            && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
-        {
-            read_text_state(zconn, &obj, has_text_caret(role), true).await
-        } else {
-            None
-        };
-        nodes.push(MirrorNode {
-            path: path.clone(),
-            role,
-            name,
-            focusable: states.contains(State::Focusable),
-            focused: states.contains(State::Focused),
-            actionable,
-            children,
-            text,
-        });
+        queue.extend(child_refs);
+        nodes.push(node);
         objects.insert(path, obj);
     }
     Ok((nodes, objects))
+}
+
+/// Reads one AT-SPI object into a [`MirrorNode`] plus its non-null child
+/// refs. `None` only when the object's proxy cannot be built; individual
+/// property failures degrade to the same defaults the walk has always used.
+pub(crate) async fn read_node(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Option<(MirrorNode, Vec<ObjectRefOwned>)> {
+    let proxy = obj.as_accessible_proxy(zconn).await.ok()?;
+    let role = proxy.get_role().await.unwrap_or(Role::Invalid);
+    let name = proxy.name().await.unwrap_or_default();
+    let states = proxy.get_state().await.unwrap_or_else(|_| StateSet::empty());
+    let interfaces = proxy.get_interfaces().await.ok();
+    let actionable = interfaces
+        .as_ref()
+        .is_some_and(|set| set.contains(Interface::Action));
+    let mut children = Vec::new();
+    let mut child_refs = Vec::new();
+    for child in proxy.get_children().await.unwrap_or_default() {
+        if child.is_null() {
+            continue;
+        }
+        children.push(child.path_as_str().to_owned());
+        child_refs.push(child);
+    }
+    let text = if reads_text_runs(role, !children.is_empty())
+        && interfaces.as_ref().is_some_and(|set| set.contains(Interface::Text))
+    {
+        read_text_state(zconn, obj, has_text_caret(role), true).await
+    } else {
+        None
+    };
+    let node = MirrorNode {
+        path: obj.path_as_str().to_owned(),
+        role,
+        name,
+        focusable: states.contains(State::Focusable),
+        focused: states.contains(State::Focused),
+        actionable,
+        children,
+        text,
+    };
+    Some((node, child_refs))
 }
 
 /// Reads the AT-SPI `Text` interface of `obj`: its text (capped at
