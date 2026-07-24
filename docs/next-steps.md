@@ -441,6 +441,50 @@ for the build-up.
     note: the same Writer tree walked in 6-7s idle but 79s while LO was busy
     right after X11 typing — AT-SPI calls serialize on the app's main loop,
     so time walks against an idle app.
+- **Widget-state forwarding + menu roles + drive-back diagnostic**
+  (2026-07-24, later same day). Grounded in a live AT-SPI characterization
+  pass over gtk4-widget-factory and LibreOffice via the new
+  `examples/charprobe` (raw role/state/interface/action dump straight off the
+  bus, no mirror in between; `--open <action-substr>` fires a `DoAction`
+  first to capture transient popups). Four changes:
+  - *States* (commit 45f4659): the mirror distilled only Focusable/Focused
+    from each `StateSet`, so check/radio/menu items, toggle buttons, and
+    combo/menu buttons reached AccessKit with no state. The dead `node_flags`
+    became a pure `node_states(StateSet) -> NodeStates` distiller
+    (`Checked`/`Pressed`→`Toggled::True`, `Indeterminate`→`Mixed`,
+    `Checkable`→`False`; `Expandable`/`Collapsed`/`Expanded`→`expanded`;
+    `Selectable`/`Selected`→`selected`; `HasPopup`→`has_popup`), carried on
+    `MirrorNode`, populated in `read_node`, set in `build_node` via
+    `set_toggled`/`set_expanded`/`set_selected`/`set_has_popup`. Live-verified
+    through the mirror on gtk4-widget-factory: `CheckBox tog=True/False/Mixed`,
+    `RadioButton` same, `ToggleButton` pressed=`True`, menu button `pop=Menu`
+    (`dump_tree` gained a state column). Core fix for "menu items and combo
+    boxes don't announce state"; applies to both toolkit paths.
+  - *Roles* (commit e6bbc2d): `Role::PopupMenu`→`Menu`,
+    `Role::PushButtonMenu`→`Button` (popup rides `has_popup`); both had fallen
+    through to `GenericContainer`. Classic
+    MenuBar/Menu/MenuItem/CheckMenuItem/RadioMenuItem were already mapped
+    (LibreOffice/gtk3 emits ~770 MenuItems + 520 CheckMenuItems, now stateful).
+  - *Drive-back diagnostic* (commit 7296594): `handle_action` discarded
+    `perform`/`set_text_selection` errors with `.ok()?`, so a GTK4
+    `grab_focus`/`set_caret_offset` returning NotSupported vanished silently.
+    It now logs `action`+`path`+error at `warn` (added `tracing` dep); visible
+    under the daemon's subscriber.
+  - *LibreOffice gtk3*: `SAL_USE_VCLPLUGIN=gtk3` set locally via
+    `~/.config/environment.d/accesskit-libreoffice.conf` (this-system, not the
+    installer; takes effect next WSL session). Re-confirms the A/B — same
+    soffice, gtk4 `grab_focus`→`Err(NotSupported)` vs gtk3 (ATK bridge)
+    `text grab_focus`→`Ok(true)`.
+  - *GTK4 menu/combo shape* (characterization that drives the Remaining item
+    below): GTK4-native apps expose **no** Menu/MenuItem/PopupMenu roles even
+    with a menu open — a "menu" is a `menu.popup` `DoAction` on a
+    `Grouping`/`ToggleButton[has_popup]` node, items surface as Button/Label in
+    a transient popover (classic menu-role mapping is moot for GTK4; it matters
+    for LibreOffice/gtk3). `ComboBox` exposes the `Selection` interface (not
+    Value) and holds its displayed value in a child `Text` node the mirror
+    already reads (value is structural — no special casing);
+    `Slider`/`SpinButton`/`ScrollBar` expose `Value`. `DoAction` genuinely
+    activates on GTK4 (`menu.popup` returned true).
 
 ## Remaining
 
@@ -486,6 +530,28 @@ for the build-up.
    anchor, and LO `Paragraph` runs are all **done**, see the mirror-follow-ups
    milestone); (e) a `GetForegroundWindow` gate on
    `post_focus(true)` if RAIL testing shows Narrator/NVDA focus theft.
+6. **GTK4 action drive-back** (the "operate menus/combo boxes" half — not yet
+   started). Today `mirror::perform` wires only `Click`→`DoAction(0)` and
+   `Focus`→`grab_focus` (dead on GTK4 by design — see spikes.md). GTK4 keeps
+   every *action* interface (verified in upstream `gtk/a11y/`):
+   `Action.DoAction`, `Selection.SelectChild`, `Value.SetCurrentValue`,
+   `EditableText` — all present in `atspi-proxies 0.14`. Plan: (a) a pure
+   `plan_action(role, interfaces, action) -> AtspiCall` routing fn
+   (unit-tested) mapping incoming `accesskit::Action` → `Click`→`DoAction`;
+   `Click`/`Focus` on a selectable option → `Selection.SelectChild(index)`;
+   `Expand`/`Collapse` → named `DoAction` (`menu.popup`/`Press`, fallback
+   `DoAction(0)`); `Increment`/`Decrement`/`SetValue` → `Value.SetCurrentValue`;
+   `SetValue` on editable text → `EditableText.SetTextContents`; (b) thin glue
+   in `perform` building `SelectionProxy`/`ValueProxy`/`EditableTextProxy`;
+   (c) expose Expand/Collapse on Expandable nodes and Increment/Decrement/SetValue
+   on Value-interface nodes in `build_node` so UIA offers the patterns. The
+   Linux side is TDD-able + live-verifiable here (drive an Expand/Select at a
+   live combo). The **unverified hop is UIA→AccessKit** (which action msrdc's
+   UIA sends per gesture): resolve it by logging incoming `msg.action` in
+   `handle_action` (the drive-back diagnostic above is the instrument) while
+   driving the `viewer` RAIL window from `System.Windows.Automation`
+   (ExpandCollapse/Toggle/SelectionItem/Invoke/RangeValue). Full end-to-end
+   UIA validation needs an active Windows/msrdc session.
 
 ## Notes / corrections
 
