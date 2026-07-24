@@ -7,8 +7,8 @@ use crate::app_id::AppIdResolver;
 use crate::coalesce::RewalkCoalescer;
 use crate::focus::FocusTracker;
 use crate::mapping::{
-    build_window_update, emitted_children, focus_update, rebuild_text_node, splice_chain_update,
-    text_offset, NodeIdMap, TextNodeCache,
+    build_window_update, emitted_children, focus_update, merge_update, rebuild_text_node,
+    splice_chain_update, text_offset, NodeIdMap, TextNodeCache,
 };
 use crate::mirror::{self, BridgeResult};
 use crate::reconcile::{reconcile_windows, WindowKey};
@@ -689,6 +689,9 @@ impl Mirror {
     }
 
     /// Re-walks one window and rebuilds its tree, reusing its stable id map.
+    /// A focused node the fresh walk cannot see (a spliced lazy cell) is
+    /// re-spliced into the update; when that fails, the walk's own focus
+    /// stands.
     async fn rewalk(
         &mut self,
         conn: &AccessibilityConnection,
@@ -696,15 +699,32 @@ impl Mirror {
     ) -> Option<SourceEvent> {
         let index = self.windows.iter().position(|w| w.id == window)?;
         let root = self.windows[index].root.clone();
+        let prev_focus_obj = {
+            let state = &self.windows[index];
+            state.objects.get(&state.focus).cloned()
+        };
         let (nodes, objects_by_path) = mirror::walk_window(conn, &root).await.ok()?;
         if nodes.is_empty() {
             return None;
         }
         let state = &mut self.windows[index];
-        let update = build_window_update(&nodes, &mut state.ids, &mut state.text);
+        let mut update = build_window_update(&nodes, &mut state.ids, &mut state.text);
         state.objects = index_objects(&nodes, &state.ids, &objects_by_path);
         state.children = emitted_children(&nodes);
         state.focus = update.focus;
+        if let Some(prev) = prev_focus_obj {
+            if !objects_by_path.contains_key(prev.path_as_str()) {
+                let known: HashSet<String> =
+                    self.windows[index].children.keys().cloned().collect();
+                if let Some(chain) =
+                    mirror::read_chain_to_known(conn, &prev, &known, mirror::MAX_SPLICE_HOPS).await
+                {
+                    if let Some(splice) = self.apply_spliced_chain(index, &chain) {
+                        merge_update(&mut update, splice);
+                    }
+                }
+            }
+        }
         Some(SourceEvent::TreeUpdate { window, update })
     }
 

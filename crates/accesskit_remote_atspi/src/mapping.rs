@@ -1747,4 +1747,42 @@ mod tests {
         assert_eq!(state.focus_id_in_tree(), cell_node.id());
         assert_eq!(cell_node.role(), accesskit::Role::Cell);
     }
+
+    #[test]
+    fn consumer_survives_rewalk_that_drops_the_spliced_focus() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/table".into()];
+        let table = leaf("/table", Role::Table, "grid");
+        let walk_nodes = vec![root, table];
+        let known: HashSet<String> = ["/win".to_owned(), "/table".to_owned()].into();
+        let chain = || {
+            let mut fresh_table = leaf("/table", Role::Table, "grid");
+            fresh_table.children = vec!["/table/cell".into()];
+            vec![fresh_table, leaf("/table/cell", Role::TableCell, "A1")]
+        };
+
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        let full_a = build_window_update(&walk_nodes, &mut ids, &mut caches);
+        let mut tree = accesskit_consumer::Tree::new(full_a, false);
+
+        let splice = splice_chain_update(&chain(), &[], &known, &mut ids, &mut caches)
+            .expect("chain splices");
+        let cell_id = ids.get("/table/cell").unwrap();
+        assert_eq!(splice.update.focus, cell_id);
+        tree.update_and_process_changes(splice.update, &mut NoOpChanges);
+
+        let mut full_b = build_window_update(&walk_nodes, &mut ids, &mut caches);
+        assert_ne!(full_b.focus, cell_id, "the walk alone reverts focus");
+        let resplice = splice_chain_update(&chain(), &[], &known, &mut ids, &mut caches)
+            .expect("re-splice applies");
+        merge_update(&mut full_b, resplice.update);
+        tree.update_and_process_changes(full_b, &mut NoOpChanges);
+
+        let state = tree.state();
+        let cell_node = state
+            .node_by_tree_local_id(cell_id, accesskit::TreeId::ROOT)
+            .expect("cell survives the merged rewalk");
+        assert_eq!(state.focus_id_in_tree(), cell_node.id());
+    }
 }
