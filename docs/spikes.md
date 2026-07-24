@@ -105,6 +105,21 @@ Verified empirically (2026-07-23) and against the local WSLg clone at
 - Consequence for non-WSLg targets (mstsc, real RDP): regular AddIns
   registration presumably still applies there (rd_pipe's daily mechanism);
   the plugin crate should support both registration modes.
+- **Addendum (2026-07-24): `OptionalAddIns` resolves from HKCU too — install is
+  now no-elevation.** The `Name`=DLL-path entry works under **HKCU**
+  `…\Terminal Server Client\Default\OptionalAddIns\WSLDVC_PRIVATE`, not just
+  HKLM — verified by deleting the HKLM key and leaving only HKCU (positive
+  control first), then cycling: msrdc still loaded the plug-in with an identical
+  `probe reporting 2 (chain=true)` / `Creating listener AccessKit`. So "resolved
+  via `HKLM\…\OptionalAddIns`" above narrows to "HKLM **or** HKCU".
+  `WSLG_USE_WSLDVC_PRIVATE` can **not** move to the registry — WSLGd reads it
+  only from the `.wslgconfig` file (`WSLGd/main.cpp:153-185,483-489`), so full
+  setup still needs the per-user `%USERPROFILE%\.wslgconfig` write. Both are
+  elevation-free, so `regsvr32 <dll>` (via `DllRegisterServer`, HKCU +
+  `.wslgconfig`) does the whole install per-user. Gotcha: installing a global
+  `tracing` subscriber in `DllMain` fast-fails regsvr32 at its clean exit
+  (`0xC0000409`, `__fastfail` 7); init tracing lazily on the DVC path instead.
+  Commit 8c108fd.
 
 ## Spike 1b — msrdc's own UIA on RAIL windows: none (field is clear)
 

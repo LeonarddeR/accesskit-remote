@@ -328,10 +328,43 @@ for the build-up.
    (see the focus/caret milestone above). Local WM_SETFOCUS/KILLFOCUS handling
    stays (last-writer-wins). Still to exercise interactively on the RAIL path,
    where GTK actually emits focus events (headless WSL does not).
-4. **Registration UX**: production install still manual (HKLM
-   `OptionalAddIns\WSLDVC_PRIVATE` + `.wslgconfig`); consider a small installer
-   or DllInstall-style helper later. The debug DLL is currently registered on
-   this machine — remove the HKLM key + `%USERPROFILE%\.wslgconfig` to disable.
+4. **Registration UX**: ~~production install still manual~~ **done** —
+   `regsvr32 <dll>` / `regsvr32 /u <dll>` auto-register with **no elevation**.
+   `DllRegisterServer`/`DllUnregisterServer` (basic pattern — no `/i` command
+   line, no COM CLSID/`InprocServer32`, just the path) write/remove the **HKCU**
+   `OptionalAddIns\WSLDVC_PRIVATE` `Name`=DLL-path entry (via `windows-registry`)
+   **and** the `%USERPROFILE%\.wslgconfig` `[system-distro-env]
+   WSLG_USE_WSLDVC_PRIVATE=true` flag (a surgical, atomic, idempotent single-line
+   editor — `wslgconfig.rs` pure core, 12 tests; no INI crate, `rust-ini` drops
+   comments). **Findings that enabled this:** msrdc loads
+   `OptionalAddIns\WSLDVC_PRIVATE` from **HKCU** (empirically verified — HKLM
+   deleted + HKCU-only → identical load), so no admin/HKLM needed; and
+   `WSLG_USE_WSLDVC_PRIVATE` **cannot** come from the registry — WSLGd reads it
+   only from the `.wslgconfig` file (`P:\Microsoft\wslg` `WSLGd/main.cpp:153-185,
+   483-489`), so full automation still needs the (per-user, no-admin) file write.
+   **Crash fix:** installing the global `tracing` `fmt` subscriber in `DllMain`
+   aborts regsvr32 at its clean exit (`0xC0000409`, `__fastfail` subcode 7 =
+   FATAL_APP_EXIT, faulting module = our DLL — a Rust-DLL teardown footgun);
+   tracing init moved to a lazy `Once` on the DVC path
+   (`VirtualChannelGetInstance`), which msrdc always hits but regsvr32 never does,
+   so msrdc logging is unchanged (verified live). The debug DLL stays registered
+   on this machine via the **HKLM** key + `.wslgconfig` (dev); `regsvr32 <dll>`
+   switches to the per-user path. Commit 8c108fd.
+5. **Test — `WSL2_WESTON_SHELL_DESKTOP=1` (full desktop shell).** Set it under
+   `[system-distro-env]` in `.wslgconfig` so weston runs its **desktop shell** (a
+   real window manager) instead of `rdprail-shell`. *Hypothesis:* headless WSL
+   has no WM, so GTK4 emits no `state-changed:focused`/`window:activate` — a
+   desktop-shell session *does* manage window focus, so GTK should emit focus +
+   window-lifecycle events over AT-SPI. If so, the deferred live verification of
+   **node focus, active-descendant, and caret drive** (wired + unit-tested; only
+   exercisable where a WM delivers focus events — Remaining 5a/5b + the
+   focus/caret milestone) can run against the mirror
+   (`dump_tree`/`caret_reflect`/focus examples) **without** the full interactive
+   msrdc/RAIL Windows round-trip. Also characterize the Windows side: desktop
+   mode has no per-window `RAIL_WINDOW`s, so the RAIL `SetWinEventHook` +
+   visible-adapter attach (`rail.rs`, `association.rs`) won't bind the same way —
+   record whether the plugin still loads and what UIA surface the single desktop
+   window exposes.
 
 ## Workflow notes
 
