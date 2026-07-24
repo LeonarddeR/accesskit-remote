@@ -30,10 +30,11 @@ jobs:
       # must be built before `cargo test`.
       - name: Build DVC plugin DLL
         run: cargo build --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin
+      # No ACCESSKIT_DVC_DLL_PATH: dll_path() resolves the DLL from
+      # CARGO_MANIFEST_DIR (absolute, arch-aware). A relative override would be
+      # wrong here, since cargo test runs with the package dir as CWD.
       - name: Test Windows crates
         run: cargo test --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin -p accesskit_remote_windows
-        env:
-          ACCESSKIT_DVC_DLL_PATH: target/${{ matrix.target }}/debug/accesskit_remote_dvc_plugin.dll
 
   linux:
     name: linux (${{ matrix.runner }})
