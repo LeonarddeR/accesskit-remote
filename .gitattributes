@@ -1,0 +1,4 @@
+# Shell scripts and systemd units run in Linux/WSL; keep LF regardless of host
+# autocrlf, or bash chokes on CR and the unit fails to parse.
+*.sh text eol=lf
+*.service text eol=lf
