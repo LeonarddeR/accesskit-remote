@@ -547,6 +547,116 @@ pub fn focus_update(focus: NodeId) -> TreeUpdate {
     }
 }
 
+/// The element children each walked node contributes to the emitted tree —
+/// [`MirrorNode::children`] filtered to the walked set, the same filter
+/// `build_node` applies. Keyed by AT-SPI path.
+pub fn emitted_children(nodes: &[MirrorNode]) -> HashMap<String, Vec<String>> {
+    let walked: HashSet<&str> = nodes.iter().map(|node| node.path.as_str()).collect();
+    nodes
+        .iter()
+        .map(|node| {
+            let children = node
+                .children
+                .iter()
+                .filter(|child| walked.contains(child.as_str()))
+                .cloned()
+                .collect();
+            (node.path.clone(), children)
+        })
+        .collect()
+}
+
+/// A spliced chain turned into a partial update plus the bookkeeping the
+/// caller folds into its per-window children map.
+pub struct SpliceResult {
+    pub update: TreeUpdate,
+    /// The element children each chain node was emitted with, by path.
+    pub children: Vec<(String, Vec<String>)>,
+}
+
+/// Splices a freshly read ancestor chain into an existing window tree.
+/// `chain[0]` is the already-known ancestor's fresh read, each following node
+/// a child of its predecessor, the last the new focus target. The ancestor is
+/// emitted with `ancestor_children` (the client tree's current children) plus
+/// the chain child appended; interior nodes keep only children in `known` or
+/// the chain, so a lazy grid's huge fresh child list can neither bloat nor
+/// orphan the client tree. Returns a partial update (`tree: None`) whose
+/// focus is the descendant, or `None` for a chain shorter than two nodes.
+pub fn splice_chain_update(
+    chain: &[MirrorNode],
+    ancestor_children: &[String],
+    known: &HashSet<String>,
+    ids: &mut NodeIdMap,
+    text_caches: &mut HashMap<String, TextNodeCache>,
+) -> Option<SpliceResult> {
+    if chain.len() < 2 {
+        return None;
+    }
+    let chain_paths: HashSet<&str> = chain.iter().map(|node| node.path.as_str()).collect();
+    let mut per_node_children: Vec<Vec<String>> = Vec::with_capacity(chain.len());
+    for (index, node) in chain.iter().enumerate() {
+        let mut children: Vec<String> = if index == 0 {
+            ancestor_children.to_vec()
+        } else {
+            node.children
+                .iter()
+                .filter(|child| known.contains(*child) || chain_paths.contains(child.as_str()))
+                .cloned()
+                .collect()
+        };
+        if let Some(next) = chain.get(index + 1) {
+            if !children.contains(&next.path) {
+                children.push(next.path.clone());
+            }
+        }
+        per_node_children.push(children);
+    }
+    let mut spliced: Vec<MirrorNode> = chain.to_vec();
+    for (node, children) in spliced.iter_mut().zip(&per_node_children) {
+        node.children = children.clone();
+    }
+    let mut walked: HashSet<&str> = known.iter().map(String::as_str).collect();
+    walked.extend(spliced.iter().map(|node| node.path.as_str()));
+    walked.extend(ancestor_children.iter().map(String::as_str));
+    let mut nodes_out = Vec::new();
+    let mut focus = None;
+    for node in &spliced {
+        let id = ids.id_for(&node.path);
+        let built = build_node(node, id, ids, &walked);
+        nodes_out.push((id, built.container));
+        nodes_out.extend(built.runs);
+        if let Some(cache) = built.cache {
+            text_caches.insert(node.path.clone(), cache);
+        }
+        focus = Some(id);
+    }
+    let update = TreeUpdate {
+        nodes: nodes_out,
+        tree: None,
+        tree_id: TreeId::ROOT,
+        focus: focus?,
+    };
+    let children = spliced
+        .iter()
+        .map(|node| node.path.clone())
+        .zip(per_node_children)
+        .collect();
+    Some(SpliceResult { update, children })
+}
+
+/// Merges a splice delta into a full-tree update: same-id nodes are replaced,
+/// new ones appended, and the splice's focus wins. The full update's `tree`
+/// is untouched.
+pub fn merge_update(full: &mut TreeUpdate, splice: TreeUpdate) {
+    for (id, node) in splice.nodes {
+        match full.nodes.iter_mut().find(|(existing, _)| *existing == id) {
+            Some(slot) => slot.1 = node,
+            None => full.nodes.push((id, node)),
+        }
+    }
+    full.focus = splice.focus;
+}
+
 /// A built node: the container plus any synthesized text-run children and, for
 /// text nodes, the cache used to diff later text deltas.
 struct BuiltNode {
@@ -617,6 +727,19 @@ fn build_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoOpChanges;
+
+    impl accesskit_consumer::TreeChangeHandler for NoOpChanges {
+        fn node_added(&mut self, _: &accesskit_consumer::Node) {}
+        fn node_updated(&mut self, _: &accesskit_consumer::Node, _: &accesskit_consumer::Node) {}
+        fn focus_moved(
+            &mut self,
+            _: Option<&accesskit_consumer::Node>,
+            _: Option<&accesskit_consumer::Node>,
+        ) {}
+        fn node_removed(&mut self, _: &accesskit_consumer::Node) {}
+    }
 
     fn leaf(path: &str, role: Role, name: &str) -> MirrorNode {
         MirrorNode {
@@ -1361,5 +1484,267 @@ mod tests {
                 && close(rect.y1, expected.y1),
             "expected {expected:?}, got {rect:?}"
         );
+    }
+
+    // --- Chain splicing ---
+
+    #[test]
+    fn emitted_children_filters_to_walked_set() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/a".into(), "/lazy".into()];
+        let a = leaf("/a", Role::Panel, "");
+        let map = emitted_children(&[root, a]);
+        assert_eq!(map["/win"], vec!["/a".to_owned()]);
+        assert_eq!(map["/a"], Vec::<String>::new());
+    }
+
+    #[test]
+    fn splice_appends_chain_under_known_ancestor() {
+        let mut fresh_table = leaf("/table", Role::Table, "grid");
+        fresh_table.children = vec!["/table/cell".into()];
+        let cell = leaf("/table/cell", Role::TableCell, "A1");
+        let known: HashSet<String> = ["/win".to_owned(), "/table".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+        let table_id = ids.id_for("/table");
+
+        let result = splice_chain_update(
+            &[fresh_table, cell],
+            &[],
+            &known,
+            &mut ids,
+            &mut HashMap::new(),
+        )
+        .expect("chain splices");
+
+        let cell_id = ids.get("/table/cell").expect("cell id allocated");
+        assert_eq!(result.update.focus, cell_id);
+        assert!(result.update.tree.is_none());
+        let (_, table_node) = result
+            .update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == table_id)
+            .expect("ancestor re-emitted");
+        assert!(table_node.children().contains(&cell_id));
+        assert!(result.update.nodes.iter().any(|(id, _)| *id == cell_id));
+        assert_eq!(
+            result.children,
+            vec![
+                ("/table".to_owned(), vec!["/table/cell".to_owned()]),
+                ("/table/cell".to_owned(), Vec::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn splice_preserves_ancestor_children_absent_from_fresh_read() {
+        let mut fresh_table = leaf("/table", Role::Table, "grid");
+        fresh_table.children = vec!["/table/cell".into()];
+        let cell = leaf("/table/cell", Role::TableCell, "A1");
+        let known: HashSet<String> =
+            ["/table".to_owned(), "/table/a".to_owned(), "/table/b".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+        let a_id = ids.id_for("/table/a");
+        let b_id = ids.id_for("/table/b");
+
+        let result = splice_chain_update(
+            &[fresh_table, cell],
+            &["/table/a".to_owned(), "/table/b".to_owned()],
+            &known,
+            &mut ids,
+            &mut HashMap::new(),
+        )
+        .expect("chain splices");
+
+        let table_id = ids.get("/table").unwrap();
+        let cell_id = ids.get("/table/cell").unwrap();
+        let (_, table_node) = result
+            .update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == table_id)
+            .unwrap();
+        assert_eq!(table_node.children(), &[a_id, b_id, cell_id]);
+    }
+
+    #[test]
+    fn splice_ignores_unknown_fresh_children() {
+        let mut fresh_table = leaf("/table", Role::Table, "grid");
+        fresh_table.children =
+            vec!["/table/x1".into(), "/table/cell".into(), "/table/x2".into()];
+        let cell = leaf("/table/cell", Role::TableCell, "A1");
+        let known: HashSet<String> = ["/table".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+
+        let result =
+            splice_chain_update(&[fresh_table, cell], &[], &known, &mut ids, &mut HashMap::new())
+                .expect("chain splices");
+
+        let table_id = ids.get("/table").unwrap();
+        let cell_id = ids.get("/table/cell").unwrap();
+        let (_, table_node) = result
+            .update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == table_id)
+            .unwrap();
+        assert_eq!(table_node.children(), &[cell_id], "never-walked cells contribute nothing");
+        assert!(ids.get("/table/x1").is_none());
+    }
+
+    #[test]
+    fn splice_injects_missing_interior_link() {
+        let table = leaf("/table", Role::Table, "grid");
+        let row = leaf("/table/row", Role::Panel, "");
+        let cell = leaf("/table/row/cell", Role::TableCell, "A1");
+        let known: HashSet<String> = ["/table".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+
+        let result = splice_chain_update(
+            &[table, row, cell],
+            &[],
+            &known,
+            &mut ids,
+            &mut HashMap::new(),
+        )
+        .expect("chain splices");
+
+        let row_id = ids.get("/table/row").unwrap();
+        let cell_id = ids.get("/table/row/cell").unwrap();
+        let (_, row_node) = result
+            .update
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == row_id)
+            .expect("interior node emitted");
+        assert_eq!(row_node.children(), &[cell_id]);
+    }
+
+    #[test]
+    fn resplice_is_idempotent() {
+        let known: HashSet<String> = ["/table".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+        let build = |ids: &mut NodeIdMap| {
+            let mut fresh_table = leaf("/table", Role::Table, "grid");
+            fresh_table.children = vec!["/table/cell".into()];
+            let cell = leaf("/table/cell", Role::TableCell, "A1");
+            splice_chain_update(
+                &[fresh_table, cell],
+                &[],
+                &known,
+                ids,
+                &mut HashMap::new(),
+            )
+            .expect("chain splices")
+        };
+        let first = build(&mut ids);
+        let second = build(&mut ids);
+        assert_eq!(first.update.focus, second.update.focus);
+        assert_eq!(first.children, second.children);
+        let ids_of = |r: &SpliceResult| {
+            let mut v: Vec<_> = r.update.nodes.iter().map(|(id, _)| *id).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids_of(&first), ids_of(&second));
+    }
+
+    #[test]
+    fn splice_rejects_a_short_chain() {
+        let table = leaf("/table", Role::Table, "grid");
+        let known: HashSet<String> = ["/table".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+        assert!(splice_chain_update(&[table], &[], &known, &mut ids, &mut HashMap::new())
+            .is_none());
+        assert!(splice_chain_update(&[], &[], &known, &mut ids, &mut HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn spliced_text_node_builds_runs_and_cache() {
+        let mut fresh_doc = leaf("/doc", Role::DocumentText, "");
+        fresh_doc.children = vec!["/doc/p".into()];
+        let mut p = leaf("/doc/p", Role::Paragraph, "");
+        p.text = Some(TextState {
+            text: "hi".into(),
+            caret: None,
+            selection: None,
+            extents: None,
+        });
+        let known: HashSet<String> = ["/doc".to_owned()].into();
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+
+        let result = splice_chain_update(&[fresh_doc, p], &[], &known, &mut ids, &mut caches)
+            .expect("chain splices");
+
+        let run_id = ids.get("/doc/p#run0").expect("run id allocated");
+        assert!(result.update.nodes.iter().any(|(id, _)| *id == run_id));
+        assert!(caches.contains_key("/doc/p"), "text cache recorded for later deltas");
+    }
+
+    #[test]
+    fn merge_replaces_same_id_nodes_appends_new_and_adopts_focus() {
+        let mut ids = NodeIdMap::new();
+        let root_id = ids.id_for("/win");
+        let extra_id = ids.id_for("/extra");
+        let mut full = TreeUpdate {
+            nodes: vec![(root_id, Node::new(accesskit::Role::Window))],
+            tree: Some(Tree::new(root_id)),
+            tree_id: TreeId::ROOT,
+            focus: root_id,
+        };
+        let mut replacement = Node::new(accesskit::Role::Window);
+        replacement.set_label("fresh");
+        let splice = TreeUpdate {
+            nodes: vec![
+                (root_id, replacement),
+                (extra_id, Node::new(accesskit::Role::Cell)),
+            ],
+            tree: None,
+            tree_id: TreeId::ROOT,
+            focus: extra_id,
+        };
+
+        merge_update(&mut full, splice);
+
+        assert_eq!(full.nodes.len(), 2);
+        assert_eq!(full.nodes[0].1.label(), Some("fresh".into()));
+        assert_eq!(full.nodes[1].0, extra_id);
+        assert_eq!(full.focus, extra_id);
+        assert!(full.tree.is_some(), "merge never clears the full update's tree");
+    }
+
+    #[test]
+    fn consumer_applies_spliced_cell_focus() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/table".into()];
+        let table = leaf("/table", Role::Table, "grid");
+        let mut ids = NodeIdMap::new();
+        let mut caches = HashMap::new();
+        let full = build_window_update(&[root, table], &mut ids, &mut caches);
+        let mut tree = accesskit_consumer::Tree::new(full, false);
+
+        let mut fresh_table = leaf("/table", Role::Table, "grid");
+        fresh_table.children = vec!["/table/cell".into()];
+        let cell = leaf("/table/cell", Role::TableCell, "A1");
+        let known: HashSet<String> = ["/win".to_owned(), "/table".to_owned()].into();
+        let result = splice_chain_update(
+            &[fresh_table, cell],
+            &[],
+            &known,
+            &mut ids,
+            &mut caches,
+        )
+        .expect("chain splices");
+        let cell_id = ids.get("/table/cell").unwrap();
+
+        tree.update_and_process_changes(result.update, &mut NoOpChanges);
+
+        let state = tree.state();
+        let cell_node = state
+            .node_by_tree_local_id(cell_id, accesskit::TreeId::ROOT)
+            .expect("spliced cell present in consumer tree");
+        assert_eq!(state.focus_id_in_tree(), cell_node.id());
+        assert_eq!(cell_node.role(), accesskit::Role::Cell);
     }
 }
