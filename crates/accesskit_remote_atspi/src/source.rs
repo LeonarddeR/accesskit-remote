@@ -364,10 +364,20 @@ impl Mirror {
         };
         match selection {
             Some((anchor, focus)) => {
-                mirror::set_text_selection(conn, &target, anchor, focus).await.ok()?;
+                if let Err(e) = mirror::set_text_selection(conn, &target, anchor, focus).await {
+                    tracing::warn!(path = target.path_as_str(), "set_text_selection failed: {e}");
+                    return None;
+                }
             }
             None => {
-                mirror::perform(conn, &target, msg.action).await.ok()?;
+                if let Err(e) = mirror::perform(conn, &target, msg.action).await {
+                    tracing::warn!(
+                        action = ?msg.action,
+                        path = target.path_as_str(),
+                        "perform action failed: {e}",
+                    );
+                    return None;
+                }
             }
         }
         self.rewalk(conn, msg.window).await
