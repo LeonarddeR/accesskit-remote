@@ -10,6 +10,7 @@
 mod app_id;
 mod coalesce;
 mod focus;
+mod invalidate;
 pub mod mapping;
 mod mirror;
 pub mod reconcile;

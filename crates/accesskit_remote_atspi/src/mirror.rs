@@ -16,6 +16,7 @@ use atspi::proxy::accessible::ObjectRefExt;
 use atspi::proxy::action::ActionProxy;
 use atspi::proxy::application::ApplicationProxy;
 use atspi::proxy::component::ComponentProxy;
+use atspi::proxy::selection::SelectionProxy;
 use atspi::proxy::text::TextProxy;
 use atspi::zbus::fdo::{DBusProxy, PropertiesProxy};
 use atspi::zbus::names::{BusName, InterfaceName};
@@ -404,6 +405,57 @@ async fn read_first_selection(proxy: &TextProxy<'_>, len: usize) -> Option<(usiz
     let end = (end as usize).min(len);
     let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
     (lo != hi).then_some((lo, hi))
+}
+
+/// The outcome of reading a container's selected children.
+pub enum SelectedChildren {
+    /// The object paths of the currently selected children.
+    Paths(Vec<String>),
+    /// More children are selected than the caller's cap allows.
+    TooMany,
+    /// The object exposes no readable `Selection` interface.
+    Unavailable,
+}
+
+/// Reads the object paths of `container`'s selected children off its AT-SPI
+/// `Selection` interface, at most `cap` of them.
+pub async fn read_selected_children(
+    conn: &AccessibilityConnection,
+    container: &ObjectRefOwned,
+    cap: usize,
+) -> SelectedChildren {
+    async fn inner(
+        conn: &AccessibilityConnection,
+        container: &ObjectRefOwned,
+        cap: usize,
+    ) -> BridgeResult<SelectedChildren> {
+        let name: BusName = container.name().ok_or("null selection container")?.clone().into();
+        let proxy = SelectionProxy::builder(conn.connection())
+            .destination(name)?
+            .path(container.path().clone())?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await?;
+        let count = proxy.n_selected_children().await?;
+        if count <= 0 {
+            return Ok(SelectedChildren::Paths(Vec::new()));
+        }
+        if count as usize > cap {
+            return Ok(SelectedChildren::TooMany);
+        }
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let child = proxy.get_selected_child(index).await?;
+            if child.is_null() {
+                continue;
+            }
+            paths.push(child.path_as_str().to_owned());
+        }
+        Ok(SelectedChildren::Paths(paths))
+    }
+    inner(conn, container, cap)
+        .await
+        .unwrap_or(SelectedChildren::Unavailable)
 }
 
 /// Performs an AccessKit action on an AT-SPI object: `Click` invokes the

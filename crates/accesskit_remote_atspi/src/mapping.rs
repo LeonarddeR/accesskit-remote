@@ -907,7 +907,7 @@ pub fn refresh_node(
         container.set_children(children);
     }
     match old.text_selection() {
-        Some(selection) => container.set_text_selection(selection.clone()),
+        Some(selection) => container.set_text_selection(*selection),
         None => container.clear_text_selection(),
     }
 
@@ -1996,7 +1996,7 @@ mod tests {
         );
         let mut ids = NodeIdMap::new();
         let mut cache = WindowCache::default();
-        build_window_update(&[doc.clone()], &mut ids, &mut cache);
+        build_window_update(std::slice::from_ref(&doc), &mut ids, &mut cache);
         let id = ids.get("/doc").unwrap();
         let runs_before = cache.nodes["/doc"].children().to_vec();
         let selection_before = cache.nodes["/doc"].text_selection().cloned();
@@ -2022,7 +2022,7 @@ mod tests {
         );
         let mut ids = NodeIdMap::new();
         let mut cache = WindowCache::default();
-        build_window_update(&[doc.clone()], &mut ids, &mut cache);
+        build_window_update(std::slice::from_ref(&doc), &mut ids, &mut cache);
         let id = ids.get("/doc").unwrap();
 
         let mut fresh = doc.clone();

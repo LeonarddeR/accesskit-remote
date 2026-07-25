@@ -6,18 +6,21 @@
 use crate::app_id::AppIdResolver;
 use crate::coalesce::RewalkCoalescer;
 use crate::focus::FocusTracker;
+use crate::invalidate::{
+    property_is_mirrored, selection_refresh_targets, state_is_mirrored, NodeRefreshLimiter,
+};
 use crate::mapping::{
     build_window_update, emitted_children, focus_update, merge_update, rebuild_text_node,
-    splice_chain_update, text_offset, NodeIdMap, WindowCache,
+    refresh_node, splice_chain_update, text_offset, NodeIdMap, WindowCache,
 };
-use crate::mirror::{self, BridgeResult};
+use crate::mirror::{self, BridgeResult, SelectedChildren};
 use crate::reconcile::{reconcile_windows, WindowKey};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
 use atspi::events::object::{
-    ActiveDescendantChangedEvent, ChildrenChangedEvent, StateChangedEvent, TextCaretMovedEvent,
-    TextChangedEvent, TextSelectionChangedEvent,
+    ActiveDescendantChangedEvent, ChildrenChangedEvent, PropertyChangeEvent, SelectionChangedEvent,
+    StateChangedEvent, TextCaretMovedEvent, TextChangedEvent, TextSelectionChangedEvent,
 };
 use atspi::events::{Event, EventProperties, ObjectEvents, WindowEvents};
 use atspi::object_ref::{ObjectRef, ObjectRefOwned};
@@ -44,6 +47,19 @@ const REWALK_DEBOUNCE_QUIET: Duration = Duration::from_millis(250);
 /// A window is re-walked at most this long after the first event of a burst,
 /// even while events keep arriving.
 const REWALK_DEBOUNCE_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Minimum spacing between semantic refreshes of the same node. The first
+/// change emits immediately; changes inside this window collapse into one
+/// trailing refresh.
+const NODE_REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// A node changing continuously (a progress bar) is refreshed at least this
+/// often.
+const NODE_REFRESH_MAX_DELAY: Duration = Duration::from_millis(500);
+
+/// How many selected children a `selection-changed` will read individually
+/// before falling back to a debounced re-walk of the whole window.
+const MAX_SELECTED_CHILDREN: usize = 32;
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
@@ -176,8 +192,10 @@ async fn bridge_main(
     let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile_timer.tick().await; // Drop the immediate first tick; the initial enumeration just ran.
     let mut pending = RewalkCoalescer::new(REWALK_DEBOUNCE_QUIET, REWALK_DEBOUNCE_MAX_DELAY);
+    let mut refresh = NodeRefreshLimiter::new(NODE_REFRESH_MIN_INTERVAL, NODE_REFRESH_MAX_DELAY);
     'pump: loop {
-        let next_rewalk = pending.next_deadline();
+        // One timer arm serves both schedules; each drains whatever is due.
+        let next_timer = earliest(pending.next_deadline(), refresh.next_deadline());
         tokio::select! {
             action = actions_rx.recv() => match action {
                 Some(msg) => {
@@ -191,7 +209,10 @@ async fn bridge_main(
             },
             item = events.next() => match item {
                 Some(Ok(event)) => {
-                    for source_event in mirror.handle_atspi_event(&conn, event, &mut pending).await {
+                    let out = mirror
+                        .handle_atspi_event(&conn, event, &mut pending, &mut refresh)
+                        .await;
+                    for source_event in out {
                         if events_tx.send(source_event).is_err() {
                             break 'pump;
                         }
@@ -203,12 +224,24 @@ async fn bridge_main(
             // The sleep expression is evaluated even when the guard disables
             // the arm, so the `None` case needs a valid (never-awaited) instant.
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                next_rewalk.unwrap_or_else(|| Instant::now() + RECONCILE_INTERVAL),
-            )), if next_rewalk.is_some() => {
+                next_timer.unwrap_or_else(|| Instant::now() + RECONCILE_INTERVAL),
+            )), if next_timer.is_some() => {
+                let now = Instant::now();
                 // Events arriving while a re-walk runs queue on the event
                 // stream and re-note a fresh burst; nothing is lost.
-                for window in pending.take_due(Instant::now()) {
+                for window in pending.take_due(now) {
                     if let Some(source_event) = mirror.rewalk(&conn, window).await {
+                        if events_tx.send(source_event).is_err() {
+                            break 'pump;
+                        }
+                    }
+                }
+                let mut due: HashMap<WindowId, Vec<String>> = HashMap::new();
+                for (window, path) in refresh.take_due(now) {
+                    due.entry(window).or_default().push(path);
+                }
+                for (window, paths) in due {
+                    for source_event in mirror.refresh_paths(&conn, window, &paths).await {
                         if events_tx.send(source_event).is_err() {
                             break 'pump;
                         }
@@ -219,6 +252,7 @@ async fn bridge_main(
                 for source_event in mirror.reconcile(&conn).await {
                     if let SourceEvent::WindowRemoved(window) = &source_event {
                         pending.discard(*window);
+                        refresh.discard(*window);
                     }
                     if events_tx.send(source_event).is_err() {
                         break 'pump;
@@ -231,20 +265,35 @@ async fn bridge_main(
 
 /// Subscribes to the AT-SPI events that drive passive tree reflection:
 /// structural `children-changed`, window lifecycle/activation, `state-changed`
-/// (filtered to `:focused` in the handler), `active-descendant-changed` (focus
-/// moving within a container), and the text events that move the caret or change
-/// text/selection. The coarse `state-changed` rule also delivers unrelated state
-/// changes; the handler discards them in O(1). Text events re-query a single
-/// node and never re-walk.
+/// (`:focused` moves focus, the mirrored states refresh the node),
+/// `property-change` and `selection-changed` (also node refreshes),
+/// `active-descendant-changed` (focus moving within a container), and the text
+/// events that move the caret or change text/selection. The coarse
+/// `state-changed` and `property-change` rules also deliver changes the mapping
+/// does not forward; the handler discards those in O(1). Everything but the
+/// structural and lifecycle events re-queries single nodes and never re-walks.
+///
+/// `bounds-changed` is deliberately not registered: it fires on every resize
+/// and scroll, and bounds refresh with the re-walk.
 async fn register_events(conn: &AccessibilityConnection) -> BridgeResult<()> {
     conn.register_event::<ChildrenChangedEvent>().await?;
     conn.register_event::<WindowEvents>().await?;
     conn.register_event::<StateChangedEvent>().await?;
+    conn.register_event::<PropertyChangeEvent>().await?;
+    conn.register_event::<SelectionChangedEvent>().await?;
     conn.register_event::<ActiveDescendantChangedEvent>().await?;
     conn.register_event::<TextCaretMovedEvent>().await?;
     conn.register_event::<TextChangedEvent>().await?;
     conn.register_event::<TextSelectionChangedEvent>().await?;
     Ok(())
+}
+
+/// The earlier of two optional deadlines.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (deadline, None) | (None, deadline) => deadline,
+    }
 }
 
 /// Authoritative mirror state: one [`WindowState`] per discovered toplevel
@@ -395,17 +444,26 @@ impl Mirror {
     /// window once its burst settles. An activate/deactivate is matched to the
     /// frame by sender and path, re-walks it immediately, and advances
     /// window-level focus.
+    ///
+    /// A mirrored state change, a mirrored property change, or a selection
+    /// change refreshes the affected node's semantics (see
+    /// [`refresh_semantics`](Self::refresh_semantics) and
+    /// [`refresh_selection`](Self::refresh_selection)), rate-limited per node by
+    /// `refresh` — structure is left to the debounced re-walk, so these paths
+    /// never mark `pending`.
     async fn handle_atspi_event(
         &mut self,
         conn: &AccessibilityConnection,
         event: Event,
         pending: &mut RewalkCoalescer,
+        refresh: &mut NodeRefreshLimiter,
     ) -> Vec<SourceEvent> {
         if is_window_lifecycle_event(&event) {
             let out = self.reconcile(conn).await;
             for source_event in &out {
                 if let SourceEvent::WindowRemoved(window) = source_event {
                     pending.discard(*window);
+                    refresh.discard(*window);
                 }
             }
             return out;
@@ -415,6 +473,28 @@ impl Mirror {
                 let enabled = ev.enabled;
                 return self.handle_focus_change(conn, &event, enabled).await;
             }
+            if !state_is_mirrored(ev.state) {
+                return Vec::new();
+            }
+            let (sender, path) = (event.sender(), event.path());
+            return self
+                .refresh_semantics(conn, sender.as_str(), path.as_str(), refresh)
+                .await;
+        }
+        if let Event::Object(ObjectEvents::PropertyChange(ev)) = &event {
+            if !property_is_mirrored(&ev.property) {
+                return Vec::new();
+            }
+            let (sender, path) = (event.sender(), event.path());
+            return self
+                .refresh_semantics(conn, sender.as_str(), path.as_str(), refresh)
+                .await;
+        }
+        if let Event::Object(ObjectEvents::SelectionChanged(_)) = &event {
+            let (sender, path) = (event.sender(), event.path());
+            return self
+                .refresh_selection(conn, sender.as_str(), path.as_str(), refresh, pending)
+                .await;
         }
         if let Event::Object(ObjectEvents::ActiveDescendantChanged(ev)) = &event {
             let sender = event.sender();
@@ -652,6 +732,144 @@ impl Mirror {
         Some(result.update)
     }
 
+    /// Re-reads one node's semantics after a state or property change and emits
+    /// a minimal delta. The node must be one the emitting app's window tree
+    /// currently holds, so an untracked object costs no bus call; the per-node
+    /// limiter decides whether to read now or schedule a trailing refresh.
+    async fn refresh_semantics(
+        &mut self,
+        conn: &AccessibilityConnection,
+        sender: &str,
+        path: &str,
+        refresh: &mut NodeRefreshLimiter,
+    ) -> Vec<SourceEvent> {
+        let Some(index) = resolve_tracked_node(&self.windows, sender, path) else {
+            return Vec::new();
+        };
+        let window = self.windows[index].id;
+        if !refresh.note(window, path, Instant::now()) {
+            return Vec::new();
+        }
+        self.refresh_paths(conn, window, &[path.to_owned()]).await
+    }
+
+    /// Reflects a container's `selection-changed` by re-reading the children
+    /// whose `selected` state can have moved: those the client currently shows
+    /// as selected, plus those the container now reports. A container with more
+    /// than [`MAX_SELECTED_CHILDREN`] selected falls back to the debounced
+    /// re-walk.
+    async fn refresh_selection(
+        &mut self,
+        conn: &AccessibilityConnection,
+        sender: &str,
+        path: &str,
+        refresh: &mut NodeRefreshLimiter,
+        pending: &mut RewalkCoalescer,
+    ) -> Vec<SourceEvent> {
+        let Some(index) = resolve_tracked_node(&self.windows, sender, path) else {
+            return Vec::new();
+        };
+        let state = &self.windows[index];
+        let window = state.id;
+        let Some(container) = state.ids.get(path).and_then(|id| state.objects.get(&id)).cloned()
+        else {
+            return Vec::new();
+        };
+        let emitted = state.children.get(path).cloned().unwrap_or_default();
+        let previously: Vec<String> = emitted
+            .iter()
+            .filter(|child| {
+                state.cache.nodes.get(*child).is_some_and(|node| node.is_selected() == Some(true))
+            })
+            .cloned()
+            .collect();
+
+        let selected = match mirror::read_selected_children(conn, &container, MAX_SELECTED_CHILDREN)
+            .await
+        {
+            SelectedChildren::Paths(paths) => paths,
+            SelectedChildren::TooMany => {
+                pending.note(window, Instant::now());
+                return Vec::new();
+            }
+            SelectedChildren::Unavailable => return Vec::new(),
+        };
+
+        let now = Instant::now();
+        let targets: Vec<String> = selection_refresh_targets(&previously, &selected)
+            .into_iter()
+            .filter(|target| emitted.iter().any(|child| child == target))
+            .filter(|target| refresh.note(window, target, now))
+            .collect();
+        self.refresh_paths(conn, window, &targets).await
+    }
+
+    /// Re-reads each path's own AT-SPI state (no text, no children) and emits
+    /// one delta of the nodes whose semantics changed. The window and its cache
+    /// are resolved *after* the reads: a re-walk between them can prune a path,
+    /// and [`refresh_node`] then declines it.
+    ///
+    /// This relies on `bridge_main` running one `select!` branch to completion —
+    /// a future `tokio::spawn` of this work would need its own guard against a
+    /// concurrent re-walk. [`refresh_text`](Self::refresh_text) has the same
+    /// shape.
+    async fn refresh_paths(
+        &mut self,
+        conn: &AccessibilityConnection,
+        window: WindowId,
+        paths: &[String],
+    ) -> Vec<SourceEvent> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        let mut fresh = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(object) = self.object_at(window, path) else {
+                continue;
+            };
+            if let Some((node, _)) = mirror::read_node(conn.connection(), &object, false).await {
+                fresh.push(node);
+            }
+        }
+        let Some(index) = self.windows.iter().position(|w| w.id == window) else {
+            return Vec::new();
+        };
+        let state = &mut self.windows[index];
+        let mut nodes = Vec::new();
+        for node in &fresh {
+            let Some(id) = state.ids.get(&node.path) else {
+                continue;
+            };
+            let Some(children) = state.children.get(&node.path).cloned() else {
+                continue;
+            };
+            if let Some(refreshed) =
+                refresh_node(node, id, &children, &mut state.ids, &mut state.cache)
+            {
+                nodes.push(refreshed);
+            }
+        }
+        if nodes.is_empty() {
+            return Vec::new();
+        }
+        vec![SourceEvent::TreeUpdate {
+            window,
+            update: accesskit::TreeUpdate {
+                nodes,
+                tree: None,
+                tree_id: accesskit::TreeId::ROOT,
+                focus: state.focus,
+            },
+        }]
+    }
+
+    /// The AT-SPI object behind one path in one window, for a targeted re-read.
+    fn object_at(&self, window: WindowId, path: &str) -> Option<ObjectRefOwned> {
+        let state = self.windows.iter().find(|w| w.id == window)?;
+        let id = state.ids.get(path)?;
+        state.objects.get(&id).cloned()
+    }
+
     /// Reflects an AT-SPI text event (caret move, text change, selection change)
     /// by re-querying just the emitting node's `Text` interface and emitting a
     /// minimal delta of the changed nodes — never a re-walk. Gated on the object
@@ -824,6 +1042,16 @@ fn resolve_focus_target(
     })
 }
 
+/// The index of the tracked window that currently holds `path` in the client's
+/// tree, for the app at `sender`. Resolution goes through `cache.nodes` — the
+/// set of nodes the client actually has — so a path the walk never emitted, or
+/// one a re-walk pruned, resolves to nothing and costs no bus read.
+fn resolve_tracked_node(windows: &[WindowState], sender: &str, path: &str) -> Option<usize> {
+    windows.iter().position(|w| {
+        w.root.name().is_some_and(|n| n.as_str() == sender) && w.cache.nodes.contains_key(path)
+    })
+}
+
 /// Builds the node-id → object map used to route actions back to AT-SPI.
 fn index_objects(
     nodes: &[crate::mapping::MirrorNode],
@@ -869,9 +1097,13 @@ mod tests {
             );
         }
         let mut children = HashMap::new();
+        let mut cache = WindowCache::default();
         if walked {
             children.insert(root_path.to_owned(), vec![node_path.to_owned()]);
             children.insert(node_path.to_owned(), Vec::new());
+            cache
+                .nodes
+                .insert(node_path.to_owned(), accesskit::Node::new(accesskit::Role::Button));
         }
         WindowState {
             id: WindowId(id),
@@ -879,7 +1111,7 @@ mod tests {
             ids,
             objects,
             focus: node_id,
-            cache: WindowCache::default(),
+            cache,
             children,
         }
     }
@@ -1056,6 +1288,37 @@ mod tests {
             vec![WindowId(1), WindowId(2)]
         );
         assert_eq!(mirror.windows_of_sender(":1.9"), Vec::<WindowId>::new());
+    }
+
+    #[test]
+    fn state_change_for_an_untracked_path_emits_nothing() {
+        // Resolution failing is what makes the handler emit nothing without
+        // costing a bus read.
+        let windows = vec![
+            window_state(1, ":1.1", "/win/1", "/win/1/check", true),
+            window_state(2, ":1.2", "/win/2", "/win/2/check", true),
+        ];
+        assert_eq!(resolve_tracked_node(&windows, ":1.1", "/win/1/check"), Some(0));
+        assert_eq!(resolve_tracked_node(&windows, ":1.2", "/win/2/check"), Some(1));
+        assert_eq!(
+            resolve_tracked_node(&windows, ":1.1", "/win/1/other"),
+            None,
+            "a path the walk never emitted"
+        );
+        assert_eq!(
+            resolve_tracked_node(&windows, ":1.9", "/win/1/check"),
+            None,
+            "an untracked app's sender"
+        );
+        assert_eq!(
+            resolve_tracked_node(&windows, ":1.1", "/win/2/check"),
+            None,
+            "another window's node under this sender"
+        );
+
+        // A node pruned from the client's tree by a re-walk resolves to nothing.
+        let pruned = vec![window_state(3, ":1.3", "/win/3", "/win/3/gone", false)];
+        assert_eq!(resolve_tracked_node(&pruned, ":1.3", "/win/3/gone"), None);
     }
 
     #[test]
