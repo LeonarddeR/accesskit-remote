@@ -537,12 +537,86 @@ for the build-up.
     adding a read.** Acceptance was merely "no slower", so phases 4-5 inherit
     real headroom. Note the timer must start at `AtspiSource::new()` — the bridge
     thread begins enumerating there.
-  - *Remaining phases 4-10*: numeric value + table coordinates (interface-gated);
-    object attributes + relations (role-gated, and the measurement that settles
-    whether GTK4 emits `level`/`posinset`/`xml-roles` at all); pure
-    `refresh_node`; live-update routing (`invalidate.rs`, the fix for
-    `state-changed:checked` being dropped today); pure `plan_action` router
-    (`drive.rs`); drive-back glue; Newton design note.
+  - *Remaining phases 4-5, 8-10*: numeric value + table coordinates
+    (interface-gated); object attributes + relations (role-gated, and the
+    measurement that settles whether GTK4 emits `level`/`posinset`/`xml-roles`
+    at all); pure `plan_action` router (`drive.rs`); drive-back glue; Newton
+    design note. Phases 6-7 are done — see the milestone below.
+
+- **MILESTONE — live semantics: phases 6 and 7 of 10 (done out of order, at the
+  user's request).** A widget's state change now reaches the client as a
+  1-node delta instead of waiting for an unrelated re-walk. Suite 104 → 118.
+  - *Phase 6 — pure `refresh_node`* (e169e92): `build_container` factored out of
+    `build_node` (everything a node's own read decides: role, label, description,
+    states, actions, bounds), then `refresh_node` diffs a fresh read against
+    `WindowCache.nodes` and emits only on change. **A refresh changes semantics
+    only, never structure**: children come from the paths the client currently
+    holds plus the node's cached run ids, so a lazy grid's 5000-cell fresh child
+    list can neither bloat the tree nor allocate ids, and the last-emitted
+    `TextSelection` carries over verbatim. **Constraint worth knowing:
+    `accesskit::Node` compares its property values in *insertion order*** (a
+    `Vec<PropertyValue>` plus an index array — `common/src/lib.rs`), so a refresh
+    must set properties through the same path and order as the walk or an
+    unchanged read would emit spuriously; sharing `build_container` is what makes
+    "unchanged ⇒ `None`" hold. 5 tests.
+  - *Phase 7 — live-update routing* (aaabeb0): pure `invalidate.rs` —
+    `state_is_mirrored` (pinned by a property test against `node_states` over all
+    44 `State` variants), `property_is_mirrored` (routed off the signal's
+    property *string*: `accessible-value` deserializes to `Property::Other`, so
+    atspi's `Property` enum is the wrong discriminator),
+    `selection_refresh_targets` (union of was- and is-selected), and
+    `NodeRefreshLimiter` keyed on `(window, path)` — leading edge plus trailing
+    (100ms quiet / 500ms cap), so a toggle is instant but a progress bar is not.
+    `source.rs` registers `PropertyChange` + `SelectionChanged` (**not**
+    `BoundsChanged`: it fires on every scroll and bounds ride the re-walk) and
+    routes each to `refresh_paths` → `read_node(with_text=false)` →
+    `refresh_node` → one `tree: None` update. Selection reads the container's
+    selected children off the `Selection` interface, capped at 32, falling back
+    to the debounced re-walk beyond that. Structure and semantics stay
+    orthogonal: these paths never mark the `RewalkCoalescer`. One timer arm
+    serves both schedules (earliest deadline, drain both on wake);
+    `WindowRemoved` discards from both. The window and cache slot are resolved
+    *after* the reads (a re-walk in between prunes the path and `refresh_node`
+    then declines it) — safe only because `bridge_main` runs one `select!` branch
+    to completion; a future `tokio::spawn` would break that. 8 tests.
+  - *Post-action re-walk debounced* (399c2b6, kept independently revertible):
+    `handle_action` marked the window in the coalescer instead of re-walking
+    inline. **A/B on gnome-text-editor, same 85-node starting tree, same New Tab
+    click:** before — 4 updates, the first at +150ms carrying the *stale*
+    85-node tree, then 121/121/120; after — 3 updates, +501ms 112 nodes, +952ms
+    112, +1754ms 111. One walk fewer per click and no stale tree reaches the
+    client (on Writer the same click cost a 5s walk).
+  - *Toggle floor* (f432d07): `node_states` derives `Toggled::False` from
+    `State::Checkable`, and **LibreOffice/gtk3 omits `Checkable` on an unchecked
+    dialog check button** — live-observed as a delta going `toggled Some(True) →
+    None`, which would drop the node's UIA Toggle pattern exactly while
+    unchecked. `build_container` now floors the five inherently-toggleable roles
+    at `Toggled::False`; a read state still wins and a plain `Button` stays
+    toggle-less.
+  - **Live verification** (new `examples/state_reflect`, PASS-gated on a small
+    delta whose `toggled`/`selected`/`expanded` actually changed *and* no full
+    re-walk of that window within a second):
+    - GTK4 checkbox (gtk4-widget-factory, `GDK_BACKEND=x11` + `xdotool` click):
+      one click → exactly one 1-node delta, `toggled False → True`, **zero** full
+      walks. A raw a11y-bus monitor over the same click shows the entire traffic:
+      2 `StateChanged` signals (`checked`, `indeterminate`) and 6 read round
+      trips each — the second read emitted nothing because `refresh_node` found
+      no change, which is the storm defence working.
+    - LibreOffice/gtk3 (VCL): two 1-node deltas as a dialog checkbox toggled off
+      and back on.
+    - GTK4 selection (tab switch): two 1-node deltas — the old tab
+      `selected true → false`, the new one `false → true`.
+  - **Toolkit findings.** (i) **GTK4 emits no `object:selection-changed`** for a
+    tab switch — a bus monitor over the click shows only `state-changed:selected`
+    ×2 and `state-changed:selectable` ×2, so selection reaches us through the
+    *state* route; the `selection-changed` route is wired and unit-tested but
+    unexercised live (same class of gap as `window:create`). (ii) **A GTK4 check
+    button advertises the `Action` interface but has no action at index 0** —
+    `DoAction(0)` fails with `No action with index 0`. (iii) **VCL exposes its
+    toolbar toggle actions with empty names** (`actions=[""]`). (ii)+(iii)
+    together settle phase 8's design: the router must try a *named* action and an
+    *index*, in order. `examples/click_probe` now installs a tracing subscriber
+    (that is how (ii) surfaced) and prints each update's shape and latency.
 
 ## Remaining
 
@@ -589,8 +663,13 @@ for the build-up.
    milestone); (e) a `GetForegroundWindow` gate on
    `post_focus(true)` if RAIL testing shows Narrator/NVDA focus theft.
 6. **GTK4 action drive-back** (the "operate menus/combo boxes" half — not yet
-   started). Today `mirror::perform` wires only `Click`→`DoAction(0)` and
-   `Focus`→`grab_focus` (dead on GTK4 by design — see spikes.md). GTK4 keeps
+   started; plan phases 8-9). Today `mirror::perform` wires only
+   `Click`→`DoAction(0)` and `Focus`→`grab_focus` (dead on GTK4 by design — see
+   spikes.md). **Two measurements now constrain the router** (see the phase-6/7
+   milestone): a GTK4 check button has **no action at index 0** (`DoAction(0)` →
+   `No action with index 0`) while **VCL's toolbar toggles have empty action
+   names** — so `plan_action` must try a named action *and* an index, in order,
+   and neither alone is sufficient. GTK4 keeps
    every *action* interface (verified in upstream `gtk/a11y/`):
    `Action.DoAction`, `Selection.SelectChild`, `Value.SetCurrentValue`,
    `EditableText` — all present in `atspi-proxies 0.14`. Plan: (a) a pure
