@@ -43,6 +43,7 @@ dependencies = [
  "atspi",
  "tokio",
  "tokio-stream",
+ "tracing",
 ]
 
 [[package]]

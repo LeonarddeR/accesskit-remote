@@ -877,6 +877,47 @@ pub fn merge_update(full: &mut TreeUpdate, splice: TreeUpdate) {
     full.focus = splice.focus;
 }
 
+/// Rebuilds one node's semantics from a fresh read and diffs it against the
+/// node's last-emitted form, returning the node to emit — or `None` when
+/// nothing changed or the path is no longer in the client's tree.
+///
+/// A refresh changes semantics only, never structure: the children come from
+/// `emitted_children` (the paths the client currently holds) plus, for a text
+/// node, its cached run ids, so the fresh read's own child list is ignored and
+/// allocates no ids. The last-emitted text selection is carried over verbatim,
+/// since a refresh reads no text.
+pub fn refresh_node(
+    fresh: &MirrorNode,
+    id: NodeId,
+    emitted_children: &[String],
+    ids: &mut NodeIdMap,
+    cache: &mut WindowCache,
+) -> Option<(NodeId, Node)> {
+    let old = cache.nodes.get(&fresh.path)?.clone();
+    let runs: Vec<NodeId> = cache
+        .text
+        .get(&fresh.path)
+        .map(|text| text.runs.iter().map(|(run_id, _)| *run_id).collect())
+        .unwrap_or_default();
+
+    let mut container = build_container(fresh);
+    let mut children: Vec<NodeId> = emitted_children.iter().map(|path| ids.id_for(path)).collect();
+    children.extend(runs);
+    if !children.is_empty() {
+        container.set_children(children);
+    }
+    match old.text_selection() {
+        Some(selection) => container.set_text_selection(selection.clone()),
+        None => container.clear_text_selection(),
+    }
+
+    if container == old {
+        return None;
+    }
+    cache.nodes.insert(fresh.path.clone(), container.clone());
+    Some((id, container))
+}
+
 /// A built node: the container plus any synthesized text-run children and, for
 /// text nodes, the cache used to diff later text deltas.
 struct BuiltNode {
@@ -885,12 +926,10 @@ struct BuiltNode {
     cache: Option<TextNodeCache>,
 }
 
-fn build_node(
-    node: &MirrorNode,
-    id: NodeId,
-    ids: &mut NodeIdMap,
-    walked: &HashSet<&str>,
-) -> BuiltNode {
+/// Builds everything about a node that comes from its own AT-SPI read: role,
+/// label, description, states, actions, and bounds. Children and text selection
+/// are added by the caller, which knows the tree's structure.
+fn build_container(node: &MirrorNode) -> Node {
     let role = refine_role(map_role(node.role), node);
     let mut container = Node::new(role);
     if !node.name.is_empty() {
@@ -941,12 +980,6 @@ fn build_node(
     if let Some(orientation) = node.states.orientation {
         container.set_orientation(orientation);
     }
-    let element_children: Vec<NodeId> = node
-        .children
-        .iter()
-        .filter(|path| walked.contains(path.as_str()))
-        .map(|path| ids.id_for(path))
-        .collect();
     if node.is_actionable() && is_clickable_role(node.role) {
         container.add_action(accesskit::Action::Click);
     }
@@ -963,6 +996,22 @@ fn build_node(
             });
         }
     }
+    container
+}
+
+fn build_node(
+    node: &MirrorNode,
+    id: NodeId,
+    ids: &mut NodeIdMap,
+    walked: &HashSet<&str>,
+) -> BuiltNode {
+    let mut container = build_container(node);
+    let element_children: Vec<NodeId> = node
+        .children
+        .iter()
+        .filter(|path| walked.contains(path.as_str()))
+        .map(|path| ids.id_for(path))
+        .collect();
     match &node.text {
         Some(state) => {
             let (runs, layout) = build_text_runs(
@@ -1855,6 +1904,140 @@ mod tests {
         let delta = rebuild_text_node(&mut caches, "/doc", &shorter, &mut ids);
         let (_, parent) = delta.iter().find(|(id, _)| *id == node_id).unwrap();
         assert_eq!(parent.children().len(), 1, "container children shrink to one run");
+    }
+
+    // --- Per-node refresh ---
+
+    #[test]
+    fn refresh_node_returns_nothing_when_the_read_is_unchanged() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/a".into()];
+        let mut check = leaf("/a", Role::CheckBox, "Check");
+        check.states.toggled = Some(accesskit::Toggled::False);
+        check.states.focusable = true;
+        check.states.sensitive = true;
+
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        build_window_update(&[root.clone(), check.clone()], &mut ids, &mut cache);
+
+        let check_id = ids.get("/a").unwrap();
+        assert!(
+            refresh_node(&check, check_id, &[], &mut ids, &mut cache).is_none(),
+            "an identical read emits nothing"
+        );
+        let root_id = ids.get("/win").unwrap();
+        assert!(
+            refresh_node(&root, root_id, &["/a".to_owned()], &mut ids, &mut cache).is_none(),
+            "a container rebuilt with its emitted children emits nothing"
+        );
+    }
+
+    #[test]
+    fn refresh_node_emits_one_node_for_a_toggle_change() {
+        let mut check = leaf("/a", Role::CheckBox, "Check");
+        check.states.toggled = Some(accesskit::Toggled::False);
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        build_window_update(&[check.clone()], &mut ids, &mut cache);
+        let id = ids.get("/a").unwrap();
+
+        let mut fresh = check.clone();
+        fresh.states.toggled = Some(accesskit::Toggled::True);
+        let (emitted_id, node) =
+            refresh_node(&fresh, id, &[], &mut ids, &mut cache).expect("the toggle changed");
+
+        assert_eq!(emitted_id, id);
+        assert_eq!(node.toggled(), Some(accesskit::Toggled::True));
+        assert_eq!(
+            cache.nodes["/a"].toggled(),
+            Some(accesskit::Toggled::True),
+            "the cache advances to the emitted node"
+        );
+        assert!(
+            refresh_node(&fresh, id, &[], &mut ids, &mut cache).is_none(),
+            "re-reading the same state is a no-op"
+        );
+    }
+
+    #[test]
+    fn refresh_node_ignores_the_fresh_reads_children() {
+        let mut root = leaf("/grid", Role::Table, "Sheet");
+        root.children = vec!["/a".into(), "/b".into()];
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        build_window_update(
+            &[root.clone(), leaf("/a", Role::TableCell, "A"), leaf("/b", Role::TableCell, "B")],
+            &mut ids,
+            &mut cache,
+        );
+        let id = ids.get("/grid").unwrap();
+        let emitted = vec!["/a".to_owned(), "/b".to_owned()];
+
+        // A lazy grid's fresh read sees thousands of cells the client never got.
+        let mut fresh = root.clone();
+        fresh.children = (0..5000).map(|index| format!("/cell{index}")).collect();
+        fresh.states.busy = true;
+        let (_, node) = refresh_node(&fresh, id, &emitted, &mut ids, &mut cache).expect("busy changed");
+
+        assert_eq!(
+            node.children(),
+            &[ids.get("/a").unwrap(), ids.get("/b").unwrap()],
+            "structure comes from what the client holds"
+        );
+        assert_eq!(ids.get("/cell0"), None, "unemitted children allocate no ids");
+    }
+
+    #[test]
+    fn refresh_node_preserves_a_text_nodes_runs_and_selection() {
+        let doc = text_node(
+            "/doc",
+            TextState { text: "one\ntwo".into(), caret: Some(2), selection: None, extents: None },
+        );
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        build_window_update(&[doc.clone()], &mut ids, &mut cache);
+        let id = ids.get("/doc").unwrap();
+        let runs_before = cache.nodes["/doc"].children().to_vec();
+        let selection_before = cache.nodes["/doc"].text_selection().cloned();
+        assert_eq!(runs_before.len(), 2);
+        assert!(selection_before.is_some());
+
+        // A refresh reads no text, so `text` is None on the fresh node.
+        let mut fresh = doc.clone();
+        fresh.text = None;
+        fresh.states.read_only = true;
+        let (_, node) = refresh_node(&fresh, id, &[], &mut ids, &mut cache).expect("read_only changed");
+
+        assert!(node.is_read_only());
+        assert_eq!(node.children(), runs_before.as_slice(), "run children survive");
+        assert_eq!(node.text_selection(), selection_before.as_ref(), "selection survives");
+    }
+
+    #[test]
+    fn refresh_node_and_rebuild_text_node_share_one_cache_slot() {
+        let doc = text_node(
+            "/doc",
+            TextState { text: "a".into(), caret: Some(0), selection: None, extents: None },
+        );
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        build_window_update(&[doc.clone()], &mut ids, &mut cache);
+        let id = ids.get("/doc").unwrap();
+
+        let mut fresh = doc.clone();
+        fresh.text = None;
+        fresh.description = "Document body".into();
+        refresh_node(&fresh, id, &[], &mut ids, &mut cache).expect("the description changed");
+
+        let edited = TextState { text: "ab".into(), caret: Some(2), selection: None, extents: None };
+        let delta = rebuild_text_node(&mut cache, "/doc", &edited, &mut ids);
+        let (_, parent) = delta.iter().find(|(emitted, _)| *emitted == id).expect("container changed");
+        assert_eq!(
+            parent.description(),
+            Some("Document body"),
+            "the text rebuild diffs against the refreshed node"
+        );
     }
 
     #[test]
