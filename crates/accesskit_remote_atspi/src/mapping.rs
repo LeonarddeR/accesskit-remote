@@ -370,6 +370,19 @@ fn is_clickable_role(role: Role) -> bool {
     )
 }
 
+/// Whether a role is one whose whole purpose is to carry a checked or pressed
+/// state, so a consumer should always find one on it.
+fn is_toggleable_role(role: Role) -> bool {
+    matches!(
+        role,
+        Role::CheckBox
+            | Role::CheckMenuItem
+            | Role::RadioButton
+            | Role::RadioMenuItem
+            | Role::ToggleButton
+    )
+}
+
 /// Whether a role is an editable text field.
 fn is_editable_text_role(role: Role) -> bool {
     matches!(role, Role::Text | Role::Entry | Role::PasswordText)
@@ -942,8 +955,12 @@ fn build_container(node: &MirrorNode) -> Node {
     if !node.description.is_empty() && node.description != node.name {
         container.set_description(node.description.clone());
     }
-    if let Some(toggled) = node.states.toggled {
-        container.set_toggled(toggled);
+    match node.states.toggled {
+        Some(toggled) => container.set_toggled(toggled),
+        // A role that is inherently a toggle keeps reporting one even when the
+        // toolkit's state set carries neither Checked nor Checkable.
+        None if is_toggleable_role(node.role) => container.set_toggled(accesskit::Toggled::False),
+        None => {}
     }
     if let Some(expanded) = node.states.expanded {
         container.set_expanded(expanded);
@@ -1422,6 +1439,42 @@ mod tests {
             by_id[&ids.get("/b").unwrap()].description(),
             None,
             "a description echoing the label is dropped",
+        );
+    }
+
+    #[test]
+    fn toggleable_roles_always_report_a_toggle_state() {
+        // LibreOffice/gtk3 omits State::Checkable on an unchecked check button,
+        // so its `toggled` would collapse to None and the node would lose its
+        // UIA Toggle pattern exactly while unchecked.
+        for role in [
+            Role::CheckBox,
+            Role::CheckMenuItem,
+            Role::RadioButton,
+            Role::RadioMenuItem,
+            Role::ToggleButton,
+        ] {
+            let node = leaf("/n", role, "x");
+            assert_eq!(node.states.toggled, None, "{role:?} reads no toggle state");
+            let update = build(std::slice::from_ref(&node), &mut NodeIdMap::new());
+            assert_eq!(
+                update.nodes[0].1.toggled(),
+                Some(accesskit::Toggled::False),
+                "{role:?} still reports a toggle",
+            );
+        }
+
+        let button = leaf("/b", Role::Button, "Go");
+        let update = build(std::slice::from_ref(&button), &mut NodeIdMap::new());
+        assert_eq!(update.nodes[0].1.toggled(), None, "a plain button is not a toggle");
+
+        let mut mixed = leaf("/c", Role::CheckBox, "x");
+        mixed.states.toggled = Some(accesskit::Toggled::Mixed);
+        let update = build(std::slice::from_ref(&mixed), &mut NodeIdMap::new());
+        assert_eq!(
+            update.nodes[0].1.toggled(),
+            Some(accesskit::Toggled::Mixed),
+            "a read state wins over the floor",
         );
     }
 
