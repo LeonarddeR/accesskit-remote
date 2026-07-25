@@ -198,13 +198,7 @@ async fn bridge_main(
         let next_timer = earliest(pending.next_deadline(), refresh.next_deadline());
         tokio::select! {
             action = actions_rx.recv() => match action {
-                Some(msg) => {
-                    if let Some(event) = mirror.handle_action(&conn, msg).await {
-                        if events_tx.send(event).is_err() {
-                            break 'pump;
-                        }
-                    }
-                }
+                Some(msg) => mirror.handle_action(&conn, msg, &mut pending).await,
                 None => break 'pump,
             },
             item = events.next() => match item {
@@ -388,25 +382,38 @@ impl Mirror {
         Ok(Some((descriptor, update)))
     }
 
-    /// Performs an action on its target object, then re-walks that window and
-    /// returns the resulting full-tree update. `SetTextSelection` resolves its
-    /// anchor/focus run positions against the target's text-node layout into
-    /// global AT-SPI offsets (the run ids live in the layout, never in
-    /// `objects`, so only the container node routes through `objects`).
+    /// Performs an action on its target object, then marks the window for a
+    /// debounced re-walk. The feedback a consumer sees is the delta the
+    /// toolkit's own state/text/children events produce; the walk is the safety
+    /// net for an action a toolkit reports nothing for.
+    /// `SetTextSelection` resolves its anchor/focus run positions against the
+    /// target's text-node layout into global AT-SPI offsets (the run ids live in
+    /// the layout, never in `objects`, so only the container node routes through
+    /// `objects`).
     async fn handle_action(
         &mut self,
         conn: &AccessibilityConnection,
         msg: PerformMsg,
-    ) -> Option<SourceEvent> {
+        pending: &mut RewalkCoalescer,
+    ) {
         let (target, selection) = {
-            let window = self.windows.iter().find(|w| w.id == msg.window)?;
-            let target = window.objects.get(&msg.node)?.clone();
+            let Some(window) = self.windows.iter().find(|w| w.id == msg.window) else {
+                return;
+            };
+            let Some(target) = window.objects.get(&msg.node).cloned() else {
+                return;
+            };
             let selection = if msg.action == accesskit::Action::SetTextSelection {
-                let sel = msg.data.as_ref()?;
-                let cache = window.cache.text.get(target.path_as_str())?;
-                let anchor = text_offset(&cache.layout, &sel.anchor)?;
-                let focus = text_offset(&cache.layout, &sel.focus)?;
-                Some((anchor, focus))
+                let resolved = msg.data.as_ref().and_then(|sel| {
+                    let cache = window.cache.text.get(target.path_as_str())?;
+                    let anchor = text_offset(&cache.layout, &sel.anchor)?;
+                    let focus = text_offset(&cache.layout, &sel.focus)?;
+                    Some((anchor, focus))
+                });
+                match resolved {
+                    Some(offsets) => Some(offsets),
+                    None => return,
+                }
             } else {
                 None
             };
@@ -416,7 +423,7 @@ impl Mirror {
             Some((anchor, focus)) => {
                 if let Err(e) = mirror::set_text_selection(conn, &target, anchor, focus).await {
                     tracing::warn!(path = target.path_as_str(), "set_text_selection failed: {e}");
-                    return None;
+                    return;
                 }
             }
             None => {
@@ -426,11 +433,11 @@ impl Mirror {
                         path = target.path_as_str(),
                         "perform action failed: {e}",
                     );
-                    return None;
+                    return;
                 }
             }
         }
-        self.rewalk(conn, msg.window).await
+        pending.note(msg.window, Instant::now());
     }
 
     /// Reflects an AT-SPI event. A toplevel add/remove (see

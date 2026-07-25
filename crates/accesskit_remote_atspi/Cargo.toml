@@ -18,3 +18,4 @@ tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 accesskit_consumer = "0.38"
+tracing-subscriber.workspace = true
