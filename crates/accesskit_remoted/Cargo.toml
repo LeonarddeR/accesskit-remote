@@ -12,6 +12,8 @@ accesskit.workspace = true
 accesskit_remote.workspace = true
 accesskit_remote_server.workspace = true
 accesskit_remote_transport.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit_remote_atspi.workspace = true

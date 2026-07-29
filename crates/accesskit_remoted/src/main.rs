@@ -55,6 +55,18 @@ fn select_atspi() -> io::Result<Source> {
 }
 
 fn main() -> io::Result<()> {
+    // Level via ACCESSKIT_REMOTED_LOG (default info), mirroring the DVC
+    // plug-in's ACCESSKIT_DVC_LOG.
+    let level = std::env::var("ACCESSKIT_REMOTED_LOG")
+        .ok()
+        .and_then(|value| value.parse::<tracing::Level>().ok())
+        .unwrap_or(tracing::Level::INFO);
+    tracing_subscriber::fmt()
+        .compact()
+        .with_ansi(false)
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .init();
     let (listener, description, source) = parse_args(std::env::args().skip(1))?;
     eprintln!("accesskit_remoted: listening on {description}");
     loop {

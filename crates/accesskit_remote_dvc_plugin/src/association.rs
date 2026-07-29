@@ -39,8 +39,8 @@ pub fn normalize_rail_title<'a>(raw: &'a str, distro: &str) -> &'a str {
 }
 
 /// Match a RAIL window against the remote window list: normalized-title
-/// equality is the outer gate, then the Weston window id narrows (or vetoes)
-/// a title match, then app id disambiguates whatever remains ambiguous.
+/// equality is the outer gate, then the Weston window id narrows an
+/// ambiguous title set, then app id disambiguates whatever remains.
 /// Returns `None` when there is no match or the match stays ambiguous.
 pub fn match_window(
     rail: &RailWindow,
@@ -52,10 +52,10 @@ pub fn match_window(
         client_windows.iter().filter(|(_, info)| info.title == title).collect();
     match by_title.as_slice() {
         [] => None,
-        [(id, info)] => match (rail.weston_window_id(), info.native_window_id) {
-            (Some(rid), Some(nid)) if rid != nid => None,
-            _ => Some(*id),
-        },
+        // A lone title match binds even when its claimed id disagrees:
+        // Weston reassigns RAIL window ids on an msrdc restart without
+        // re-logging, so a stale claim must not block a unique title.
+        [(id, _)] => Some(*id),
         several => {
             if let Some(rid) = rail.weston_window_id() {
                 let claiming: Vec<WindowId> = several
@@ -226,10 +226,13 @@ mod tests {
     }
 
     #[test]
-    fn single_title_match_vetoed_by_conflicting_native_id() {
+    fn single_title_match_survives_a_conflicting_native_id() {
+        // Weston reassigns RAIL window ids on an msrdc restart without
+        // re-logging, so a lone title match with a stale claim must still
+        // bind; only ambiguous sets need a live id to resolve.
         let windows = vec![(WindowId(1), info_native("Text Editor", None, Some(5)))];
         let r = rail_with_server_id("Text Editor (Debian)", None, 0x1_0000_0009);
-        assert_eq!(match_window(&r, "Debian", &windows), None);
+        assert_eq!(match_window(&r, "Debian", &windows), Some(WindowId(1)));
     }
 
     #[test]

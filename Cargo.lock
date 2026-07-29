@@ -121,6 +121,8 @@ dependencies = [
  "accesskit_remote_atspi",
  "accesskit_remote_server",
  "accesskit_remote_transport",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
