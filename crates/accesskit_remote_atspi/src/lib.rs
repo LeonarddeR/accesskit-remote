@@ -9,6 +9,7 @@
 
 mod app_id;
 mod coalesce;
+pub mod drive;
 mod focus;
 mod invalidate;
 pub mod mapping;

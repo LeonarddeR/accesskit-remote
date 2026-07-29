@@ -1191,11 +1191,23 @@ fn build_container(node: &MirrorNode) -> Node {
     if let Some(orientation) = node.states.orientation {
         container.set_orientation(orientation);
     }
-    if node.is_actionable() && is_clickable_role(node.role) {
+    if node.is_actionable() && (is_clickable_role(node.role) || node.states.toggled.is_some()) {
         container.add_action(accesskit::Action::Click);
     }
     if node.states.focusable {
         container.add_action(accesskit::Action::Focus);
+    }
+    if node.states.expanded.is_some() {
+        container.add_action(accesskit::Action::Expand);
+        container.add_action(accesskit::Action::Collapse);
+    }
+    if node.value.is_some() {
+        container.add_action(accesskit::Action::Increment);
+        container.add_action(accesskit::Action::Decrement);
+        container.add_action(accesskit::Action::SetValue);
+    }
+    if node.interfaces.contains(Interface::EditableText) {
+        container.add_action(accesskit::Action::SetValue);
     }
     if let Some(bounds) = node.bounds {
         if bounds.width > 0 && bounds.height > 0 {
@@ -3421,5 +3433,45 @@ mod tests {
             vec![Relation { kind: RelationKind::LabelledBy, targets: vec!["/other".to_owned()] }];
         let changed = refresh_node(&retargeted, a_id, &[], &mut ids, &mut cache);
         assert!(changed.is_some(), "a retargeted relation must be re-emitted");
+    }
+
+    #[test]
+    fn build_node_declares_the_new_actions() {
+        use accesskit::Toggled;
+
+        let mut expandable = leaf("/combo", Role::ComboBox, "Font");
+        expandable.states.expanded = Some(false);
+        let mut ids = NodeIdMap::new();
+        let update = build(&[expandable], &mut ids);
+        let (_, node) = &update.nodes[0];
+        assert!(node.supports_action(accesskit::Action::Expand));
+        assert!(node.supports_action(accesskit::Action::Collapse));
+
+        let mut slider = leaf("/slider", Role::Slider, "Volume");
+        slider.interfaces.insert(Interface::Value);
+        slider.value = Some(ValueState { current: 5.0, minimum: 0.0, maximum: 10.0, step: 1.0 });
+        let mut ids = NodeIdMap::new();
+        let update = build(&[slider], &mut ids);
+        let (_, node) = &update.nodes[0];
+        assert!(node.supports_action(accesskit::Action::Increment));
+        assert!(node.supports_action(accesskit::Action::Decrement));
+        assert!(node.supports_action(accesskit::Action::SetValue));
+
+        let mut text = leaf("/text", Role::Text, "Body");
+        text.interfaces.insert(Interface::EditableText);
+        let mut ids = NodeIdMap::new();
+        let update = build(&[text], &mut ids);
+        let (_, node) = &update.nodes[0];
+        assert!(node.supports_action(accesskit::Action::SetValue));
+
+        // A GTK4 menu-button shape: Action interface plus a toggle state, but a
+        // role outside is_clickable_role.
+        let mut menu_button = leaf("/menu-button", Role::Grouping, "View");
+        menu_button.interfaces.insert(Interface::Action);
+        menu_button.states.toggled = Some(Toggled::False);
+        let mut ids = NodeIdMap::new();
+        let update = build(&[menu_button], &mut ids);
+        let (_, node) = &update.nodes[0];
+        assert!(node.supports_action(accesskit::Action::Click));
     }
 }
