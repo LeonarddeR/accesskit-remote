@@ -63,14 +63,13 @@ const MAX_SELECTED_CHILDREN: usize = 32;
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
-/// An action to perform, routed from the sync side to the bridge thread. `data`
-/// carries the [`accesskit::Action::SetTextSelection`] payload; it is `None` for
-/// actions that take none.
+/// An action to perform, routed from the sync side to the bridge thread with
+/// its request payload intact.
 struct PerformMsg {
     window: WindowId,
     action: accesskit::Action,
     node: accesskit::NodeId,
-    data: Option<accesskit::TextSelection>,
+    data: Option<accesskit::ActionData>,
 }
 
 /// A [`TreeSource`] that mirrors the live AT-SPI accessibility tree.
@@ -126,15 +125,11 @@ impl TreeSource for AtspiSource {
     }
 
     fn perform(&mut self, window: WindowId, request: &accesskit::ActionRequest) {
-        let data = match &request.data {
-            Some(accesskit::ActionData::SetTextSelection(selection)) => Some(selection.clone()),
-            _ => None,
-        };
         let _ = self.actions.send(PerformMsg {
             window,
             action: request.action,
             node: request.target_node,
-            data,
+            data: request.data.clone(),
         });
     }
 
@@ -396,6 +391,12 @@ impl Mirror {
         msg: PerformMsg,
         pending: &mut RewalkCoalescer,
     ) {
+        tracing::info!(
+            action = ?msg.action,
+            node = msg.node.0,
+            window = msg.window.0,
+            "action request",
+        );
         let (target, selection) = {
             let Some(window) = self.windows.iter().find(|w| w.id == msg.window) else {
                 return;
@@ -404,7 +405,10 @@ impl Mirror {
                 return;
             };
             let selection = if msg.action == accesskit::Action::SetTextSelection {
-                let resolved = msg.data.as_ref().and_then(|sel| {
+                let resolved = msg.data.as_ref().and_then(|data| {
+                    let accesskit::ActionData::SetTextSelection(sel) = data else {
+                        return None;
+                    };
                     let cache = window.cache.text.get(target.path_as_str())?;
                     let anchor = text_offset(&cache.layout, &sel.anchor)?;
                     let focus = text_offset(&cache.layout, &sel.focus)?;
@@ -427,7 +431,9 @@ impl Mirror {
                 }
             }
             None => {
-                if let Err(e) = mirror::perform(conn, &target, msg.action).await {
+                if let Err(e) =
+                    mirror::perform(conn, &target, msg.action, msg.data.as_ref()).await
+                {
                     tracing::warn!(
                         action = ?msg.action,
                         path = target.path_as_str(),

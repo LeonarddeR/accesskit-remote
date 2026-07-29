@@ -138,7 +138,7 @@ fn value_step(ctx: &ActionContext, direction: f64) -> Vec<AtspiCall> {
 }
 
 /// Roles that live as selectable options inside a `Selection` container.
-fn is_option_role(role: Role) -> bool {
+pub(crate) fn is_option_role(role: Role) -> bool {
     matches!(
         role,
         Role::ListItem

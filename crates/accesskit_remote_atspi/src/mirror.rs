@@ -4,6 +4,7 @@
 //! their own (the [`crate::source`] `Mirror` owns that).
 
 use crate::app_id::AppIdResolver;
+use crate::drive::{is_option_role, plan_action, ActionContext, AtspiCall};
 use crate::mapping::{
     clamp_text, has_text_caret, map_relation, node_states, parse_attributes, reads_text_runs,
     role_reads_attributes, role_reads_relations, role_reads_value, CellState, CharExtent,
@@ -18,8 +19,10 @@ use atspi::proxy::accessible::ObjectRefExt;
 use atspi::proxy::action::ActionProxy;
 use atspi::proxy::application::ApplicationProxy;
 use atspi::proxy::component::ComponentProxy;
+use atspi::proxy::editable_text::EditableTextProxy;
 use atspi::proxy::selection::SelectionProxy;
 use atspi::proxy::text::TextProxy;
+use atspi::proxy::value::ValueProxy;
 use atspi::zbus::fdo::{DBusProxy, PropertiesProxy};
 use atspi::zbus::names::{BusName, InterfaceName};
 use atspi::zbus::proxy::CacheProperties;
@@ -619,36 +622,171 @@ pub async fn read_selected_children(
         .unwrap_or(SelectedChildren::Unavailable)
 }
 
-/// Performs an AccessKit action on an AT-SPI object: `Click` invokes the
-/// object's default action, `Focus` grabs focus. Other actions are ignored.
+/// Performs an AccessKit action on an AT-SPI object. The target's shape —
+/// role, interfaces, action names, and (when the plan can use them) parent
+/// selection support and current value — is read fresh at perform time, then
+/// [`plan_action`]'s ordered calls are tried until one succeeds. A step
+/// answering `false` or an error is a decline and the next step runs; an
+/// exhausted plan and a planless action are logged, never errors.
 pub async fn perform(
     conn: &AccessibilityConnection,
     target: &ObjectRefOwned,
     action: accesskit::Action,
+    data: Option<&accesskit::ActionData>,
 ) -> BridgeResult<()> {
     let zconn = conn.connection();
+    let proxy = target.as_accessible_proxy(zconn).await?;
+    let (role, interfaces) = tokio::join!(proxy.get_role(), proxy.get_interfaces());
+    let role = role.unwrap_or(Role::Invalid);
+    let interfaces = interfaces.unwrap_or_else(|_| InterfaceSet::empty());
+    let actions = if interfaces.contains(Interface::Action) {
+        read_action_names(zconn, target).await
+    } else {
+        Vec::new()
+    };
+    let mut parent = None;
+    let mut parent_interfaces = InterfaceSet::empty();
+    let mut index_in_parent = None;
+    if matches!(action, accesskit::Action::Click | accesskit::Action::Focus)
+        && is_option_role(role)
+    {
+        if let Ok(parent_ref) = proxy.parent().await {
+            if !parent_ref.is_null() {
+                if let Ok(parent_proxy) = parent_ref.as_accessible_proxy(zconn).await {
+                    let (ifaces, index) =
+                        tokio::join!(parent_proxy.get_interfaces(), proxy.get_index_in_parent());
+                    parent_interfaces = ifaces.unwrap_or_else(|_| InterfaceSet::empty());
+                    index_in_parent = index.ok().filter(|index| *index >= 0);
+                    parent = Some(parent_ref);
+                }
+            }
+        }
+    }
+    let value = if matches!(action, accesskit::Action::Increment | accesskit::Action::Decrement)
+        && interfaces.contains(Interface::Value)
+    {
+        read_value_state(zconn, target).await
+    } else {
+        None
+    };
+    let ctx = ActionContext {
+        role,
+        interfaces,
+        actions,
+        parent_interfaces,
+        index_in_parent,
+        value,
+    };
+    let plan = plan_action(&ctx, action, data);
+    if plan.is_empty() {
+        tracing::warn!(?action, ?role, path = target.path_as_str(), "action has no plan");
+        return Ok(());
+    }
+    for step in &plan {
+        match execute_step(zconn, target, parent.as_ref(), step).await {
+            Ok(true) => {
+                tracing::debug!(?action, ?step, "action step succeeded");
+                return Ok(());
+            }
+            Ok(false) => tracing::debug!(?action, ?step, "action step declined"),
+            Err(e) => tracing::debug!(?action, ?step, "action step failed: {e}"),
+        }
+    }
+    tracing::warn!(?action, ?plan, path = target.path_as_str(), "action plan exhausted");
+    Ok(())
+}
+
+/// The target's `Action.GetActions` names, index-aligned; failures degrade to
+/// an empty list.
+async fn read_action_names(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Vec<String> {
+    let build = async {
+        let name: BusName = obj.name()?.clone().into();
+        ActionProxy::builder(zconn)
+            .destination(name)
+            .ok()?
+            .path(obj.path().clone())
+            .ok()?
+            .cache_properties(CacheProperties::No)
+            .build()
+            .await
+            .ok()
+    };
+    let Some(proxy) = build.await else {
+        return Vec::new();
+    };
+    match proxy.get_actions().await {
+        Ok(actions) => actions.into_iter().map(|action| action.name).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Attempts one planned call. `Ok(true)` is success, `Ok(false)` a decline
+/// (`DoAction`/`SelectChild`/`SetTextContents` answering `false`), and an
+/// error — a `NotSupported` reply included — counts as a decline at the
+/// caller.
+async fn execute_step(
+    zconn: &atspi::zbus::Connection,
+    target: &ObjectRefOwned,
+    parent: Option<&ObjectRefOwned>,
+    step: &AtspiCall,
+) -> BridgeResult<bool> {
     let name: BusName = target.name().ok_or("null action target")?.clone().into();
     let path = target.path().clone();
-    match action {
-        accesskit::Action::Click => {
+    match step {
+        AtspiCall::DoAction(index) => {
             let proxy = ActionProxy::builder(zconn)
                 .destination(name)?
                 .path(path)?
+                .cache_properties(CacheProperties::No)
                 .build()
                 .await?;
-            proxy.do_action(0).await?;
+            Ok(proxy.do_action(*index).await?)
         }
-        accesskit::Action::Focus => {
+        AtspiCall::GrabFocus => {
             let proxy = ComponentProxy::builder(zconn)
                 .destination(name)?
                 .path(path)?
+                .cache_properties(CacheProperties::No)
                 .build()
                 .await?;
-            proxy.grab_focus().await?;
+            Ok(proxy.grab_focus().await?)
         }
-        _ => {}
+        AtspiCall::SelectChildOfParent(index) => {
+            let Some(parent) = parent else {
+                return Ok(false);
+            };
+            let parent_name: BusName = parent.name().ok_or("null parent")?.clone().into();
+            let proxy = SelectionProxy::builder(zconn)
+                .destination(parent_name)?
+                .path(parent.path().clone())?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await?;
+            Ok(proxy.select_child(*index).await?)
+        }
+        AtspiCall::SetCurrentValue(value) => {
+            let proxy = ValueProxy::builder(zconn)
+                .destination(name)?
+                .path(path)?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await?;
+            proxy.set_current_value(*value).await?;
+            Ok(true)
+        }
+        AtspiCall::SetTextContents(text) => {
+            let proxy = EditableTextProxy::builder(zconn)
+                .destination(name)?
+                .path(path)?
+                .cache_properties(CacheProperties::No)
+                .build()
+                .await?;
+            Ok(proxy.set_text_contents(text).await?)
+        }
     }
-    Ok(())
 }
 
 /// Sets the caret or selection on a text object via its AT-SPI `Text` interface.
