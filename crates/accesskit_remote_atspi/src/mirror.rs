@@ -5,8 +5,10 @@
 
 use crate::app_id::AppIdResolver;
 use crate::mapping::{
-    clamp_text, has_text_caret, node_states, reads_text_runs, role_reads_value, CellState,
-    CharExtent, MirrorNode, TableState, TextState, ValueState, MAX_GEOMETRY_CHARS, MAX_TEXT_CHARS,
+    clamp_text, has_text_caret, map_relation, node_states, parse_attributes, reads_text_runs,
+    role_reads_attributes, role_reads_relations, role_reads_value, CellState, CharExtent,
+    MirrorNode, NodeAttributes, Relation, TableState, TextState, ValueState, MAX_GEOMETRY_CHARS,
+    MAX_TEXT_CHARS,
 };
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
@@ -201,7 +203,7 @@ pub(crate) async fn read_node(
     }
     let wants_text =
         with_text && reads_text_runs(role, !children.is_empty()) && interfaces.contains(Interface::Text);
-    let (text, bounds, value, table, cell) = tokio::join!(
+    let (text, bounds, value, table, cell, attributes, relations) = tokio::join!(
         async {
             if wants_text {
                 read_text_state(zconn, obj, has_text_caret(role), true).await
@@ -237,6 +239,23 @@ pub(crate) async fn read_node(
                 None
             }
         },
+        async {
+            if role_reads_attributes(role) {
+                match proxy.get_attributes().await {
+                    Ok(map) => parse_attributes(&map),
+                    Err(_) => NodeAttributes::default(),
+                }
+            } else {
+                NodeAttributes::default()
+            }
+        },
+        async {
+            if role_reads_relations(role) {
+                read_relations(&proxy).await
+            } else {
+                Vec::new()
+            }
+        },
     );
     let node = MirrorNode {
         path: obj.path_as_str().to_owned(),
@@ -251,8 +270,34 @@ pub(crate) async fn read_node(
         value,
         table,
         cell,
+        attributes,
+        relations,
     };
     Some((node, refs))
+}
+
+/// Reads the object's relation set and keeps the forward directions the
+/// mapping consumes ([`map_relation`]), each with its non-null target paths.
+/// A failed read, and a relation left with no target, contribute nothing.
+async fn read_relations(proxy: &atspi::proxy::accessible::AccessibleProxy<'_>) -> Vec<Relation> {
+    let Ok(set) = proxy.get_relation_set().await else {
+        return Vec::new();
+    };
+    let mut relations = Vec::new();
+    for (relation_type, targets) in set {
+        let Some(kind) = map_relation(relation_type) else {
+            continue;
+        };
+        let targets: Vec<String> = targets
+            .iter()
+            .filter(|target| !target.is_null())
+            .map(|target| target.path_as_str().to_owned())
+            .collect();
+        if !targets.is_empty() {
+            relations.push(Relation { kind, targets });
+        }
+    }
+    relations
 }
 
 /// Reads the `Accessible` interface's `Name` and `Description` in a single

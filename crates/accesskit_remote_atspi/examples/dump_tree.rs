@@ -119,6 +119,16 @@ fn main() {
                     node.column_span(),
                 ));
             }
+            if let Some(placeholder) = node.placeholder() {
+                flags.push(format!("placeholder={placeholder:?}"));
+            }
+            if !node.labelled_by().is_empty() {
+                let ids: Vec<u64> = node.labelled_by().iter().map(|id| id.0).collect();
+                flags.push(format!("labelled_by={ids:?}"));
+            }
+            if !node.controls().is_empty() {
+                flags.push(format!("controls={}", node.controls().len()));
+            }
             let has_state = toggled.is_some()
                 || expanded.is_some()
                 || selected.is_some()

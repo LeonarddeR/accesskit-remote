@@ -225,11 +225,30 @@ fn main() {
             } else {
                 Vec::new()
             };
+            let attrs = timeout(CALL, proxy.get_attributes()).await.ok().and_then(|r| r.ok());
+            let relations = timeout(CALL, proxy.get_relation_set()).await.ok().and_then(|r| r.ok());
             let indent = "  ".repeat(depth);
             println!(
                 "{indent}{role:?} {name:?} [{}] ifaces={ifaces:?} actions={actions:?}",
                 sflags.join(","),
             );
+            if let Some(map) = attrs {
+                if !map.is_empty() {
+                    let mut entries: Vec<String> =
+                        map.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    entries.sort();
+                    println!("{indent}  attrs: {}", entries.join(" "));
+                }
+            }
+            if let Some(rels) = relations {
+                if !rels.is_empty() {
+                    let parts: Vec<String> = rels
+                        .iter()
+                        .map(|(rt, targets)| format!("{rt:?}->{}", targets.len()))
+                        .collect();
+                    println!("{indent}  rels: {}", parts.join(" "));
+                }
+            }
             if ifaces.as_ref().is_some_and(|s| s.contains(Interface::TableCell)) {
                 probe_table_cell(zconn, &obj, &indent).await;
             }

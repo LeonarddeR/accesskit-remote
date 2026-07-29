@@ -54,6 +54,11 @@ impl NodeIdMap {
 /// advertises, so `interfaces` doubles as the gate for which extra reads the
 /// walk performed: `text` ⇔ `Text`, `bounds` ⇔ `Component`, `value` ⇔
 /// `Value`, `table` ⇔ `Table`, `cell` ⇔ `TableCell`.
+///
+/// `attributes` and `relations` are different: both come from the
+/// `Accessible` interface every object already advertises, so there is no
+/// interface to gate them on. Instead they are read only for roles that can
+/// carry them ([`role_reads_attributes`], [`role_reads_relations`]).
 #[derive(Debug, Clone)]
 pub struct MirrorNode {
     pub path: String,
@@ -82,6 +87,14 @@ pub struct MirrorNode {
     /// TableCell-interface position and span; `None` when the interface is
     /// absent.
     pub cell: Option<CellState>,
+    /// Presentation attributes (`placeholder-text`, `level`, `posinset`,
+    /// `setsize`); read only for roles that can carry them
+    /// ([`role_reads_attributes`]), not gated by any interface.
+    pub attributes: NodeAttributes,
+    /// AT-SPI relations targeting other objects by path, forward directions
+    /// only; read only for roles that can carry them
+    /// ([`role_reads_relations`]), not gated by any interface.
+    pub relations: Vec<Relation>,
 }
 
 impl Default for MirrorNode {
@@ -99,6 +112,8 @@ impl Default for MirrorNode {
             value: None,
             table: None,
             cell: None,
+            attributes: NodeAttributes::default(),
+            relations: Vec::new(),
         }
     }
 }
@@ -158,6 +173,36 @@ pub struct CellState {
     pub column: i32,
     pub row_span: i32,
     pub column_span: i32,
+}
+
+/// Presentation attributes read from AT-SPI's untyped object `Attributes`
+/// map, gated to the roles that can carry them ([`role_reads_attributes`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NodeAttributes {
+    pub placeholder: Option<String>,
+    pub level: Option<usize>,
+    pub position_in_set: Option<usize>,
+    pub size_of_set: Option<usize>,
+}
+
+/// One AccessKit relation this mapping consumes. AT-SPI reports relations in
+/// both directions; only the forward direction of each pair is kept
+/// ([`map_relation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    LabelledBy,
+    Controls,
+    DescribedBy,
+    Details,
+    ErrorMessage,
+    PopupFor,
+}
+
+/// One AT-SPI relation of `kind`, targeting the object paths in `targets`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relation {
+    pub kind: RelationKind,
+    pub targets: Vec<String>,
 }
 
 /// One synthesized [`Role::TextRun`] child: its node id and code-point count,
@@ -390,6 +435,25 @@ pub fn node_states(states: StateSet) -> NodeStates {
     }
 }
 
+/// Parses the AT-SPI object attributes the mapping forwards out of the
+/// interface's untyped string map: `placeholder-text`, `level`, `posinset`,
+/// and `setsize`. A value that fails to parse (or, for `placeholder-text`, is
+/// empty) is dropped to `None` rather than surfaced malformed; keys the
+/// mapping does not recognize (`toolkit`, `keyshortcuts`, `xml-roles`, ...)
+/// are ignored.
+pub fn parse_attributes(map: &HashMap<String, String>) -> NodeAttributes {
+    let count = |key: &str| map.get(key).and_then(|value| value.parse::<usize>().ok());
+    NodeAttributes {
+        placeholder: map
+            .get("placeholder-text")
+            .filter(|value| !value.is_empty())
+            .cloned(),
+        level: count("level"),
+        position_in_set: count("posinset"),
+        size_of_set: count("setsize"),
+    }
+}
+
 /// Whether a role is one whose default action a consumer should expose as
 /// Click. GTK exposes the AT-SPI Action interface on many containers, so the
 /// interface alone is too broad; this narrows it to conventionally clickable
@@ -426,6 +490,69 @@ pub(crate) fn role_reads_value(role: Role) -> bool {
             | Role::ScrollBar
             | Role::Dial
     )
+}
+
+/// Whether a role is one whose object attributes are worth reading: text
+/// inputs and other roles that can carry a placeholder, a heading or item
+/// level, or a position within a set.
+pub(crate) fn role_reads_attributes(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Text
+            | Role::PasswordText
+            | Role::Entry
+            | Role::Editbar
+            | Role::Terminal
+            | Role::Heading
+            | Role::ListItem
+            | Role::TreeItem
+            | Role::RadioButton
+            | Role::PageTab
+            | Role::TableCell
+    )
+}
+
+/// Whether a role is one whose relations are worth reading: controls and the
+/// containers/labels/targets they conventionally point at or are pointed at
+/// from.
+pub(crate) fn role_reads_relations(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Panel
+            | Role::Grouping
+            | Role::ScrollPane
+            | Role::PageTab
+            | Role::Button
+            | Role::ToggleButton
+            | Role::CheckBox
+            | Role::RadioButton
+            | Role::ComboBox
+            | Role::SpinButton
+            | Role::Slider
+            | Role::ScrollBar
+            | Role::Text
+            | Role::Entry
+            | Role::PasswordText
+            | Role::Editbar
+    )
+}
+
+/// Maps an AT-SPI [`atspi::RelationType`] to the [`RelationKind`] this mapping
+/// consumes. AT-SPI relations come in reciprocal pairs; only the forward
+/// direction of each pair the mapping cares about is kept — the reverse
+/// (`LabelFor`, `ControlledBy`, `DescriptionFor`, ...) maps to `None`, as does
+/// every relation type the mapping does not consume at all.
+pub(crate) fn map_relation(kind: atspi::RelationType) -> Option<RelationKind> {
+    use atspi::RelationType;
+    match kind {
+        RelationType::LabelledBy => Some(RelationKind::LabelledBy),
+        RelationType::ControllerFor => Some(RelationKind::Controls),
+        RelationType::DescribedBy => Some(RelationKind::DescribedBy),
+        RelationType::Details => Some(RelationKind::Details),
+        RelationType::ErrorMessage => Some(RelationKind::ErrorMessage),
+        RelationType::PopupFor => Some(RelationKind::PopupFor),
+        _ => None,
+    }
 }
 
 /// Whether a role is one whose whole purpose is to carry a checked or pressed
@@ -795,6 +922,11 @@ pub fn build_window_update(
     cache: &mut WindowCache,
 ) -> TreeUpdate {
     let walked: HashSet<&str> = nodes.iter().map(|node| node.path.as_str()).collect();
+    // Every walked path holds its id before the first node is built, so a
+    // relation target resolves whether or not the walk has reached it yet.
+    for node in nodes {
+        ids.id_for(&node.path);
+    }
     let root_id = ids.id_for(&nodes[0].path);
     let mut out = Vec::with_capacity(nodes.len());
     let mut focus = root_id;
@@ -909,6 +1041,9 @@ pub fn splice_chain_update(
     let mut nodes_out = Vec::new();
     let mut focus = None;
     for node in &spliced {
+        ids.id_for(&node.path);
+    }
+    for node in &spliced {
         let id = ids.id_for(&node.path);
         let built = build_node(node, id, ids, &walked);
         cache.nodes.insert(node.path.clone(), built.container.clone());
@@ -972,6 +1107,7 @@ pub fn refresh_node(
         .unwrap_or_default();
 
     let mut container = build_container(fresh);
+    apply_relations(&mut container, &fresh.relations, ids);
     let mut children: Vec<NodeId> = emitted_children.iter().map(|path| ids.id_for(path)).collect();
     children.extend(runs);
     if !children.is_empty() {
@@ -1107,7 +1243,48 @@ fn build_container(node: &MirrorNode) -> Node {
             container.set_column_span(cell.column_span as usize);
         }
     }
+    if let Some(placeholder) = &node.attributes.placeholder {
+        container.set_placeholder(placeholder.clone());
+    }
+    if let Some(level) = node.attributes.level {
+        container.set_level(level);
+    }
+    if let Some(position) = node.attributes.position_in_set {
+        container.set_position_in_set(position);
+    }
+    if let Some(size) = node.attributes.size_of_set {
+        container.set_size_of_set(size);
+    }
     container
+}
+
+/// Adds a node's relations to its container, resolving each target path to the
+/// id it was walked under and dropping the targets that have none — an
+/// unwalked path stays unwalked rather than gaining an id here. A relation
+/// left with no resolved target sets no property at all.
+///
+/// Runs immediately after [`build_container`] wherever a container is built,
+/// so a walk and a refresh of the same node write the same properties in the
+/// same order.
+fn apply_relations(container: &mut Node, relations: &[Relation], ids: &NodeIdMap) {
+    for relation in relations {
+        let targets: Vec<NodeId> = relation
+            .targets
+            .iter()
+            .filter_map(|path| ids.get(path))
+            .collect();
+        let Some(&first) = targets.first() else {
+            continue;
+        };
+        match relation.kind {
+            RelationKind::LabelledBy => container.set_labelled_by(targets),
+            RelationKind::Controls => container.set_controls(targets),
+            RelationKind::DescribedBy => container.set_described_by(targets),
+            RelationKind::Details => container.set_details(targets),
+            RelationKind::ErrorMessage => container.set_error_message(first),
+            RelationKind::PopupFor => {}
+        }
+    }
 }
 
 fn build_node(
@@ -1117,6 +1294,7 @@ fn build_node(
     walked: &HashSet<&str>,
 ) -> BuiltNode {
     let mut container = build_container(node);
+    apply_relations(&mut container, &node.relations, ids);
     let element_children: Vec<NodeId> = node
         .children
         .iter()
@@ -3014,5 +3192,234 @@ mod tests {
         for role in [Role::MenuItem, Role::TableCell, Role::Label, Role::Paragraph] {
             assert!(!role_reads_value(role), "{role:?} must not read Value");
         }
+    }
+
+    // --- Object attributes and relations (Phase 5) ---
+
+    #[test]
+    fn parse_attributes_reads_placeholder_level_posinset_and_setsize() {
+        let mut map = HashMap::new();
+        map.insert("placeholder-text".to_owned(), "Search…".to_owned());
+        map.insert("level".to_owned(), "2".to_owned());
+        map.insert("posinset".to_owned(), "3".to_owned());
+        map.insert("setsize".to_owned(), "9".to_owned());
+        let attrs = parse_attributes(&map);
+        assert_eq!(attrs.placeholder, Some("Search…".to_owned()));
+        assert_eq!(attrs.level, Some(2));
+        assert_eq!(attrs.position_in_set, Some(3));
+        assert_eq!(attrs.size_of_set, Some(9));
+
+        let mut bad = HashMap::new();
+        bad.insert("level".to_owned(), "x".to_owned());
+        bad.insert("placeholder-text".to_owned(), String::new());
+        bad.insert("posinset".to_owned(), "-1".to_owned());
+        let bad_attrs = parse_attributes(&bad);
+        assert_eq!(bad_attrs.level, None, "non-numeric level is dropped");
+        assert_eq!(bad_attrs.placeholder, None, "empty placeholder-text is dropped");
+        assert_eq!(bad_attrs.position_in_set, None, "negative posinset is dropped");
+
+        let mut unknown = HashMap::new();
+        unknown.insert("toolkit".to_owned(), "gtk".to_owned());
+        unknown.insert("keyshortcuts".to_owned(), "Ctrl+F".to_owned());
+        unknown.insert("xml-roles".to_owned(), "search".to_owned());
+        assert_eq!(
+            parse_attributes(&unknown),
+            NodeAttributes::default(),
+            "unrecognized keys are ignored"
+        );
+    }
+
+    #[test]
+    fn attribute_reads_are_gated_to_roles_that_can_carry_them() {
+        for role in [
+            Role::Text,
+            Role::PasswordText,
+            Role::Entry,
+            Role::Editbar,
+            Role::Terminal,
+            Role::Heading,
+            Role::ListItem,
+            Role::TreeItem,
+            Role::RadioButton,
+            Role::PageTab,
+            Role::TableCell,
+        ] {
+            assert!(role_reads_attributes(role), "{role:?} should read attributes");
+        }
+        for role in [
+            Role::MenuItem,
+            Role::CheckMenuItem,
+            Role::RadioMenuItem,
+            Role::Panel,
+            Role::Filler,
+            Role::Label,
+            Role::Paragraph,
+        ] {
+            assert!(!role_reads_attributes(role), "{role:?} should not read attributes");
+        }
+
+        for role in [
+            Role::Panel,
+            Role::Grouping,
+            Role::PageTab,
+            Role::ToggleButton,
+            Role::Button,
+            Role::CheckBox,
+            Role::RadioButton,
+            Role::Text,
+            Role::ScrollBar,
+            Role::ScrollPane,
+            Role::ComboBox,
+            Role::SpinButton,
+            Role::Slider,
+        ] {
+            assert!(role_reads_relations(role), "{role:?} should read relations");
+        }
+        for role in [
+            Role::MenuItem,
+            Role::CheckMenuItem,
+            Role::Filler,
+            Role::Label,
+            Role::Paragraph,
+            Role::ListItem,
+            Role::TableCell,
+            Role::Section,
+        ] {
+            assert!(!role_reads_relations(role), "{role:?} should not read relations");
+        }
+    }
+
+    #[test]
+    fn relations_map_to_accesskit_and_drop_unwalked_targets() {
+        let mut a = leaf("/a", Role::Panel, "A");
+        let b = leaf("/b", Role::Panel, "B");
+        a.relations = vec![
+            Relation {
+                kind: RelationKind::LabelledBy,
+                targets: vec![b.path.clone(), "/unwalked/path".to_owned()],
+            },
+            Relation { kind: RelationKind::Controls, targets: vec![b.path.clone()] },
+        ];
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[a, b], &mut ids);
+        let b_id = ids.get("/b").expect("B was walked");
+        let a_id = ids.get("/a").unwrap();
+        let a_node = &update.nodes.iter().find(|(id, _)| *id == a_id).unwrap().1;
+
+        assert_eq!(a_node.labelled_by(), &[b_id], "labelled_by resolves the walked target");
+        assert_eq!(a_node.controls(), &[b_id], "controls resolves the walked target");
+        assert_eq!(
+            ids.get("/unwalked/path"),
+            None,
+            "a relation target that was never walked allocates no id"
+        );
+    }
+
+    #[test]
+    fn forward_relations_reach_accesskit_by_kind() {
+        let mut a = leaf("/a", Role::Text, "A");
+        let target = leaf("/target", Role::Panel, "T");
+        a.relations = vec![
+            Relation { kind: RelationKind::DescribedBy, targets: vec![target.path.clone()] },
+            Relation { kind: RelationKind::Details, targets: vec![target.path.clone()] },
+            Relation { kind: RelationKind::ErrorMessage, targets: vec![target.path.clone()] },
+        ];
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[a, target], &mut ids);
+        let target_id = ids.get("/target").unwrap();
+        let a_id = ids.get("/a").unwrap();
+        let a_node = &update.nodes.iter().find(|(id, _)| *id == a_id).unwrap().1;
+
+        assert_eq!(a_node.described_by(), &[target_id]);
+        assert_eq!(a_node.details(), &[target_id]);
+        assert_eq!(a_node.error_message(), Some(target_id));
+    }
+
+    #[test]
+    fn popup_for_is_parsed_but_never_emitted() {
+        assert_eq!(map_relation(atspi::RelationType::PopupFor), Some(RelationKind::PopupFor));
+
+        let mut modal = leaf("/popup", Role::Panel, "Popup");
+        let owner = leaf("/owner", Role::Panel, "Owner");
+        modal.relations =
+            vec![Relation { kind: RelationKind::PopupFor, targets: vec![owner.path.clone()] }];
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[modal, owner], &mut ids);
+        let modal_id = ids.get("/popup").unwrap();
+        let modal_node = &update.nodes.iter().find(|(id, _)| *id == modal_id).unwrap().1;
+
+        assert!(modal_node.labelled_by().is_empty());
+        assert!(modal_node.controls().is_empty());
+        assert!(modal_node.described_by().is_empty());
+        assert!(modal_node.details().is_empty());
+        assert!(modal_node.error_message().is_none());
+    }
+
+    #[test]
+    fn map_relation_consumes_forward_directions_only() {
+        use atspi::RelationType;
+
+        for reverse in [RelationType::LabelFor, RelationType::ControlledBy, RelationType::DescriptionFor]
+        {
+            assert_eq!(map_relation(reverse), None, "{reverse:?} is the reverse direction");
+        }
+        assert_eq!(map_relation(RelationType::LabelledBy), Some(RelationKind::LabelledBy));
+        assert_eq!(map_relation(RelationType::ControllerFor), Some(RelationKind::Controls));
+        assert_eq!(map_relation(RelationType::DescribedBy), Some(RelationKind::DescribedBy));
+        assert_eq!(map_relation(RelationType::Details), Some(RelationKind::Details));
+        assert_eq!(map_relation(RelationType::ErrorMessage), Some(RelationKind::ErrorMessage));
+    }
+
+    #[test]
+    fn attributes_reach_accesskit_node_properties() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/search".into(), "/heading".into()];
+        let mut search = leaf("/search", Role::Text, "");
+        search.attributes.placeholder = Some("Search…".to_owned());
+        let mut heading = leaf("/heading", Role::Heading, "Title");
+        heading.attributes.level = Some(2);
+        heading.attributes.position_in_set = Some(3);
+        heading.attributes.size_of_set = Some(9);
+
+        let mut ids = NodeIdMap::new();
+        let update = build(&[root, search, heading], &mut ids);
+        let node = |path: &str| {
+            let id = ids.get(path).unwrap();
+            update.nodes.iter().find(|(i, _)| *i == id).unwrap().1.clone()
+        };
+
+        assert_eq!(node("/search").placeholder(), Some("Search…"));
+        assert_eq!(node("/heading").level(), Some(2));
+        assert_eq!(node("/heading").position_in_set(), Some(3));
+        assert_eq!(node("/heading").size_of_set(), Some(9));
+    }
+
+    #[test]
+    fn refresh_node_preserves_relations_on_unchanged_reads() {
+        let mut root = leaf("/win", Role::Frame, "w");
+        root.children = vec!["/a".into(), "/b".into()];
+        let mut a = leaf("/a", Role::Panel, "A");
+        let b = leaf("/b", Role::Panel, "B");
+        a.relations = vec![Relation { kind: RelationKind::LabelledBy, targets: vec![b.path.clone()] }];
+
+        let mut ids = NodeIdMap::new();
+        let mut cache = WindowCache::default();
+        build_window_update(&[root.clone(), a.clone(), b.clone()], &mut ids, &mut cache);
+        let a_id = ids.get("/a").unwrap();
+
+        // Refreshing with the identical relation set emits nothing.
+        let unchanged =
+            refresh_node(&a, a_id, &[], &mut ids, &mut cache);
+        assert!(unchanged.is_none(), "identical relation set yields no delta");
+
+        // Retargeting the relation must be picked up as a change.
+        let mut retargeted = a.clone();
+        retargeted.relations =
+            vec![Relation { kind: RelationKind::LabelledBy, targets: vec!["/other".to_owned()] }];
+        let changed = refresh_node(&retargeted, a_id, &[], &mut ids, &mut cache);
+        assert!(changed.is_some(), "a retargeted relation must be re-emitted");
     }
 }
