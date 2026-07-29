@@ -101,6 +101,24 @@ fn main() {
             if let Some(orientation) = node.orientation() {
                 flags.push(format!("{orientation:?}"));
             }
+            if let Some(value) = node.numeric_value() {
+                flags.push(format!(
+                    "value={value} range={:?}..{:?} step={:?}",
+                    node.min_numeric_value(),
+                    node.max_numeric_value(),
+                    node.numeric_value_step(),
+                ));
+            }
+            if let (Some(rows), Some(columns)) = (node.row_count(), node.column_count()) {
+                flags.push(format!("table={rows}x{columns}"));
+            }
+            if let (Some(row), Some(column)) = (node.row_index(), node.column_index()) {
+                flags.push(format!(
+                    "cell=({row},{column}) span={:?}x{:?}",
+                    node.row_span(),
+                    node.column_span(),
+                ));
+            }
             let has_state = toggled.is_some()
                 || expanded.is_some()
                 || selected.is_some()

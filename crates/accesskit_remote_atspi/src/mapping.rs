@@ -52,7 +52,8 @@ impl NodeIdMap {
 ///
 /// Each `Option` field corresponds to an AT-SPI interface the object
 /// advertises, so `interfaces` doubles as the gate for which extra reads the
-/// walk performed: `text` ⇔ `Text`, `bounds` ⇔ `Component`.
+/// walk performed: `text` ⇔ `Text`, `bounds` ⇔ `Component`, `value` ⇔
+/// `Value`, `table` ⇔ `Table`, `cell` ⇔ `TableCell`.
 #[derive(Debug, Clone)]
 pub struct MirrorNode {
     pub path: String,
@@ -71,6 +72,16 @@ pub struct MirrorNode {
     /// The object's own window-relative extents from `Component.GetExtents`;
     /// `None` when the interface is absent or the read failed.
     pub bounds: Option<CharExtent>,
+    /// Value-interface numeric range and current value; `None` when the
+    /// interface is absent or the role is not one that carries a value
+    /// ([`role_reads_value`]).
+    pub value: Option<ValueState>,
+    /// Table-interface row and column counts; `None` when the interface is
+    /// absent.
+    pub table: Option<TableState>,
+    /// TableCell-interface position and span; `None` when the interface is
+    /// absent.
+    pub cell: Option<CellState>,
 }
 
 impl Default for MirrorNode {
@@ -85,6 +96,9 @@ impl Default for MirrorNode {
             children: Vec::new(),
             text: None,
             bounds: None,
+            value: None,
+            table: None,
+            cell: None,
         }
     }
 }
@@ -116,6 +130,34 @@ pub struct CharExtent {
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+/// The AT-SPI `Value` interface state of one node: the current numeric value,
+/// the minimum and maximum of its range, and the increment one step changes
+/// it by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueState {
+    pub current: f64,
+    pub minimum: f64,
+    pub maximum: f64,
+    pub step: f64,
+}
+
+/// The AT-SPI `Table` interface's row and column counts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TableState {
+    pub rows: i32,
+    pub columns: i32,
+}
+
+/// The AT-SPI `TableCell` interface's position within its table: zero-based
+/// row and column, and the number of rows and columns it spans.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellState {
+    pub row: i32,
+    pub column: i32,
+    pub row_span: i32,
+    pub column_span: i32,
 }
 
 /// One synthesized [`Role::TextRun`] child: its node id and code-point count,
@@ -367,6 +409,22 @@ fn is_clickable_role(role: Role) -> bool {
             | Role::Link
             | Role::ListItem
             | Role::TreeItem
+    )
+}
+
+/// Whether a role conventionally carries a numeric value. LibreOffice
+/// advertises the Value interface on menu items and table cells too, where a
+/// numeric range is meaningless to a consumer, so the interface alone is too
+/// broad.
+pub(crate) fn role_reads_value(role: Role) -> bool {
+    matches!(
+        role,
+        Role::Slider
+            | Role::SpinButton
+            | Role::ProgressBar
+            | Role::LevelBar
+            | Role::ScrollBar
+            | Role::Dial
     )
 }
 
@@ -1011,6 +1069,42 @@ fn build_container(node: &MirrorNode) -> Node {
                 x1: (bounds.x + bounds.width) as f64,
                 y1: (bounds.y + bounds.height) as f64,
             });
+        }
+    }
+    if let Some(value) = node.value {
+        if value.current.is_finite() {
+            container.set_numeric_value(value.current);
+            if value.minimum.is_finite()
+                && value.maximum.is_finite()
+                && value.step.is_finite()
+                && value.minimum < value.maximum
+            {
+                container.set_min_numeric_value(value.minimum);
+                container.set_max_numeric_value(value.maximum);
+                container.set_numeric_value_step(value.step);
+            }
+        }
+    }
+    if let Some(table) = node.table {
+        if table.rows >= 0 {
+            container.set_row_count(table.rows as usize);
+        }
+        if table.columns >= 0 {
+            container.set_column_count(table.columns as usize);
+        }
+    }
+    if let Some(cell) = node.cell {
+        if cell.row >= 0 {
+            container.set_row_index(cell.row as usize);
+        }
+        if cell.column >= 0 {
+            container.set_column_index(cell.column as usize);
+        }
+        if cell.row_span > 0 {
+            container.set_row_span(cell.row_span as usize);
+        }
+        if cell.column_span > 0 {
+            container.set_column_span(cell.column_span as usize);
         }
     }
     container
@@ -2832,5 +2926,93 @@ mod tests {
             .node_by_tree_local_id(cell_id, accesskit::TreeId::ROOT)
             .expect("cell survives the merged rewalk");
         assert_eq!(state.focus_id_in_tree(), cell_node.id());
+    }
+
+    #[test]
+    fn value_interface_state_reaches_accesskit_range_properties() {
+        let mut node = leaf("/slider", Role::Slider, "Volume");
+        node.value = Some(ValueState { current: 5.0, minimum: 0.0, maximum: 10.0, step: 1.0 });
+
+        let update = build(std::slice::from_ref(&node), &mut NodeIdMap::new());
+        let built = &update.nodes[0].1;
+
+        assert_eq!(built.numeric_value(), Some(5.0));
+        assert_eq!(built.min_numeric_value(), Some(0.0));
+        assert_eq!(built.max_numeric_value(), Some(10.0));
+        assert_eq!(built.numeric_value_step(), Some(1.0));
+    }
+
+    #[test]
+    fn degenerate_value_range_emits_only_the_current_value() {
+        let mut flat_range = leaf("/flat", Role::Slider, "Flat");
+        flat_range.value = Some(ValueState { current: 3.0, minimum: 4.0, maximum: 4.0, step: 1.0 });
+
+        let mut nan_step = leaf("/nan-step", Role::Slider, "Jumpy");
+        nan_step.value =
+            Some(ValueState { current: 3.0, minimum: 0.0, maximum: 10.0, step: f64::NAN });
+
+        for node in [flat_range, nan_step] {
+            let update = build(std::slice::from_ref(&node), &mut NodeIdMap::new());
+            let built = &update.nodes[0].1;
+            assert_eq!(built.numeric_value(), Some(3.0), "{}", node.path);
+            assert_eq!(built.min_numeric_value(), None, "{}", node.path);
+            assert_eq!(built.max_numeric_value(), None, "{}", node.path);
+            assert_eq!(built.numeric_value_step(), None, "{}", node.path);
+        }
+    }
+
+    #[test]
+    fn table_counts_reach_accesskit() {
+        let mut grid = leaf("/grid", Role::Table, "Grid");
+        grid.table = Some(TableState { rows: 5, columns: 3 });
+        let update = build(std::slice::from_ref(&grid), &mut NodeIdMap::new());
+        let built = &update.nodes[0].1;
+        assert_eq!(built.row_count(), Some(5));
+        assert_eq!(built.column_count(), Some(3));
+
+        let mut negative_counts = leaf("/broken-grid", Role::Table, "Broken");
+        negative_counts.table = Some(TableState { rows: -1, columns: -1 });
+        let update = build(std::slice::from_ref(&negative_counts), &mut NodeIdMap::new());
+        let built = &update.nodes[0].1;
+        assert_eq!(built.row_count(), None);
+        assert_eq!(built.column_count(), None);
+    }
+
+    #[test]
+    fn cell_coordinates_reach_accesskit() {
+        let mut cell = leaf("/grid/cell", Role::TableCell, "A1");
+        cell.cell = Some(CellState { row: 2, column: 3, row_span: 1, column_span: 2 });
+        let update = build(std::slice::from_ref(&cell), &mut NodeIdMap::new());
+        let built = &update.nodes[0].1;
+        assert_eq!(built.row_index(), Some(2));
+        assert_eq!(built.column_index(), Some(3));
+        assert_eq!(built.row_span(), Some(1));
+        assert_eq!(built.column_span(), Some(2));
+
+        let mut spanless = leaf("/grid/spanless", Role::TableCell, "B1");
+        spanless.cell = Some(CellState { row: 4, column: 0, row_span: 0, column_span: -1 });
+        let update = build(std::slice::from_ref(&spanless), &mut NodeIdMap::new());
+        let built = &update.nodes[0].1;
+        assert_eq!(built.row_index(), Some(4));
+        assert_eq!(built.column_index(), Some(0));
+        assert_eq!(built.row_span(), None);
+        assert_eq!(built.column_span(), None);
+    }
+
+    #[test]
+    fn value_reads_are_gated_to_value_bearing_roles() {
+        for role in [
+            Role::Slider,
+            Role::SpinButton,
+            Role::ProgressBar,
+            Role::LevelBar,
+            Role::ScrollBar,
+            Role::Dial,
+        ] {
+            assert!(role_reads_value(role), "{role:?} carries a value");
+        }
+        for role in [Role::MenuItem, Role::TableCell, Role::Label, Role::Paragraph] {
+            assert!(!role_reads_value(role), "{role:?} must not read Value");
+        }
     }
 }

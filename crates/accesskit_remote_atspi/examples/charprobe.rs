@@ -100,6 +100,66 @@ fn main() {
         false
     }
 
+    /// Prints the raw `GetRowColumnSpan` reply shape and the `TableCell`
+    /// property map, so toolkit differences in the reply signature are visible
+    /// verbatim.
+    async fn probe_table_cell(zconn: &atspi::zbus::Connection, obj: &ObjectRefOwned, indent: &str) {
+        use atspi::zbus::names::InterfaceName;
+        let Some(name) = obj.name() else { return };
+        let bus: BusName = name.clone().into();
+        let reply = timeout(
+            CALL,
+            zconn.call_method(
+                Some(bus.clone()),
+                obj.path().clone(),
+                Some("org.a11y.atspi.TableCell"),
+                "GetRowColumnSpan",
+                &(),
+            ),
+        )
+        .await;
+        match reply {
+            Ok(Ok(msg)) => {
+                let body = msg.body();
+                let as5 = body.deserialize::<(bool, i32, i32, i32, i32)>();
+                let as4 = body.deserialize::<(i32, i32, i32, i32)>();
+                println!(
+                    "{indent}  GetRowColumnSpan sig={:?} as-biiii={as5:?} as-iiii={as4:?}",
+                    body.signature(),
+                );
+            }
+            Ok(Err(e)) => println!("{indent}  GetRowColumnSpan ERR {e}"),
+            Err(_) => println!("{indent}  GetRowColumnSpan TIMEOUT"),
+        }
+        let props = async {
+            let proxy = atspi::zbus::fdo::PropertiesProxy::builder(zconn)
+                .destination(bus)
+                .ok()?
+                .path(obj.path().clone())
+                .ok()?
+                .build()
+                .await
+                .ok()?;
+            timeout(
+                CALL,
+                proxy.get_all(InterfaceName::try_from("org.a11y.atspi.TableCell").ok()?),
+            )
+            .await
+            .ok()?
+            .ok()
+        }
+        .await;
+        match props {
+            Some(map) => {
+                let mut entries: Vec<String> =
+                    map.iter().map(|(k, v)| format!("{k}={v:?}")).collect();
+                entries.sort();
+                println!("{indent}  TableCell props: {}", entries.join(" "));
+            }
+            None => println!("{indent}  TableCell props: GetAll failed"),
+        }
+    }
+
     async fn walk_app(zconn: &atspi::zbus::Connection, app_ref: ObjectRefOwned) {
         let mut queue: VecDeque<(ObjectRefOwned, usize)> = VecDeque::new();
         queue.push_back((app_ref, 0));
@@ -170,6 +230,9 @@ fn main() {
                 "{indent}{role:?} {name:?} [{}] ifaces={ifaces:?} actions={actions:?}",
                 sflags.join(","),
             );
+            if ifaces.as_ref().is_some_and(|s| s.contains(Interface::TableCell)) {
+                probe_table_cell(zconn, &obj, &indent).await;
+            }
             let children = timeout(CALL, proxy.get_children())
                 .await
                 .ok()

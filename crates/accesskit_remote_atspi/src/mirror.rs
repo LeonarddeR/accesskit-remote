@@ -5,8 +5,8 @@
 
 use crate::app_id::AppIdResolver;
 use crate::mapping::{
-    clamp_text, has_text_caret, node_states, reads_text_runs, CharExtent, MirrorNode, TextState,
-    MAX_GEOMETRY_CHARS, MAX_TEXT_CHARS,
+    clamp_text, has_text_caret, node_states, reads_text_runs, role_reads_value, CellState,
+    CharExtent, MirrorNode, TableState, TextState, ValueState, MAX_GEOMETRY_CHARS, MAX_TEXT_CHARS,
 };
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
@@ -201,7 +201,7 @@ pub(crate) async fn read_node(
     }
     let wants_text =
         with_text && reads_text_runs(role, !children.is_empty()) && interfaces.contains(Interface::Text);
-    let (text, bounds) = tokio::join!(
+    let (text, bounds, value, table, cell) = tokio::join!(
         async {
             if wants_text {
                 read_text_state(zconn, obj, has_text_caret(role), true).await
@@ -212,6 +212,27 @@ pub(crate) async fn read_node(
         async {
             if interfaces.contains(Interface::Component) {
                 read_component_extents(zconn, obj).await
+            } else {
+                None
+            }
+        },
+        async {
+            if interfaces.contains(Interface::Value) && role_reads_value(role) {
+                read_value_state(zconn, obj).await
+            } else {
+                None
+            }
+        },
+        async {
+            if interfaces.contains(Interface::Table) {
+                read_table_state(zconn, obj).await
+            } else {
+                None
+            }
+        },
+        async {
+            if interfaces.contains(Interface::TableCell) {
+                read_cell_state(zconn, obj).await
             } else {
                 None
             }
@@ -227,6 +248,9 @@ pub(crate) async fn read_node(
         children,
         text,
         bounds,
+        value,
+        table,
+        cell,
     };
     Some((node, refs))
 }
@@ -389,6 +413,98 @@ async fn read_component_extents(
         .ok()?;
     let (x, y, width, height) = proxy.get_extents(CoordType::Window).await.ok()?;
     Some(CharExtent { x, y, width, height })
+}
+
+/// Reads the `Value` interface's current value and range in a single round
+/// trip via `Properties.GetAll`. Any missing or mistyped property, or a
+/// failed call, degrades to `None`.
+async fn read_value_state(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Option<ValueState> {
+    let name: BusName = obj.name()?.clone().into();
+    let proxy = PropertiesProxy::builder(zconn)
+        .destination(name)
+        .ok()?
+        .path(obj.path().clone())
+        .ok()?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    let props = proxy
+        .get_all(InterfaceName::try_from("org.a11y.atspi.Value").ok()?)
+        .await
+        .ok()?;
+    let read = |key: &str| -> Option<f64> {
+        props.get(key).cloned().and_then(|value| f64::try_from(value).ok())
+    };
+    Some(ValueState {
+        current: read("CurrentValue")?,
+        minimum: read("MinimumValue")?,
+        maximum: read("MaximumValue")?,
+        step: read("MinimumIncrement")?,
+    })
+}
+
+/// Reads the `Table` interface's row and column counts in a single round trip
+/// via `Properties.GetAll`. Any missing or mistyped property, or a failed
+/// call, degrades to `None`.
+async fn read_table_state(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Option<TableState> {
+    let name: BusName = obj.name()?.clone().into();
+    let proxy = PropertiesProxy::builder(zconn)
+        .destination(name)
+        .ok()?
+        .path(obj.path().clone())
+        .ok()?
+        .cache_properties(CacheProperties::No)
+        .build()
+        .await
+        .ok()?;
+    let props = proxy
+        .get_all(InterfaceName::try_from("org.a11y.atspi.Table").ok()?)
+        .await
+        .ok()?;
+    let read = |key: &str| -> Option<i32> {
+        props.get(key).cloned().and_then(|value| i32::try_from(value).ok())
+    };
+    Some(TableState { rows: read("NRows")?, columns: read("NColumns")? })
+}
+
+/// Reads a table cell's row/column position and span off its `TableCell`
+/// interface. The `GetRowColumnSpan` reply is decoded as either the spec's
+/// `(biiii)` (GTK4's own bridge) or at-spi2-atk's `(iiii)` without the leading
+/// validity flag; an invalid result or a failed call degrades to `None`.
+async fn read_cell_state(
+    zconn: &atspi::zbus::Connection,
+    obj: &ObjectRefOwned,
+) -> Option<CellState> {
+    let name: BusName = obj.name()?.clone().into();
+    let reply = zconn
+        .call_method(
+            Some(name),
+            obj.path().clone(),
+            Some("org.a11y.atspi.TableCell"),
+            "GetRowColumnSpan",
+            &(),
+        )
+        .await
+        .ok()?;
+    let body = reply.body();
+    let (row, column, row_span, column_span) =
+        match body.deserialize::<(bool, i32, i32, i32, i32)>() {
+            Ok((valid, row, column, row_span, column_span)) => {
+                if !valid {
+                    return None;
+                }
+                (row, column, row_span, column_span)
+            }
+            Err(_) => body.deserialize::<(i32, i32, i32, i32)>().ok()?,
+        };
+    Some(CellState { row, column, row_span, column_span })
 }
 
 /// Reads the first AT-SPI text selection as a normalized `(start, end)` with
