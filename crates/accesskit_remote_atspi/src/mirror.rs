@@ -7,9 +7,9 @@ use crate::app_id::AppIdResolver;
 use crate::drive::{is_option_role, plan_action, ActionContext, AtspiCall};
 use crate::mapping::{
     clamp_text, has_text_caret, map_relation, node_states, parse_attributes, reads_text_runs,
-    role_reads_attributes, role_reads_relations, role_reads_value, CellState, CharExtent,
-    MirrorNode, NodeAttributes, Relation, TableState, TextState, ValueState, MAX_GEOMETRY_CHARS,
-    MAX_TEXT_CHARS,
+    role_reads_attributes, role_reads_relations, role_reads_value, text_direction_from_attribute,
+    CellState, CharExtent, MirrorNode, NodeAttributes, Relation, TableState, TextState,
+    ValueState, MAX_GEOMETRY_CHARS, MAX_TEXT_CHARS,
 };
 use accesskit_remote::{AppInfo, WindowId};
 use accesskit_remote_server::WindowDescriptor;
@@ -372,11 +372,13 @@ pub(crate) async fn read_chain_to_known(
 
 /// Reads the AT-SPI `Text` interface of `obj`: its text (capped at
 /// [`MAX_TEXT_CHARS`] code points), when `with_caret` its caret offset and
-/// first selection, and when `with_geometry` its per-character window-relative
+/// first selection, when `with_geometry` its per-character window-relative
 /// extents (only up to [`MAX_GEOMETRY_CHARS`] code points — one bus call per
-/// character). All offsets are Unicode scalar value (code point) indices.
-/// Returns `None` if the text itself cannot be read; caret, selection, and
-/// extents degrade to `None` individually.
+/// character), and always its widget-level text direction off
+/// `GetDefaultAttributes`' `direction` key. All offsets are Unicode scalar
+/// value (code point) indices. Returns `None` if the text itself cannot be
+/// read; caret, selection, and extents degrade to `None` individually, and
+/// direction to left-to-right.
 pub async fn read_text_state(
     zconn: &atspi::zbus::Connection,
     obj: &ObjectRefOwned,
@@ -398,11 +400,20 @@ pub async fn read_text_state(
         .await
         .ok()?;
 
-    let count = proxy.character_count().await.ok()?.max(0);
+    // Independent of the character count the text read below needs, so it
+    // rides along with that first call rather than costing its own round trip.
+    let (count, default_attributes) =
+        tokio::join!(proxy.character_count(), proxy.get_default_attributes());
+    let count = count.ok()?.max(0);
     let capped = count.min(MAX_TEXT_CHARS as i32);
     let raw = proxy.get_text(0, capped).await.ok()?;
     let text = clamp_text(&raw).to_owned();
     let len = text.chars().count();
+
+    let direction = default_attributes
+        .ok()
+        .and_then(|attributes| attributes.get("direction").map(String::as_str).map(text_direction_from_attribute))
+        .unwrap_or(accesskit::TextDirection::LeftToRight);
 
     let (caret, selection) = if with_caret {
         let caret = proxy
@@ -422,7 +433,7 @@ pub async fn read_text_state(
         None
     };
 
-    Some(TextState { text, caret, selection, extents })
+    Some(TextState { text, caret, selection, extents, direction })
 }
 
 /// Reads one window-relative extent per code point in `[0, len)`. Any single
