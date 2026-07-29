@@ -22,6 +22,14 @@ pub struct RailWindow {
     pub app_user_model_id: Option<String>,
 }
 
+impl RailWindow {
+    /// The Weston-side window id encoded in the low 32 bits of
+    /// `server_window_id`; `None` when the property was absent (reads 0).
+    pub fn weston_window_id(&self) -> Option<u64> {
+        (self.server_window_id != 0).then(|| self.server_window_id & 0xFFFF_FFFF)
+    }
+}
+
 /// Strip WSLg's RAIL decorations from a window title: the copy-mode prefix if
 /// present, then a ` (<distro>)` suffix anchored to the known distro name.
 pub fn normalize_rail_title<'a>(raw: &'a str, distro: &str) -> &'a str {
@@ -31,7 +39,8 @@ pub fn normalize_rail_title<'a>(raw: &'a str, distro: &str) -> &'a str {
 }
 
 /// Match a RAIL window against the remote window list: normalized-title
-/// equality, disambiguated by app id when several windows share a title.
+/// equality is the outer gate, then the Weston window id narrows (or vetoes)
+/// a title match, then app id disambiguates whatever remains ambiguous.
 /// Returns `None` when there is no match or the match stays ambiguous.
 pub fn match_window(
     rail: &RailWindow,
@@ -43,8 +52,31 @@ pub fn match_window(
         client_windows.iter().filter(|(_, info)| info.title == title).collect();
     match by_title.as_slice() {
         [] => None,
-        [(id, _)] => Some(*id),
+        [(id, info)] => match (rail.weston_window_id(), info.native_window_id) {
+            (Some(rid), Some(nid)) if rid != nid => None,
+            _ => Some(*id),
+        },
         several => {
+            if let Some(rid) = rail.weston_window_id() {
+                let claiming: Vec<WindowId> = several
+                    .iter()
+                    .filter(|(_, info)| info.native_window_id == Some(rid))
+                    .map(|(id, _)| *id)
+                    .collect();
+                if let [id] = claiming.as_slice() {
+                    return Some(*id);
+                }
+                if claiming.is_empty() {
+                    let unclaimed: Vec<WindowId> = several
+                        .iter()
+                        .filter(|(_, info)| info.native_window_id.is_none())
+                        .map(|(id, _)| *id)
+                        .collect();
+                    if let [id] = unclaimed.as_slice() {
+                        return Some(*id);
+                    }
+                }
+            }
             let aumid = rail.app_user_model_id.as_deref()?;
             let by_app: Vec<WindowId> = several
                 .iter()
@@ -65,6 +97,10 @@ mod tests {
     use accesskit_remote::AppInfo;
 
     fn info(title: &str, app_id: Option<&str>) -> WindowInfo {
+        info_native(title, app_id, None)
+    }
+
+    fn info_native(title: &str, app_id: Option<&str>, native_window_id: Option<u64>) -> WindowInfo {
         WindowInfo {
             title: title.to_owned(),
             app: AppInfo {
@@ -74,7 +110,7 @@ mod tests {
                 toolkit: Some("GTK".to_owned()),
                 toolkit_version: None,
             },
-            native_window_id: None,
+            native_window_id,
         }
     }
 
@@ -108,8 +144,12 @@ mod tests {
     }
 
     fn rail(title: &str, aumid: Option<&str>) -> RailWindow {
+        rail_with_server_id(title, aumid, 0x1_0000_0005)
+    }
+
+    fn rail_with_server_id(title: &str, aumid: Option<&str>, server_window_id: u64) -> RailWindow {
         RailWindow {
-            server_window_id: 0x1_0000_0005,
+            server_window_id,
             title: title.to_owned(),
             app_user_model_id: aumid.map(str::to_owned),
         }
@@ -150,5 +190,70 @@ mod tests {
         let windows = vec![(WindowId(1), info("Files", Some("org.gnome.Nautilus")))];
         let r = rail("Text Editor (Debian)", None);
         assert_eq!(match_window(&r, "Debian", &windows), None);
+    }
+
+    #[test]
+    fn weston_window_id_masks_high_bits() {
+        let claimed = RailWindow {
+            server_window_id: 0x1_0000_0005,
+            title: String::new(),
+            app_user_model_id: None,
+        };
+        assert_eq!(claimed.weston_window_id(), Some(5));
+
+        let missing = RailWindow { server_window_id: 0, ..claimed };
+        assert_eq!(missing.weston_window_id(), None);
+    }
+
+    #[test]
+    fn match_ambiguous_resolved_by_native_window_id() {
+        let windows = vec![
+            (WindowId(1), info_native("Untitled", None, Some(5))),
+            (WindowId(2), info_native("Untitled", None, Some(9))),
+        ];
+        let r = rail_with_server_id("Untitled (Debian)", None, 0x1_0000_0009);
+        assert_eq!(match_window(&r, "Debian", &windows), Some(WindowId(2)));
+    }
+
+    #[test]
+    fn ambiguous_with_unclaimed_id_binds_sole_unclaimed_candidate() {
+        let windows = vec![
+            (WindowId(1), info_native("Untitled", None, Some(5))),
+            (WindowId(2), info_native("Untitled", None, None)),
+        ];
+        let r = rail_with_server_id("Untitled (Debian)", None, 0x1_0000_0009);
+        assert_eq!(match_window(&r, "Debian", &windows), Some(WindowId(2)));
+    }
+
+    #[test]
+    fn single_title_match_vetoed_by_conflicting_native_id() {
+        let windows = vec![(WindowId(1), info_native("Text Editor", None, Some(5)))];
+        let r = rail_with_server_id("Text Editor (Debian)", None, 0x1_0000_0009);
+        assert_eq!(match_window(&r, "Debian", &windows), None);
+    }
+
+    #[test]
+    fn single_title_match_with_matching_native_id_binds() {
+        let windows = vec![(WindowId(1), info_native("Text Editor", None, Some(5)))];
+        let r = rail_with_server_id("Text Editor (Debian)", None, 0x1_0000_0005);
+        assert_eq!(match_window(&r, "Debian", &windows), Some(WindowId(1)));
+    }
+
+    #[test]
+    fn missing_prop_degrades_to_title_matching() {
+        let unique = vec![(WindowId(1), info_native("Text Editor", None, Some(5)))];
+        let r = rail_with_server_id("Text Editor (Debian)", None, 0);
+        assert_eq!(match_window(&r, "Debian", &unique), Some(WindowId(1)));
+
+        let ambiguous = vec![
+            (WindowId(1), info("Untitled", Some("org.gnome.TextEditor"))),
+            (WindowId(2), info("Untitled", Some("org.gnome.TextEditor"))),
+        ];
+        let r = RailWindow {
+            server_window_id: 0,
+            title: "Untitled (Debian)".to_owned(),
+            app_user_model_id: Some("org.gnome.TextEditor".to_owned()),
+        };
+        assert_eq!(match_window(&r, "Debian", &ambiguous), None);
     }
 }

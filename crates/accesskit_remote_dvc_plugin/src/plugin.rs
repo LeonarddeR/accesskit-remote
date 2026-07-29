@@ -80,12 +80,16 @@ fn handle_event(client: &SharedClient, shared: &Arc<RailShared>, event: ClientEv
                 info.map(|i| i.title.as_str()),
                 info.and_then(|i| i.app.app_id.as_deref())
             );
-            let (title, app_id) = match info {
-                Some(i) => (i.title.clone(), i.app.app_id.clone()),
+            let (title, app_id, native_window_id) = match info {
+                Some(i) => (i.title.clone(), i.app.app_id.clone(), i.native_window_id),
                 None => return,
             };
             drop(locked);
-            shared.registry.lock().unwrap().window_added(window, title, app_id);
+            shared
+                .registry
+                .lock()
+                .unwrap()
+                .window_added(window, title, app_id, native_window_id);
             // A RAIL HWND whose creation events fired before this window was
             // announced sits idle; nudge it into the hook. No locks held here.
             rail::nudge_unattached_rail_windows(shared);

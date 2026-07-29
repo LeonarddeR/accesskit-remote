@@ -56,6 +56,7 @@ pub struct Registry {
 struct ClientWindow {
     title: String,
     app_id: Option<String>,
+    native_window_id: Option<u64>,
 }
 
 /// The host-focus posts to make after a remote focus change: clear the window
@@ -68,8 +69,14 @@ pub struct FocusTransition {
 }
 
 impl Registry {
-    pub fn window_added(&mut self, id: WindowId, title: String, app_id: Option<String>) {
-        self.client_windows.insert(id.0, ClientWindow { title, app_id });
+    pub fn window_added(
+        &mut self,
+        id: WindowId,
+        title: String,
+        app_id: Option<String>,
+        native_window_id: Option<u64>,
+    ) {
+        self.client_windows.insert(id.0, ClientWindow { title, app_id, native_window_id });
     }
 
     /// Forgets a remote window; returns the HWND it was bound to, if any.
@@ -129,7 +136,7 @@ impl Registry {
                             toolkit: None,
                             toolkit_version: None,
                         },
-                        native_window_id: None,
+                        native_window_id: w.native_window_id,
                     },
                 )
             })
@@ -391,7 +398,7 @@ mod tests {
     #[test]
     fn focus_to_unbound_window_records_but_posts_nothing() {
         let mut r = registry();
-        r.window_added(WindowId(1), "t".into(), None);
+        r.window_added(WindowId(1), "t".into(), None, None);
         assert_eq!(
             r.focus_changed(Some(WindowId(1))),
             FocusTransition { unfocus: None, focus: None }
@@ -457,18 +464,18 @@ mod tests {
     fn has_unbound_tracks_remote_windows_without_hwnds() {
         let mut r = registry();
         assert!(!r.has_unbound(), "empty registry has nothing unbound");
-        r.window_added(WindowId(1), "a".into(), None);
+        r.window_added(WindowId(1), "a".into(), None, None);
         assert!(r.has_unbound(), "a fresh remote window is unbound");
         r.bound.insert(1, 0x111);
         assert!(!r.has_unbound(), "a bound window no longer counts");
-        r.window_added(WindowId(2), "b".into(), None);
+        r.window_added(WindowId(2), "b".into(), None, None);
         assert!(r.has_unbound(), "a second unbound window counts again");
     }
 
     #[test]
     fn removing_the_focused_window_clears_focus_so_next_focus_has_no_stale_unfocus() {
         let mut r = registry();
-        r.window_added(WindowId(1), "a".into(), None);
+        r.window_added(WindowId(1), "a".into(), None, None);
         r.bound.insert(1, 0x111);
         r.attached.insert(0x111);
         r.focus_changed(Some(WindowId(1)));
@@ -479,5 +486,15 @@ mod tests {
             r.focus_changed(Some(WindowId(2))),
             FocusTransition { unfocus: None, focus: Some(0x222) }
         );
+    }
+
+    #[test]
+    fn unbound_windows_carry_native_window_id() {
+        let mut r = registry();
+        r.window_added(WindowId(1), "a".into(), None, Some(7));
+        let unbound = r.unbound_windows();
+        assert_eq!(unbound.len(), 1);
+        assert_eq!(unbound[0].0, WindowId(1));
+        assert_eq!(unbound[0].1.native_window_id, Some(7));
     }
 }
