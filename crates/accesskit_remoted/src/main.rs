@@ -5,6 +5,9 @@
 //! are Linux-only.
 
 mod demo;
+// Only the AT-SPI path wraps the source, so the module is unused off Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod wslg;
 
 use accesskit_remote_server::{
     apply_source_event, ServerConnection, ServerError, ServerEvent, TreeSource,
@@ -105,10 +108,17 @@ fn serve(stream: Socket, source: Source) -> io::Result<()> {
     let (mut source, name): (Box<dyn TreeSource>, &str) = match source {
         Source::Demo => (Box::new(DemoSource::new()), "accesskit_remoted-demo"),
         #[cfg(target_os = "linux")]
-        Source::Atspi => (
-            Box::new(accesskit_remote_atspi::AtspiSource::new().map_err(io::Error::other)?),
-            "accesskit_remoted-atspi",
-        ),
+        Source::Atspi => {
+            let inner = accesskit_remote_atspi::AtspiSource::new().map_err(io::Error::other)?;
+            let source: Box<dyn TreeSource> = match wslg::WestonLogTail::open_default() {
+                Some(tail) => {
+                    eprintln!("accesskit_remoted: enriching window ids from the weston log");
+                    Box::new(wslg::WslgSource::new(inner, tail))
+                }
+                None => Box::new(inner),
+            };
+            (source, "accesskit_remoted-atspi")
+        }
     };
     let mut server = ServerConnection::new(name);
     let mut writer = stream.try_clone()?;
