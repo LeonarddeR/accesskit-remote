@@ -104,6 +104,7 @@ impl Provider {
                 toolkit: Some("visible_demo".into()),
                 toolkit_version: None,
             },
+            native_window_id: None,
         }
     }
 

@@ -72,6 +72,15 @@ pub enum Message {
         window: WindowId,
         title: String,
         app: AppInfo,
+        /// The toplevel's id in the provider-side window system, when known
+        /// (WSLg: Weston's RAIL window id). A consumer may use it to pick the
+        /// right native window among same-titled candidates.
+        #[serde(
+            default,
+            rename = "nativeWindowId",
+            skip_serializing_if = "Option::is_none"
+        )]
+        native_window_id: Option<u64>,
     },
     WindowRemoved {
         window: WindowId,
@@ -161,6 +170,7 @@ mod tests {
                 toolkit: Some("GTK".into()),
                 toolkit_version: Some("4.18".into()),
             },
+            native_window_id: Some(0x8e),
         });
         assert_json_round_trip(&Message::WindowRemoved { window: WindowId(7) });
         assert_json_round_trip(&Message::TreeUpdate {
@@ -182,6 +192,30 @@ mod tests {
         });
         assert_json_round_trip(&Message::Ping { seq: 42 });
         assert_json_round_trip(&Message::Pong { seq: 42 });
+    }
+
+    #[test]
+    fn window_added_without_native_id_parses() {
+        let json = br#"{"t":"windowAdded","c":{"window":3,"title":"Doc","app":{"name":"ed"}}}"#;
+        let msg: Message = serde_json::from_slice(json).unwrap();
+        match msg {
+            Message::WindowAdded {
+                native_window_id, ..
+            } => assert_eq!(native_window_id, None),
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_added_without_native_id_serializes_without_the_field() {
+        let msg = Message::WindowAdded {
+            window: WindowId(3),
+            title: "Doc".into(),
+            app: AppInfo::default(),
+            native_window_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("nativeWindowId"), "unexpected field in {json}");
     }
 
     #[test]

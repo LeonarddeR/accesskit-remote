@@ -77,6 +77,7 @@ fn initial_sync_populates_client_stores() {
                         app_id: Some("org.gnome.TextEditor".into()),
                         ..Default::default()
                     },
+                    native_window_id: None,
                 },
                 editor_tree(),
             )],
@@ -112,6 +113,7 @@ fn incremental_update_and_pruning() {
                 id: window,
                 title: "t".into(),
                 app: AppInfo::default(),
+                native_window_id: None,
             },
             editor_tree(),
         )], None)
@@ -154,6 +156,7 @@ fn action_round_trip() {
                 id: window,
                 title: "t".into(),
                 app: AppInfo::default(),
+                native_window_id: None,
             },
             editor_tree(),
         )], None)
@@ -193,6 +196,7 @@ fn window_removal_clears_focus_and_store() {
                     id: window,
                     title: "t".into(),
                     app: AppInfo::default(),
+                    native_window_id: None,
                 },
                 editor_tree(),
             )],

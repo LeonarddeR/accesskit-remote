@@ -257,6 +257,7 @@ mod tests {
                     id: WindowId(1),
                     title: "w".into(),
                     app: AppInfo::default(),
+                    native_window_id: None,
                 },
                 tree: empty_tree(),
             }],

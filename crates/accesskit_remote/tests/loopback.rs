@@ -55,6 +55,7 @@ fn full_conversation_over_tiny_chunks() {
                 toolkit: Some("GTK".into()),
                 toolkit_version: None,
             },
+            native_window_id: Some(0x8e),
         })
         .unwrap();
     provider
@@ -72,10 +73,11 @@ fn full_conversation_over_tiny_chunks() {
     let events = pump(&mut provider, &mut consumer, 3);
     assert_eq!(events.len(), 3);
     match &events[0] {
-        SessionEvent::Message(Message::WindowAdded { window: w, title, app }) => {
+        SessionEvent::Message(Message::WindowAdded { window: w, title, app, native_window_id }) => {
             assert_eq!(*w, window);
             assert_eq!(title, "New Document (Draft) - Text Editor");
             assert_eq!(app.app_id.as_deref(), Some("org.gnome.TextEditor"));
+            assert_eq!(*native_window_id, Some(0x8e));
         }
         other => panic!("unexpected event: {other:?}"),
     }

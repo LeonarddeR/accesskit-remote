@@ -129,6 +129,7 @@ impl Registry {
                             toolkit: None,
                             toolkit_version: None,
                         },
+                        native_window_id: None,
                     },
                 )
             })

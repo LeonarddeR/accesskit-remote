@@ -24,6 +24,8 @@ pub struct WindowDescriptor {
     pub id: WindowId,
     pub title: String,
     pub app: AppInfo,
+    /// The toplevel's id in the provider-side window system, when known.
+    pub native_window_id: Option<u64>,
 }
 
 /// An incremental change reported by a tree source after initial state.
@@ -201,6 +203,7 @@ impl ServerConnection {
             window: descriptor.id,
             title: descriptor.title.clone(),
             app: descriptor.app.clone(),
+            native_window_id: descriptor.native_window_id,
         })?;
         Ok(())
     }
@@ -260,6 +263,7 @@ mod tests {
             id: WindowId(id),
             title: format!("window {id}"),
             app: AppInfo::default(),
+            native_window_id: None,
         }
     }
 

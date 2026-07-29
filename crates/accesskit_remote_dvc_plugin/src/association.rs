@@ -74,6 +74,7 @@ mod tests {
                 toolkit: Some("GTK".to_owned()),
                 toolkit_version: None,
             },
+            native_window_id: None,
         }
     }
 

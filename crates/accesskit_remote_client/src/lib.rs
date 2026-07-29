@@ -16,6 +16,8 @@ use std::collections::{HashMap, HashSet};
 pub struct WindowInfo {
     pub title: String,
     pub app: AppInfo,
+    /// The toplevel's id in the provider-side window system, when known.
+    pub native_window_id: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -211,9 +213,18 @@ impl ClientConnection {
             SessionEvent::Established { .. } => out.push(ClientEvent::Connected),
             SessionEvent::Closed { reason } => out.push(ClientEvent::Closed { reason }),
             SessionEvent::Message(msg) => match msg {
-                Message::WindowAdded { window, title, app } => {
+                Message::WindowAdded {
+                    window,
+                    title,
+                    app,
+                    native_window_id,
+                } => {
                     let entry = WindowEntry {
-                        info: WindowInfo { title, app },
+                        info: WindowInfo {
+                            title,
+                            app,
+                            native_window_id,
+                        },
                         store: TreeStore::new(),
                     };
                     if self.windows.insert(window, entry).is_some() {

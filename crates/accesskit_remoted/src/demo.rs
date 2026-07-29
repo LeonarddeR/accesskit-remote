@@ -62,6 +62,7 @@ impl TreeSource for DemoSource {
                 toolkit: Some("accesskit_remoted demo".into()),
                 toolkit_version: None,
             },
+            native_window_id: None,
         };
         (vec![(descriptor, self.full_tree())], Some(WINDOW))
     }

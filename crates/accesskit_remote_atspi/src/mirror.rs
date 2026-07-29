@@ -89,6 +89,7 @@ pub async fn discover_windows(
                     id: WindowId(0),
                     title,
                     app: app_info.clone(),
+                    native_window_id: None,
                 },
                 active: states.contains(State::Active),
             });
