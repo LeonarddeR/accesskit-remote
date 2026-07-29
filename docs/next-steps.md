@@ -1,9 +1,8 @@
 # Continuation notes
 
-State as of 2026-07-25. Environment and RDP-plumbing spike findings live in
-`docs/spikes.md`; the broad-GTK4 plan (phases 0-10) is at
-`C:\Users\LeonarddeRuijter\.claude\plans\i-want-to-continue-quiet-puffin.md`;
-per-commit history is in `git log`, summarized in the changelog at the bottom.
+State as of 2026-07-29. Environment and RDP-plumbing spike findings live in
+`docs/spikes.md`; the Newton design note is `docs/newton.md`; per-commit
+history is in `git log`, summarized in the changelog at the bottom.
 
 ## Where things stand
 
@@ -19,20 +18,25 @@ Two end-to-end milestones are proven live:
 
 | Subsystem | State |
 |---|---|
-| `accesskit_remote` | Framing, JSON codec, sans-I/O `Session` handshake |
+| `accesskit_remote` | Framing, JSON codec, sans-I/O `Session` handshake; `WindowAdded` carries an optional `nativeWindowId` |
 | `accesskit_remote_transport` | TCP + vsock listener (Linux) + hvsocket connector (Windows), verified across the WSL boundary |
-| `accesskit_remoted` | `--tcp\|--vsock [PORT]`; `--atspi` swaps `DemoSource` for `AtspiSource` (Linux-only, compiled out elsewhere) |
-| `accesskit_remote_atspi` | Roles, states, text runs + geometry, focus, caret, window lifecycle, per-node refresh, debounced re-walks |
+| `accesskit_remoted` | `--tcp\|--vsock [PORT]`; `--atspi` swaps `DemoSource` for `AtspiSource`; WSLg window-id enrichment off the weston log; tracing via `ACCESSKIT_REMOTED_LOG` |
+| `accesskit_remote_atspi` | Roles, states, text runs + geometry + widget-level direction, focus, caret, numeric value, table geometry, cell coordinates, placeholder/level/posinset/setsize, relations, window lifecycle, per-node refresh, debounced re-walks |
 | `accesskit_remote_windows` | Visible-window adapter (no visibility precondition), `post_delta` / `post_focus` via a registered window message |
-| `accesskit_remote_dvc_plugin` | Chain-loads the stock `WSLDVCPlugin.dll`, per-connection hvsocket pump, RAIL hook + idle-attach nudge, `regsvr32` install |
-| Drive-back | `Click`→`DoAction(0)`, `Focus`→`grab_focus`, `SetTextSelection`→`set_caret_offset`. Only these |
+| `accesskit_remote_dvc_plugin` | Chain-loads the stock `WSLDVCPlugin.dll`, per-connection hvsocket pump, RAIL hook + idle-attach nudge, `regsvr32` install, Weston-id-narrowed same-title matching |
+| Drive-back | `plan_action` (`drive.rs`) turns each request into an ordered call list tried until one succeeds: named-or-index `DoAction`, `Selection.SelectChild`, `Value.SetCurrentValue` (clamped, zero-step synthesis), `EditableText.SetTextContents`, `GrabFocus`, `SetCaretOffset` |
 
 **Proven live.** Initial tree over the wire; window add/remove; passive
 re-walks; window and node focus reflection; caret/text/selection reflection;
 text geometry through to real UIA TextPattern rects on the RAIL window; state
 deltas (checkbox, radio, toggle, tab selection) on both GTK4 and VCL; the Calc
 active-descendant splice; `app_id` resolution; idle attach with zero
-interaction; focus and caret drive-back against LibreOffice/gtk3.
+interaction; focus and caret drive-back against LibreOffice/gtk3. From the
+2026-07-29 E2E block on the real RAIL window: RangeValue read + SetValue
+(spinner 50→400), TogglePattern flip, TabItem selection through
+`SelectChild`, InvokePattern, `accessible-value` 1-node deltas, two
+same-titled windows attaching with distinct Weston ids, and host window
+switches arriving as remote focus transitions on the right HWNDs (item 6).
 
 **Wired and unit-tested, never exercised live.** The
 `object:selection-changed` route (GTK4 routes selection through state changes
@@ -47,50 +51,38 @@ against LO/gtk3 (ATK bridge) and fail against GTK4 by design.
 
 ## Open work
 
-1. **Phase 4 — interface-gated reads.** Numeric value and table coordinates,
-   read only where the object advertises the interface.
-2. **Phase 5 — object attributes and relations.** Role-gated. Includes the
-   measurement that settles whether GTK4 emits `level`/`posinset`/`xml-roles`
-   at all — `Switch` support depends on `xml-roles`, since `atspi-common 0.14`
-   has no such role variant.
-3. **Phases 8-9 — GTK4 action drive-back** (the "operate menus and combo boxes"
-   half). Two measurements constrain the router: a GTK4 check button has **no
-   action at index 0** (`DoAction(0)` → `No action with index 0`), while VCL's
-   toolbar toggles have **empty action names** — so `plan_action` must try a
-   named action *and* an index, in order; neither alone suffices. GTK4 does
-   implement every *action* interface (`Action.DoAction`,
-   `Selection.SelectChild`, `Value.SetCurrentValue`, `EditableText`, all
-   present in `atspi-proxies 0.14`). Plan: (a) a pure
-   `plan_action(role, interfaces, action) -> AtspiCall` in `drive.rs`, mapping
-   `Click`→`DoAction`; `Click`/`Focus` on a selectable option
-   →`Selection.SelectChild(index)`; `Expand`/`Collapse`→ named `DoAction`
-   (`menu.popup`/`Press`, falling back to an index);
-   `Increment`/`Decrement`/`SetValue`→`Value.SetCurrentValue`; `SetValue` on
-   editable text →`EditableText.SetTextContents`. (b) Thin glue in `perform`
-   building `SelectionProxy`/`ValueProxy`/`EditableTextProxy`. (c) Expose
-   Expand/Collapse on Expandable nodes and Increment/Decrement/SetValue on
-   Value-interface nodes in `build_node` so UIA offers the patterns.
-   The Linux side is TDD-able and live-verifiable here. The **unverified hop is
-   UIA→AccessKit** — which action msrdc's UIA sends per gesture. Resolve it by
-   logging incoming `msg.action` in `handle_action` (the drive-back diagnostic
-   is the instrument) while driving the RAIL window from
-   `System.Windows.Automation` (ExpandCollapse/Toggle/SelectionItem/Invoke/
-   RangeValue). Full validation needs an active Windows/msrdc session.
-4. **Phase 10 — Newton design note.** Documentation only.
-5. **Same-title window disambiguation.** AUMID equality is dead on WSLg (see
-   findings); the appId↔`WslgServerWindowId` association PDU rides the *stock*
-   plugin's channel, so a different signal is needed.
-6. **Interactive RAIL focus exercise.** `FocusChanged` → `post_focus` is wired
-   and unit-tested but only ever driven headlessly; the RAIL path is where GTK
-   actually delivers `window:activate`.
-7. **Small and conditional.**
-   - RTL text direction (`TextRun` currently hardcodes LTR).
-   - A `GetForegroundWindow` gate on `post_focus(true)` if RAIL testing shows
-     Narrator/NVDA focus theft.
+The 2026-07-29 session closed the previous list (interface-gated reads,
+attributes/relations, action drive-back, same-title disambiguation, the
+interactive RAIL focus exercise, widget-level RTL, the Newton note). What
+remains is small, conditional, or blocked on the toolkit:
+
+1. **Real screen-reader validation.** Everything is verified with UIA test
+   clients; NVDA/Narrator have not been run against a RAIL window yet.
+2. **Release workflow.** `.github/workflows/release.yml` has never executed;
+   it gets its first run on the first `v*` tag (deliberate).
+3. **Toolkit-blocked, watch upstream GTK.**
+   - Most GTK4 check/radio buttons expose no AT-SPI action — `DoAction(0)`
+     answers `No action with index 0`, so they cannot be toggled remotely
+     (two widget-factory checkboxes expose a named `Toggle` and work).
+   - GTK4 combo boxes report no expanded state, so their ExpandCollapse
+     pattern reads `LeafNode` and the UIA client refuses `Expand()` before it
+     reaches the wire. Selection-based opening works.
+   - GTK4 popover *items* materialize for some widgets (widget-factory's menu
+     button, surfaced by the post-action re-walk) and never for others
+     (gnome-text-editor's hamburger); `menu.popup` opens either way.
+   - `Component.GrabFocus`/`Text.SetCaretOffset` stay `NotSupported` on GTK4.
+4. **Small and conditional.**
+   - A `GetForegroundWindow` gate on `post_focus(true)` — condition (focus
+     theft) not observed in the live block; unbuilt.
    - The empty-field caret anchor spans the full container height; widget
      padding is ignored (approximate v1).
    - Watch for `chain=false, stock=0` recurrence — seen once during a
      double-msrdc state, not reproduced since.
+   - Same-title disambiguation is per-msrdc-session: Weston reassigns RAIL
+     window ids on a new peer session without re-logging, so ambiguous sets
+     resolve again only when their windows are recreated.
+   - Per-run RTL is unachievable over AT-SPI (GTK reports only the widget's
+     base direction); the mirror forwards that widget-level direction.
 
 ## Design constraints and toolkit findings
 
@@ -171,6 +163,28 @@ against LO/gtk3 (ATK bridge) and fail against GTK4 by design.
   character's left edge).
 - GTK4 publishes its tree only when accessibility is enabled — see the workflow
   notes for the `busctl` incantation.
+- **Attributes:** GTK4 emits `placeholder-text` (real values on text inputs)
+  and `toolkit=GTK` on every node; `keyshortcuts` exists but is empty on every
+  node; `level`/`posinset`/`setsize`/`xml-roles` are emitted by neither GTK4
+  nor LO here — `parse_attributes` still parses the set for toolkits that do.
+- **Relations:** LabelledBy/LabelFor/ControllerFor/ControlledBy pairs, hung
+  mostly on labeled *Panels* (which is why Panel/Grouping are in the relation
+  role gate); we consume forward directions only.
+- **Action names are capitalized** (`Click`, `Toggle`, `Activate`) and dotted
+  names appear at any index in namespaced lists (`menu.popup` at index 5 of a
+  GtkText's list) — named matching is case-insensitive and index-agnostic.
+  Most CheckBoxes/RadioButtons/Sliders/SpinButtons/ComboBoxes list no actions
+  at all.
+- **Popovers are opened blind.** `menu.popup` returns true and the popup maps,
+  but GTK4 emits no events for it; for some widgets the items exist in a
+  fresh walk afterwards (widget-factory's menu button — the post-action
+  debounced re-walk is what surfaces them, +33 nodes), for others they never
+  materialize (gnome-text-editor's hamburger). No popover ever appears as a
+  separate toplevel, so no window suppression/grafting is needed.
+- **Text direction is widget-level only**: the `direction` attribute in
+  `Text.GetDefaultAttributes` reports the widget's base direction ("ltr" even
+  inside Hebrew text, one uniform attribute run per buffer). The mirror
+  forwards it per text node; per-run RTL cannot exist on this bridge.
 
 ### LibreOffice / VCL
 
@@ -196,6 +210,18 @@ against LO/gtk3 (ATK bridge) and fail against GTK4 by design.
   walks against an idle app.
 - Scale reference: Writer publishes ~2100 nodes headlessly under gtk3, of which
   menus contribute ~770 MenuItems and ~520 CheckMenuItems.
+- **LO advertises `Interface::Value` on menu items and table cells** — a
+  numeric range is meaningless there, which is why the Value read is
+  role-gated (`role_reads_value`: slider/spin/progress/level-bar/scroll-bar/
+  dial). Ungated it would have put a RangeValue pattern on ~1300 Writer menu
+  items.
+- **at-spi2-atk answers `GetRowColumnSpan` with `(iiii)`** — no leading
+  validity flag — while the spec shape is `(biiii)`; `read_cell_state`
+  decodes both. The TableCell *properties* (`Position`/`RowSpan`/
+  `ColumnSpan`) also work over `Properties.GetAll` on the ATK bridge.
+- LO menu items expose one empty-named action (`actions=[""]`) — the
+  index-0 fallback is their only drive route, verified live in 50 ms
+  (`click_probe Bold`).
 
 ### AT-SPI and mirror plumbing
 
@@ -275,6 +301,32 @@ against LO/gtk3 (ATK bridge) and fail against GTK4 by design.
   (`WSLGd/main.cpp:153-185, 483-489`).
 - Default dev port is **4750**; 52017 sits inside a Hyper-V excluded TCP range
   (`netsh interface ipv4 show excludedportrange protocol=tcp`).
+- **Same-title disambiguation** rides `/mnt/wslg/weston.log`: Weston logs
+  `ClientGetAppidReq: pid:<n> appId:<s> WindowId:0x<hex>` per mapped toplevel,
+  the daemon tails it (appId-keyed ledger, FIFO, window-id dedupe), ships
+  `nativeWindowId`, and the plugin narrows ambiguous title sets against
+  `GetPropW(WslgServerWindowId) & 0xFFFF_FFFF`. **The logged pid is a
+  global-VM-namespace pid** (weston saw 10372 for user-distro pid 10311) —
+  useless for correlation; appId is the join key, and reactive pairing only
+  uses entries fresher than 10 s because the log accumulates entries for every
+  window ever mapped. LO owns no app id daemon-side while Weston resolves
+  `libreoffice-writer` — covered by the sole-fresh-entry fallback.
+- **Weston reassigns RAIL window ids on a new msrdc peer session and does not
+  re-log** `ClientGetAppidReq` — so claims go stale across an msrdc restart,
+  a lone title match must bind despite a conflicting claim, and ambiguous
+  same-title sets resolve again only when their windows are recreated.
+- **UIA gesture → AccessKit action mapping, measured on msrdc** (2026-07-29):
+  every pattern gesture is preceded by `Focus`; `Toggle`, `Invoke` and
+  `SelectionItem.Select` all arrive as `Click`; `RangeValue.SetValue` arrives
+  as `SetValue` with numeric data; `ExpandCollapse.Expand` is refused by the
+  UIA *client* layer when the provider reports `LeafNode` (GTK4 combos have
+  no expanded state) and never reaches the wire.
+- `SetForegroundWindow` from a background process is blocked by foreground
+  rights; `SwitchToThisWindow` drives real RAIL activation (verified: host
+  switches arrived as `remote focus: Some(3) → None → Some(2)`).
+- After the distribution installer's uninstall test, the dev machine has no
+  plugin registration — `regsvr32 /s target\debug\accesskit_remote_dvc_plugin.dll`
+  restores HKCU `OptionalAddIns` + `.wslgconfig`, elevation-free.
 
 ## Workflow notes
 
@@ -359,7 +411,23 @@ against LO/gtk3 (ATK bridge) and fail against GTK4 by design.
   launch app (msrdc boots, RAIL window maps, registry still empty) → start
   daemon → read `%TEMP%\AccessKitDvc.log`.
 - Plugin log level via `ACCESSKIT_DVC_LOG`; port override via
-  `ACCESSKIT_DVC_PORT`.
+  `ACCESSKIT_DVC_PORT`. Daemon log level via `ACCESSKIT_REMOTED_LOG`
+  (default info; `debug` shows every executor step); weston-log path override
+  via `ACCESSKIT_REMOTED_WESTON_LOG` (empty disables the enrichment).
+- `scripts/uia.ps1` (Windows PowerShell 5.1, run with `powershell.exe`)
+  drives the provider on RAIL windows: `list`, `tree`, `invoke`/`toggle`/
+  `expand`/`collapse`/`select -Name <substr>`, `setvalue -Name <substr>
+  -Value <n>`, `range`, `focus [-Seconds n]`, `activate -Window <substr>` —
+  all accept `-Window <title-substr>`. Pattern-state re-reads wait ~3.5 s for
+  the debounced re-walk; unnamed targets (GTK spinners) need a direct
+  `FindFirst` on the pattern-available property instead of `-Name`.
+- A fresh `wsl --shutdown` wipes `/tmp` (staged scripts included) and apps
+  launched before msrdc is up never get RAIL windows — launch apps only
+  after the first window of the boot has mapped, or relaunch them.
+- Two same-titled windows for testing: two `python3` GTK4 processes
+  (`gir1.2-gtk-4.0`) with distinct `Gtk.Application` ids and one fixed
+  window title; D-Bus activation blocks duplicate instances of the desktop
+  apps themselves.
 
 ### Traps
 
@@ -413,3 +481,10 @@ Oldest first. `git log` carries the detail.
 | 45f4659, e6bbc2d, 7296594 | Widget states; PopupMenu/PushButtonMenu roles; drive-back diagnostic |
 | 5df5c1c, 7aef483, aa35493, afa6527 | Breadth phases 0-3 — data reshape, roles, states, bus budget |
 | e169e92, aaabeb0, 399c2b6, f432d07 | Phases 6-7 — pure `refresh_node`, live-update routing, post-action debounce, toggle floor |
+| 13532cc | Numeric value, table geometry, cell coordinates (dual-shape `GetRowColumnSpan` decode, `role_reads_value` gate) |
+| f65f401 | Object attributes and relations, role-gated; measured scope |
+| ede76ea | `drive.rs` pure action planner + declared actions |
+| d614bf4 | Drive-back glue: perform-time context, ordered execution, `action_drive` |
+| 13d7749, 3114163, e4522e8 | Same-title disambiguation: wire `nativeWindowId`, weston-log ledger daemon-side, Weston-id-narrowed matcher |
+| 0584b28, c574751 | Pump action log; E2E block — gesture mapping measured, veto relaxed, `uia.ps1`, daemon tracing |
+| 830f2bc | Widget-level text direction (per-run RTL is toolkit-impossible) |

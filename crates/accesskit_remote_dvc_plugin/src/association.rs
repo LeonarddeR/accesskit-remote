@@ -2,9 +2,9 @@
 //!
 //! msrdc titles a RAIL window `[WARN:COPY MODE] <toplevel title> (<distro>)`
 //! (the prefix only in RAIL copy mode, the suffix always); the undecorated
-//! toplevel title equals the AT-SPI frame name for GTK apps, which is the
-//! remote side's window title. The `WslgServerWindowId` HWND property is the
-//! stable per-HWND key; the app id corroborates ambiguous title matches.
+//! toplevel title equals the remote side's announced window title. The
+//! `WslgServerWindowId` HWND property is the stable per-HWND key; the app id
+//! corroborates ambiguous title matches.
 
 use accesskit_remote::WindowId;
 use accesskit_remote_client::WindowInfo;

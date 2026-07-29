@@ -24,26 +24,40 @@ Mirrored today:
 - Tree structure, with window add/remove and debounced re-walks on change.
 - Roles and widget state — toggled, expanded, selected, has-popup, disabled,
   read-only, required, invalid, modal, busy, orientation.
-- Focus, at window and node level, including active-descendant.
-- Text: per-line runs with caret and selection, plus per-character geometry, so
-  UIA `TextPattern` bounding rectangles resolve for magnifiers.
+- Numeric value with range and step, table row/column counts, cell
+  coordinates and spans, placeholder text, and label/control/description
+  relations.
+- Focus, at window and node level, including active-descendant; host-side
+  window switches arrive as remote focus transitions.
+- Text: per-line runs with caret and selection, per-character geometry (so
+  UIA `TextPattern` bounding rectangles resolve for magnifiers), and the
+  widget's base text direction.
 - Semantic changes arrive as single-node deltas rather than full re-walks.
+- Same-titled windows are told apart by their Weston window ids, which the
+  daemon reads from the WSLg weston log and the plug-in checks against each
+  RAIL window's `WslgServerWindowId` property (per RDP session).
+
+Action routing turns each UIA gesture into an ordered list of AT-SPI calls
+tried until one succeeds: named or index-0 actions, selection of options and
+tabs, clamped value setting and stepping, editable-text replacement, focus and
+caret. Verified end to end on the real RAIL window for toggle, invoke, tab
+selection and range-value setting.
 
 Known gaps:
 
-- **Action drive-back covers invoke, focus and caret only.** Menus, combo
-  boxes, expand/collapse and value setting are not routed yet.
-- **GTK4 does not implement the AT-SPI write methods** — `Component.GrabFocus`
-  and `Text.SetCaretOffset` return `NotSupported` — so driving focus and caret
-  reaches only toolkits on the ATK bridge, such as LibreOffice under gtk3.
-- Numeric value, table coordinates, object attributes and relations are not
-  mirrored yet.
+- **GTK4 leaves some widgets undrivable by design of its AT-SPI bridge**:
+  most check/radio buttons expose no action, combo boxes expose no expanded
+  state (their UIA `Expand()` is refused client-side), popover menu items are
+  only sometimes exposed after opening, and `GrabFocus`/`SetCaretOffset`
+  return `NotSupported`. LibreOffice under gtk3 (the ATK bridge) supports all
+  of these routes.
 - Verified with UIA test clients; not yet exercised with a real screen reader.
 - Exercised only against WSLg on Windows 11, with GTK4 and LibreOffice/VCL apps.
 
 `docs/next-steps.md` tracks current state, open work and the toolkit findings
 behind the design; `docs/spikes.md` records the environment and RDP-plumbing
-findings.
+findings; `docs/newton.md` records why the AT-SPI mirror stays the source
+path for now and how a Newton source would slot in behind the same seam.
 
 ## Installing
 
