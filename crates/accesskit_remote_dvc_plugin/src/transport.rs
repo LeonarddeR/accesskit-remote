@@ -135,6 +135,12 @@ fn pump(
             return;
         }
         while let Ok((window, request)) = actions.try_recv() {
+            info!(
+                action = ?request.action,
+                node = request.target_node.0,
+                window = window.0,
+                "pump: forwarding action",
+            );
             if let Err(e) = client.lock().unwrap().request_action(window, request) {
                 warn!("pump: action failed: {e:?}");
             }
