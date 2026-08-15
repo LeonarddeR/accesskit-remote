@@ -23,9 +23,30 @@ pub fn is_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+/// Whether this process was launched from an SSH session.
+///
+/// Worth detecting because it changes the remedy entirely: macOS attributes an
+/// Accessibility grant to a *responsible* application, and a process tree
+/// rooted in `sshd` has no GUI application to inherit one from. Granting the
+/// binary itself does not help — the check still fails.
+fn is_ssh_session() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+}
+
 /// The error a source returns when the grant is missing, spelling out the fix
-/// and the trap that follows it.
+/// for the situation the caller is actually in.
 pub fn untrusted_message() -> String {
+    if is_ssh_session() {
+        return "no Accessibility permission, and this is an SSH session.\n\
+             macOS attributes the grant to a responsible GUI application, and a \
+             process tree rooted in sshd has none — so granting this binary will \
+             not help.\n\
+             Either add /usr/libexec/sshd-keygen-wrapper under System Settings > \
+             Privacy & Security > Accessibility and reconnect (this grants every \
+             later SSH session the same access), or run from a terminal \
+             application on the Mac itself with that terminal granted."
+            .to_owned();
+    }
     let path = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "this binary".to_owned());
@@ -50,13 +71,22 @@ mod tests {
         let _ = is_trusted();
     }
 
+    /// The remedy differs by situation, and pointing someone at the wrong one
+    /// costs them a reboot's worth of confusion — so each branch is pinned.
     #[test]
-    fn the_untrusted_message_names_the_rebuild_trap() {
+    fn the_untrusted_message_matches_the_situation() {
         let message = untrusted_message();
         assert!(message.contains("Accessibility"), "{message}");
-        assert!(
-            message.contains("rebuild"),
-            "a grant silently lost on rebuild is the papercut worth warning about: {message}"
-        );
+        if is_ssh_session() {
+            assert!(
+                message.contains("sshd"),
+                "over SSH, granting the binary does nothing; the message must say so: {message}"
+            );
+        } else {
+            assert!(
+                message.contains("rebuild"),
+                "a grant silently lost on rebuild is the papercut worth warning about: {message}"
+            );
+        }
     }
 }
