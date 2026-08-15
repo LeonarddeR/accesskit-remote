@@ -17,14 +17,15 @@ use crate::delta::EmittedTree;
 use crate::element::{ElementKey, NodeIdMap};
 use crate::names::Names;
 use crate::observe::{self, AppObserver, Queue, Route};
-use crate::{ax, opt_in, trust, walk};
+use crate::{ax, node, opt_in, trust, walk};
 use accesskit_remote::WindowId;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use accesskit_remote_source::coalesce::RewalkCoalescer;
 use accesskit_remote_source::focus::FocusTracker;
+use accesskit_remote_source::limiter::NodeRefreshLimiter;
 use objc2_core_foundation::{kCFRunLoopDefaultMode, CFRunLoop};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -44,6 +45,13 @@ const RUN_LOOP_SLICE: Duration = Duration::from_millis(50);
 /// from one app activation.
 const REWALK_QUIET: Duration = Duration::from_millis(250);
 const REWALK_MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// Minimum spacing between refreshes of the same node, and the cap past which
+/// a node changing continuously is refreshed anyway. Leading edge plus
+/// trailing, so the first change of a burst reaches the consumer at once —
+/// which is what makes typing feel live — while the rest collapse into one.
+const REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(100);
+const REFRESH_MAX_DELAY: Duration = Duration::from_millis(500);
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
@@ -138,6 +146,15 @@ struct WindowState {
     /// What the consumer already holds, so a re-walk is reduced to its
     /// difference instead of re-sending the whole window.
     emitted: EmittedTree,
+    /// The window's screen origin at its last walk, so a refreshed node's
+    /// bounds land in the same coordinate space as its siblings'.
+    origin: Option<(f64, f64)>,
+    /// The children each node was *emitted* with. A refresh reads them from
+    /// here rather than from the element, because a refresh may change a
+    /// node's semantics but never the tree's shape — a fresh child list from a
+    /// lazily-populated table would otherwise splice thousands of unwalked
+    /// nodes into the consumer's tree.
+    children: HashMap<ElementKey, Vec<ElementKey>>,
 }
 
 /// The AX thread's body: enumerate once, hand the snapshot back, then serve.
@@ -153,6 +170,8 @@ fn worker(
     let queue: Queue = Rc::new(RefCell::new(Vec::new()));
     let mut observers: Vec<AppObserver> = Vec::new();
     let mut pending = RewalkCoalescer::new(REWALK_QUIET, REWALK_MAX_DELAY);
+    let mut refresh: NodeRefreshLimiter<ElementKey> =
+        NodeRefreshLimiter::new(REFRESH_MIN_INTERVAL, REFRESH_MAX_DELAY);
 
     let snapshot =
         enumerate(&names, &mut windows, &mut next_id, &mut focus, &queue, &mut observers);
@@ -185,8 +204,12 @@ fn worker(
         );
 
         let now = Instant::now();
-        route_notifications(&queue, &windows, &mut pending, now);
-        if !drain_due(&events, &names, &mut windows, &mut pending, now) {
+        if !route_notifications(
+            &events, &queue, &names, &mut windows, &mut pending, &mut refresh, now,
+        ) {
+            break;
+        }
+        if !drain_due(&events, &names, &mut windows, &mut pending, &mut refresh, now) {
             break;
         }
     }
@@ -195,33 +218,122 @@ fn worker(
     drop(observers);
 }
 
-/// Turns queued notifications into invalidations.
+/// Turns queued notifications into invalidations, and services the ones that
+/// can be answered by re-reading a single node.
 ///
-/// Every route currently converges on the debounced re-walk. That is the honest
-/// first cut: a single-node refresh needs a per-node cache of what was last
-/// emitted, without which "re-read one node" cannot answer "did anything
-/// change?" and would emit on every keystroke. The routes are kept distinct
-/// here so adding that cache changes this function and nothing above it.
+/// Returns false when the consumer has gone away.
+#[allow(clippy::too_many_arguments)]
 fn route_notifications(
+    events: &mpsc::Sender<SourceEvent>,
     queue: &Queue,
-    windows: &[WindowState],
+    names: &Names,
+    windows: &mut [WindowState],
     pending: &mut RewalkCoalescer,
+    refresh: &mut NodeRefreshLimiter<ElementKey>,
     now: Instant,
-) {
+) -> bool {
     let drained: Vec<observe::Notification> = queue.borrow_mut().drain(..).collect();
     for notification in drained {
         let route = observe::route(&notification.notification);
         if route == Route::Ignore {
             continue;
         }
-        // A notification names an element, not a window. Attributing it to
-        // every window of the owning application is deliberately coarse: the
-        // element may already be destroyed, so climbing to its window is not
-        // always possible, and the debounce collapses the excess anyway.
-        for window in windows.iter().filter(|w| w.pid == notification.pid) {
-            pending.note(window.id, now);
+        let key = ElementKey::new(notification.pid, notification.element);
+
+        match route {
+            // A semantic or caret change touches one node. Re-reading that node
+            // costs one round trip; re-walking its window costs the whole
+            // window, which for a Catalyst application is ~7ms per node.
+            Route::Refresh | Route::Text => {
+                let Some(index) = window_holding(windows, &key) else {
+                    // Not a node the consumer holds — it may be newly created,
+                    // which is a structural change, so let the walk find it.
+                    note_windows_of(windows, notification.pid, pending, now);
+                    continue;
+                };
+                if !refresh.note(windows[index].id, &key, now) {
+                    // Rate-limited: a trailing refresh is already scheduled.
+                    continue;
+                }
+                if !emit_refresh(events, names, &mut windows[index], &key) {
+                    return false;
+                }
+            }
+            // Structure changed, or an element vanished: the shape of the
+            // window is no longer known, so only a walk can re-establish it.
+            _ => note_windows_of(windows, notification.pid, pending, now),
         }
     }
+    true
+}
+
+/// The window whose tree currently contains `key`, if any.
+fn window_holding(windows: &[WindowState], key: &ElementKey) -> Option<usize> {
+    windows.iter().position(|window| window.ids.get(key).is_some())
+}
+
+/// Marks every window of an application for a debounced re-walk.
+///
+/// Deliberately coarse: a notification names an element, and by the time a
+/// destruction arrives that element cannot be climbed to find its window. The
+/// debounce collapses the excess.
+fn note_windows_of(
+    windows: &[WindowState],
+    pid: i32,
+    pending: &mut RewalkCoalescer,
+    now: Instant,
+) {
+    for window in windows.iter().filter(|window| window.pid == pid) {
+        pending.note(window.id, now);
+    }
+}
+
+/// Re-reads one node and sends it, if anything about it actually changed.
+///
+/// **Semantics only, never structure.** The node's children come from what was
+/// last emitted, not from a fresh read: a refresh must not be able to change
+/// the tree's shape, or a lazily-populated table could splice thousands of
+/// never-walked nodes into the consumer's tree by way of a value change.
+fn emit_refresh(
+    events: &mpsc::Sender<SourceEvent>,
+    names: &Names,
+    window: &mut WindowState,
+    key: &ElementKey,
+) -> bool {
+    let Some(id) = window.ids.get(key) else {
+        return true;
+    };
+    let Ok(read) = node::read(key.clone(), names) else {
+        // The element died between the notification and the read. Its removal
+        // is structural, and the walk will notice.
+        return true;
+    };
+    let mut built = node::build_container(&read, window.origin);
+    if let Some(children) = window.children.get(key) {
+        let ids: Vec<accesskit::NodeId> =
+            children.iter().filter_map(|child| window.ids.get(child)).collect();
+        if !ids.is_empty() {
+            built.set_children(ids);
+        }
+    }
+    if !window.emitted.reduce_node(id, &built) {
+        return true;
+    }
+    let update = accesskit::TreeUpdate {
+        nodes: vec![(id, built)],
+        tree: None,
+        tree_id: accesskit::TreeId::ROOT,
+        // Focus is unchanged by a semantic refresh, so it must be restated as
+        // the consumer already believes it — a stale value here would move the
+        // reader's cursor on every value change.
+        focus: window.emitted.focus().unwrap_or(id),
+    };
+    events
+        .send(SourceEvent::TreeUpdate {
+            window: window.id,
+            update,
+        })
+        .is_ok()
 }
 
 /// Re-walks every window whose debounce has expired, emitting an update for
@@ -231,13 +343,31 @@ fn drain_due(
     names: &Names,
     windows: &mut [WindowState],
     pending: &mut RewalkCoalescer,
+    refresh: &mut NodeRefreshLimiter<ElementKey>,
     now: Instant,
 ) -> bool {
+    // Trailing single-node refreshes first: they are cheap, and doing them
+    // before any re-walk means a value that settled during a burst reaches the
+    // consumer without waiting on a whole window.
+    for (window_id, key) in refresh.take_due(now) {
+        let Some(index) = windows.iter().position(|window| window.id == window_id) else {
+            continue;
+        };
+        if !emit_refresh(events, names, &mut windows[index], &key) {
+            return false;
+        }
+    }
     for id in pending.take_due(now) {
         let Some(window) = windows.iter_mut().find(|w| w.id == id) else {
             continue;
         };
         let nodes = walk::walk_window(window.key.clone(), names);
+        // Refresh reads structure from here, so it must track the walk.
+        window.children = walk::emitted_children(&nodes);
+        window.origin = nodes
+            .first()
+            .and_then(|root| root.frame)
+            .map(|frame| (frame.origin.x, frame.origin.y));
         // An empty re-walk means the window is gone or unreadable. Removing it
         // is the reconcile path's job, which has the whole window set in view;
         // dropping the tree here would tell the consumer the window went blank.
@@ -333,6 +463,11 @@ fn enumerate(
                 pid: app.pid,
                 ids,
                 emitted,
+                origin: nodes
+                    .first()
+                    .and_then(|root| root.frame)
+                    .map(|frame| (frame.origin.x, frame.origin.y)),
+                children: walk::emitted_children(&nodes),
             });
         }
     }

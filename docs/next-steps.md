@@ -363,6 +363,17 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   "unchanged ⇒ no traffic" invariant now holds at tree level here too. This
   works only because element identity is stable: the same node id in two walks
   denotes the same node, so the two can be compared at all.
+- **A keystroke costs one node.** With the per-node refresh route in place,
+  typing into TextEdit produces a single `TreeUpdate` carrying one
+  `MultilineTextInput` node, delivered on the limiter's leading edge so it is
+  live rather than debounced. Before it, the same keystroke either re-walked
+  the whole 48-node window or — because `AXValue` was read but never mapped —
+  produced a byte-identical node and reached the consumer not at all.
+- **`AXValue` must be interpreted by role or not at all.** It is a string on a
+  text field, 0/1/2 on a checkbox (2 being the mixed state), and a number on a
+  slider. Mapping it blindly would put a string where a consumer expects a
+  number; omitting it makes text editing invisible, since the node is identical
+  before and after and the delta reducer correctly suppresses it.
 - Residual, open: System Settings still reports ~13-30 genuinely changed nodes
   per second while idle, all `TreeItem`/`Cell` in its navigation sidebar.
   Bounds jitter from lazy layout is the likeliest cause. It is bounded damage

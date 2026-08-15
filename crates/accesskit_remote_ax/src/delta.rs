@@ -43,6 +43,35 @@ impl EmittedTree {
         self.nodes.is_empty()
     }
 
+    /// The focus the consumer currently believes in, for building a delta that
+    /// must not disturb it.
+    pub fn focus(&self) -> Option<NodeId> {
+        self.focus
+    }
+
+    /// Whether this window has been announced yet, i.e. whether a delta is
+    /// meaningful at all.
+    pub fn is_announced(&self) -> bool {
+        self.announced
+    }
+
+    /// Compares one re-read node against what the consumer holds.
+    ///
+    /// Unlike [`reduce`](Self::reduce) this must **not** prune the cache: a
+    /// single-node refresh says nothing about the other nodes, and treating
+    /// their absence as removal would make the next re-walk resend the entire
+    /// window — the exact traffic this module exists to avoid.
+    pub fn reduce_node(&mut self, id: NodeId, node: &accesskit::Node) -> bool {
+        let Ok(encoded) = serde_json::to_vec(node) else {
+            return true;
+        };
+        if self.nodes.get(&id) == Some(&encoded) {
+            return false;
+        }
+        self.nodes.insert(id, encoded);
+        true
+    }
+
     /// Reduces a full walk to the update that should actually be sent, or
     /// `None` when nothing changed.
     ///
@@ -200,6 +229,36 @@ mod tests {
         again.nodes.push((NodeId(2), labelled(Role::Button, "Cancel")));
         let delta = emitted.reduce(again).expect("the returning node is sent again");
         assert_eq!(delta.nodes[0].0, NodeId(2));
+    }
+
+    #[test]
+    fn a_single_node_refresh_reports_only_real_changes() {
+        let mut emitted = EmittedTree::new();
+        emitted.reduce(tree("Save")).unwrap();
+        assert!(
+            !emitted.reduce_node(NodeId(1), &labelled(Role::Button, "Save")),
+            "an unchanged re-read is not worth sending"
+        );
+        assert!(emitted.reduce_node(NodeId(1), &labelled(Role::Button, "Saved")));
+        assert!(
+            !emitted.reduce_node(NodeId(1), &labelled(Role::Button, "Saved")),
+            "and settles once sent"
+        );
+    }
+
+    /// A single-node refresh must not disturb the cache's view of the rest of
+    /// the window. If it pruned, the next re-walk would find nothing cached
+    /// and resend every node — precisely the traffic this module removes.
+    #[test]
+    fn a_single_node_refresh_leaves_the_rest_of_the_cache_intact() {
+        let mut emitted = EmittedTree::new();
+        emitted.reduce(tree("Save")).unwrap();
+        assert_eq!(emitted.len(), 2);
+        emitted.reduce_node(NodeId(1), &labelled(Role::Button, "Saved"));
+        assert_eq!(emitted.len(), 2, "the root is still known");
+        // The following re-walk sees only the one genuine difference.
+        let delta = emitted.reduce(tree("Save")).expect("the label reverted");
+        assert_eq!(delta.nodes.len(), 1);
     }
 
     #[test]

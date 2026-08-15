@@ -185,6 +185,45 @@ pub fn build_container(node: &AxNode, window_origin: Option<(f64, f64)>) -> Node
         container.set_description(node.description.clone());
     }
 
+    // `AXValue` is whatever the role says it is: the text of a field, the
+    // on/off of a checkbox, the position of a slider. Reading it without
+    // interpreting it by role would put a string where a consumer expects a
+    // number — and leaving it out entirely, as an earlier version did, makes
+    // typing invisible: the node is byte-identical before and after, so the
+    // delta reducer correctly concludes nothing happened.
+    if let Some(value) = node.value.as_deref() {
+        match role {
+            Role::TextInput
+            | Role::MultilineTextInput
+            | Role::SearchInput
+            | Role::PasswordInput
+            | Role::DateInput
+            | Role::TimeInput => {
+                if let Some(text) = attr::as_string(value) {
+                    container.set_value(text);
+                }
+            }
+            Role::CheckBox | Role::RadioButton | Role::Switch => {
+                // AppKit reports these as 0/1/2, where 2 is the mixed state a
+                // tri-state checkbox shows for a partial selection.
+                if let Some(number) = attr::as_f64(value) {
+                    container.set_toggled(match number as i64 {
+                        0 => accesskit::Toggled::False,
+                        2 => accesskit::Toggled::Mixed,
+                        _ => accesskit::Toggled::True,
+                    });
+                }
+            }
+            Role::Slider | Role::SpinButton | Role::ProgressIndicator | Role::Meter
+            | Role::ScrollBar => {
+                if let Some(number) = attr::as_f64(value) {
+                    container.set_numeric_value(number);
+                }
+            }
+            _ => {}
+        }
+    }
+
     if let Some(selected) = node.states.selected {
         container.set_selected(selected);
     }
@@ -225,7 +264,7 @@ pub fn build_container(node: &AxNode, window_origin: Option<(f64, f64)>) -> Node
 mod tests {
     use super::*;
     use objc2_application_services::AXUIElement;
-    use objc2_core_foundation::{CGPoint, CGSize};
+    use objc2_core_foundation::{CFNumber, CGPoint, CGSize};
 
     fn key() -> ElementKey {
         // SAFETY: takes no arguments and always returns a valid element.
@@ -266,6 +305,54 @@ mod tests {
 
         let origin = Some((10.0, 20.0));
         assert!(same(&build_container(&n, origin), &build_container(&n, origin)));
+    }
+
+    /// Typing must change the node, or the delta reducer correctly concludes
+    /// nothing happened and the change never reaches the consumer. This is the
+    /// test for the gap that made text editing invisible.
+    #[test]
+    fn a_text_field_carries_its_contents() {
+        let mut n = node("AXTextArea");
+        assert_eq!(n.accesskit_role(), Role::MultilineTextInput);
+        assert_eq!(build_container(&n, None).value(), None);
+
+        n.value = Some(CFString::from_static_str("hello").into());
+        assert_eq!(build_container(&n, None).value(), Some("hello"));
+
+        n.value = Some(CFString::from_static_str("hello world").into());
+        assert_eq!(build_container(&n, None).value(), Some("hello world"));
+    }
+
+    #[test]
+    fn a_checkbox_reads_its_value_as_a_toggle_including_mixed() {
+        let mut n = node("AXCheckBox");
+        n.value = Some(CFNumber::new_i32(0).into());
+        assert_eq!(build_container(&n, None).toggled(), Some(accesskit::Toggled::False));
+        n.value = Some(CFNumber::new_i32(1).into());
+        assert_eq!(build_container(&n, None).toggled(), Some(accesskit::Toggled::True));
+        // AppKit uses 2 for the partial state a tri-state checkbox shows.
+        n.value = Some(CFNumber::new_i32(2).into());
+        assert_eq!(build_container(&n, None).toggled(), Some(accesskit::Toggled::Mixed));
+    }
+
+    #[test]
+    fn a_slider_reads_its_value_as_a_number_not_a_string() {
+        let mut n = node("AXSlider");
+        n.value = Some(CFNumber::new_f64(0.42).into());
+        let built = build_container(&n, None);
+        assert_eq!(built.numeric_value(), Some(0.42));
+        assert_eq!(built.value(), None, "a slider's value is not text");
+    }
+
+    #[test]
+    fn a_value_on_a_role_that_has_no_use_for_one_is_ignored() {
+        // Plenty of elements carry AXValue with something meaningless in it;
+        // putting a string on a Button would be worse than dropping it.
+        let mut n = node("AXButton");
+        n.value = Some(CFString::from_static_str("nonsense").into());
+        let built = build_container(&n, None);
+        assert_eq!(built.value(), None);
+        assert_eq!(built.numeric_value(), None);
     }
 
     #[test]
