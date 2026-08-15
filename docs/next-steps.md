@@ -402,6 +402,23 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   macOS it is not only a safety net — it is the sole mechanism that corrects a
   scrolled window's geometry (see the scale findings below).
 
+- **Action drive-back works, and is cheaper than on AT-SPI.**
+  `AXUIElementCopyActionNames` says which actions exist and
+  `AXUIElementIsAttributeSettable` says which attributes can be written, so a
+  route that cannot work is never planned — where the AT-SPI planner had to
+  attempt calls and interpret `NotSupported` afterwards, spending a round trip
+  per guess. Measured on Calculator: **22 controls planned, 22 accepted, 20
+  produced a visible change** (the two that did not are genuine no-ops on an
+  empty display). Through the daemon, a click on a `Toolbar` node correctly
+  planned nothing at all.
+- Judging an action by whether the *call* succeeded is not enough — the first
+  version of `action_drive` reported "no visible change" for every Calculator
+  digit, because pressing a digit changes the display, not the button. The
+  instrument fingerprints the whole window before and after.
+- `action_drive` plans by default and needs `--drive` to act: pointed at System
+  Settings, an indiscriminate version would toggle the machine's real
+  configuration.
+
 ### macOS / AX at scale
 
 Measured 2026-08-16 against a long Wikipedia article ("World War II") in Safari,

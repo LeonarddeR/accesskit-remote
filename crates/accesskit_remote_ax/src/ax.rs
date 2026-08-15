@@ -13,6 +13,7 @@
 //! messaging timeout before it is read from.
 
 use crate::attr::{self, AxError};
+use crate::drive::{self, ActionContext, AxCall, Settable};
 use crate::element::ElementKey;
 use crate::names::Names;
 use crate::window_id;
@@ -273,5 +274,103 @@ mod tests {
         // returns real windows; on CI it returns an empty vector. Both pass.
         let names = Names::new();
         let _ = discover_windows(&names);
+    }
+}
+
+// ------------------------------------------------------------------- actions
+
+/// Reads everything the planner needs about an element, then carries out the
+/// plan.
+///
+/// Returns the call that succeeded, or `None` if the action could not be
+/// expressed against this element or every route was refused. A refusal is not
+/// an error: plenty of elements simply cannot do a given thing, and the
+/// consumer has already been told which actions a node supports.
+pub fn perform(
+    key: &ElementKey,
+    request: &accesskit::ActionRequest,
+    role: accesskit::Role,
+    names: &Names,
+) -> Option<AxCall> {
+    let element = key.element();
+    let context = ActionContext {
+        role,
+        actions: attr::action_names(element).unwrap_or_default(),
+        settable: read_settable(element, names),
+        // Only worth a round trip when a step might have to be synthesised.
+        value: matches!(
+            request.action,
+            accesskit::Action::Increment | accesskit::Action::Decrement
+        )
+        .then(|| attr::value(element, &names.value).ok().flatten())
+        .flatten()
+        .as_deref()
+        .and_then(attr::as_f64),
+    };
+
+    let plan = drive::plan_action(&context, request.action, request.data.as_ref());
+    if plan.is_empty() {
+        tracing::debug!(action = ?request.action, ?role, "no route to perform this action");
+        return None;
+    }
+    for call in plan {
+        if execute(element, &call, names) {
+            tracing::info!(action = ?request.action, ?call, "action performed");
+            return Some(call);
+        }
+        tracing::debug!(action = ?request.action, ?call, "route declined, trying the next");
+    }
+    None
+}
+
+/// Which of the attributes the planner can write are writable here.
+///
+/// One round trip each, and the whole point: on AT-SPI this could only be
+/// discovered by attempting the call and interpreting the refusal.
+fn read_settable(element: &AXUIElement, names: &Names) -> Vec<Settable> {
+    let mut out = Vec::new();
+    for (what, name) in [
+        (Settable::Value, &names.value),
+        (Settable::Focused, &names.focused),
+        (Settable::Selected, &names.selected),
+    ] {
+        if attr::is_settable(element, name).unwrap_or(false) {
+            out.push(what);
+        }
+    }
+    out
+}
+
+/// Runs one planned call, reporting whether it was accepted.
+fn execute(element: &AXUIElement, call: &AxCall, names: &Names) -> bool {
+    use objc2_core_foundation::{CFBoolean, CFNumber, CFString};
+    match call {
+        AxCall::Perform(action) => {
+            let name = CFString::from_static_str(action);
+            // SAFETY: a live element and a valid action name.
+            unsafe { element.perform_action(&name) == objc2_application_services::AXError::Success }
+        }
+        AxCall::SetStringValue(text) => {
+            let value = CFString::from_str(text);
+            set(element, &names.value, &value)
+        }
+        AxCall::SetNumberValue(number) => {
+            let value = CFNumber::new_f64(*number);
+            set(element, &names.value, &value)
+        }
+        AxCall::Focus => set(element, &names.focused, CFBoolean::new(true)),
+        AxCall::SetSelected(flag) => set(element, &names.selected, CFBoolean::new(*flag)),
+    }
+}
+
+fn set(
+    element: &AXUIElement,
+    attribute: &objc2_core_foundation::CFString,
+    value: &objc2_core_foundation::CFType,
+) -> bool {
+    // SAFETY: a live element, a valid attribute name, and a live CF value.
+    unsafe {
+        element.set_attribute_value(attribute, value)
+            == objc2_application_services::AXError::Success
     }
 }

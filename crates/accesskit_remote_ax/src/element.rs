@@ -98,6 +98,9 @@ impl core::fmt::Debug for ElementKey {
 #[derive(Default)]
 pub struct NodeIdMap {
     map: std::collections::HashMap<ElementKey, accesskit::NodeId>,
+    /// The reverse direction, for action requests: those name a node id and
+    /// the executor needs the element it stands for.
+    by_id: std::collections::HashMap<accesskit::NodeId, ElementKey>,
     next: u64,
 }
 
@@ -114,6 +117,7 @@ impl NodeIdMap {
         let id = accesskit::NodeId(self.next);
         self.next += 1;
         self.map.insert(key.clone(), id);
+        self.by_id.insert(id, key.clone());
         id
     }
 
@@ -122,6 +126,11 @@ impl NodeIdMap {
     /// the tree.
     pub fn get(&self, key: &ElementKey) -> Option<accesskit::NodeId> {
         self.map.get(key).copied()
+    }
+
+    /// The element a node id stands for, for carrying out an action against it.
+    pub fn key_for(&self, id: accesskit::NodeId) -> Option<&ElementKey> {
+        self.by_id.get(&id)
     }
 
     pub fn len(&self) -> usize {
@@ -184,6 +193,17 @@ mod tests {
         // out — a stale id on the consumer must not come to mean another node.
         let fresh = map.id_for(&ElementKey::new(99, system_wide()));
         assert!(!first.contains(&fresh));
+    }
+
+    #[test]
+    fn an_id_resolves_back_to_its_element() {
+        // An action names a node id; without this the executor has nothing to
+        // perform against.
+        let mut map = NodeIdMap::new();
+        let key = ElementKey::new(7, system_wide());
+        let id = map.id_for(&key);
+        assert_eq!(map.key_for(id), Some(&key));
+        assert_eq!(map.key_for(accesskit::NodeId(9999)), None);
     }
 
     #[test]

@@ -193,14 +193,7 @@ fn worker(
         match commands.try_recv() {
             Ok(Command::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => break,
             Ok(Command::Perform { window, request }) => {
-                // Drive-back is a later phase; log at the seam so the pump's
-                // own action log has a counterpart on this side.
-                tracing::info!(
-                    window = window.0,
-                    action = ?request.action,
-                    node = request.target_node.0,
-                    "action requested (drive-back not implemented yet)"
-                );
+                perform(&names, &mut windows, &mut pending, window, &request);
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }
@@ -235,6 +228,40 @@ fn worker(
     // Observers hold sources on this thread's run loop and must be dropped
     // here, before the thread and its loop go away.
     drop(observers);
+}
+
+/// Carries out one action request against the element its node id names.
+///
+/// Always marks the window for a re-walk afterwards, whether or not a route
+/// succeeded. Some actions produce no notification at all — opening a menu is
+/// the usual example — so the debounced walk is the only thing that surfaces
+/// what the action did. The AT-SPI source does the same for the same reason.
+fn perform(
+    names: &Names,
+    windows: &mut [WindowState],
+    pending: &mut RewalkCoalescer,
+    window: WindowId,
+    request: &accesskit::ActionRequest,
+) {
+    let Some(state) = windows.iter().find(|state| state.id == window) else {
+        tracing::debug!(window = window.0, "action for a window we no longer track");
+        return;
+    };
+    let Some(key) = state.ids.key_for(request.target_node) else {
+        tracing::debug!(
+            window = window.0,
+            node = request.target_node.0,
+            "action for a node this window never emitted"
+        );
+        return;
+    };
+    // The role decides which routes are even plausible, and it must be the one
+    // the consumer is looking at rather than a fresh guess.
+    let role = node::read(key.clone(), names)
+        .map(|node| node.accesskit_role())
+        .unwrap_or(accesskit::Role::Unknown);
+    ax::perform(key, request, role, names);
+    pending.note(window, Instant::now());
 }
 
 /// Turns queued notifications into invalidations, and services the ones that
