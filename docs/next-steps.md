@@ -21,6 +21,7 @@ Two end-to-end milestones are proven live:
 | `accesskit_remote` | Framing, JSON codec, sans-I/O `Session` handshake; `WindowAdded` carries an optional `nativeWindowId` |
 | `accesskit_remote_transport` | TCP + vsock listener (Linux) + hvsocket connector (Windows), verified across the WSL boundary |
 | `accesskit_remoted` | `--tcp\|--vsock [PORT]`; `--atspi` swaps `DemoSource` for `AtspiSource`; WSLg window-id enrichment off the weston log; tracing via `ACCESSKIT_REMOTED_LOG` |
+| `accesskit_remote_source` | Source-agnostic and platform-neutral: `RewalkCoalescer`, `NodeRefreshLimiter<K>`, `FocusTracker`, `reconcile_windows<K>`. Shared by every tree source; tested on Linux, Windows and macOS |
 | `accesskit_remote_atspi` | Roles, states, text runs + geometry + widget-level direction, focus, caret, numeric value, table geometry, cell coordinates, placeholder/level/posinset/setsize, relations, window lifecycle, per-node refresh, debounced re-walks |
 | `accesskit_remote_windows` | Visible-window adapter (no visibility precondition), `post_delta` / `post_focus` via a registered window message |
 | `accesskit_remote_dvc_plugin` | Chain-loads the stock `WSLDVCPlugin.dll`, per-connection hvsocket pump, RAIL hook + idle-attach nudge, `regsvr32` install, Weston-id-narrowed same-title matching |
@@ -488,3 +489,4 @@ Oldest first. `git log` carries the detail.
 | 13d7749, 3114163, e4522e8 | Same-title disambiguation: wire `nativeWindowId`, weston-log ledger daemon-side, Weston-id-narrowed matcher |
 | 0584b28, c574751 | Pump action log; E2E block — gesture mapping measured, veto relaxed, `uia.ps1`, daemon tracing |
 | 830f2bc | Widget-level text direction (per-run RTL is toolkit-impossible) |
+| 0b24b35 | `accesskit_remote_source` — debounce, refresh limiter, focus tracker and window diff extracted out of the Linux-only crate, generic over node/window identity; macOS CI job |
