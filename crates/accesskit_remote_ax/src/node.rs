@@ -88,6 +88,8 @@ pub struct AxNode {
     pub frame: Option<CGRect>,
     pub states: NodeStates,
     pub children: Vec<ElementKey>,
+    /// The UTF-16 selection range, read only for elements that carry text.
+    pub selected_range: Option<(usize, usize)>,
 }
 
 impl AxNode {
@@ -110,6 +112,24 @@ impl AxNode {
             &self.description
         }
     }
+}
+
+/// Whether this role's text should be exposed as `TextRun` children.
+///
+/// The UIA Text pattern needs a role in `supports_text_ranges` with at least
+/// one `TextRun` child, so this set decides where text is readable at all.
+/// Deliberately narrow: giving every label a caret is what made GTK report a
+/// degenerate caret-at-zero on every static string.
+pub fn has_text_runs(role: Role) -> bool {
+    matches!(
+        role,
+        Role::TextInput
+            | Role::MultilineTextInput
+            | Role::SearchInput
+            | Role::PasswordInput
+            | Role::Document
+            | Role::Terminal
+    )
 }
 
 /// Reads one element's whole attribute set in a single round trip.
@@ -137,7 +157,7 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
         .and_then(attr::as_string)
         .filter(|s| !s.is_empty());
 
-    Ok(AxNode {
+    let mut node = AxNode {
         role,
         subrole,
         title: text(I_TITLE),
@@ -152,13 +172,23 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
             focused: flag(I_FOCUSED).unwrap_or(false),
             selected: flag(I_SELECTED),
         },
+        selected_range: None,
         children: attr::elements(key.element(), &names.children)
             .unwrap_or_default()
             .into_iter()
             .map(|child| ElementKey::new(key.pid(), child))
             .collect(),
         key,
-    })
+    };
+    // Only text elements pay for the selection read.
+    if has_text_runs(node.accesskit_role()) {
+        node.selected_range = attr::value(node.key.element(), &names.selected_text_range)
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(attr::as_range);
+    }
+    Ok(node)
 }
 
 /// Builds everything about a node that comes from its own read: role, name,
@@ -282,6 +312,7 @@ mod tests {
             frame: None,
             states: NodeStates::default(),
             children: Vec::new(),
+            selected_range: None,
         }
     }
 

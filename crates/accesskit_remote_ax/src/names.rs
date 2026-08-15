@@ -63,6 +63,7 @@ names! {
     main => "AXMain",
     minimized => "AXMinimized",
     hidden => "AXHidden",
+    selected_text_range => "AXSelectedTextRange",
     placeholder => "AXPlaceholderValue",
     title_ui_element => "AXTitleUIElement",
 

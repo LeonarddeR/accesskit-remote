@@ -101,6 +101,12 @@ pub struct NodeIdMap {
     /// The reverse direction, for action requests: those name a node id and
     /// the executor needs the element it stands for.
     by_id: std::collections::HashMap<accesskit::NodeId, ElementKey>,
+    /// Ids for the synthetic `TextRun` children of a text element, keyed by
+    /// their parent and index. They are drawn from the same counter as element
+    /// ids so the two can never collide, and they are just as append-only: a
+    /// run whose id changed on every walk would make each keystroke replace the
+    /// paragraph instead of updating it.
+    runs: std::collections::HashMap<(accesskit::NodeId, usize), accesskit::NodeId>,
     next: u64,
 }
 
@@ -126,6 +132,17 @@ impl NodeIdMap {
     /// the tree.
     pub fn get(&self, key: &ElementKey) -> Option<accesskit::NodeId> {
         self.map.get(key).copied()
+    }
+
+    /// The id of a text element's `index`-th run, allocating on first sight.
+    pub fn run_id_for(&mut self, parent: accesskit::NodeId, index: usize) -> accesskit::NodeId {
+        if let Some(id) = self.runs.get(&(parent, index)) {
+            return *id;
+        }
+        let id = accesskit::NodeId(self.next);
+        self.next += 1;
+        self.runs.insert((parent, index), id);
+        id
     }
 
     /// The element a node id stands for, for carrying out an action against it.
@@ -204,6 +221,22 @@ mod tests {
         let id = map.id_for(&key);
         assert_eq!(map.key_for(id), Some(&key));
         assert_eq!(map.key_for(accesskit::NodeId(9999)), None);
+    }
+
+    #[test]
+    fn run_ids_are_stable_and_never_collide_with_element_ids() {
+        let mut map = NodeIdMap::new();
+        let parent = map.id_for(&ElementKey::new(1, system_wide()));
+        let first = map.run_id_for(parent, 0);
+        let second = map.run_id_for(parent, 1);
+        assert_ne!(first, second);
+        assert_ne!(first, parent, "runs share the element counter, so cannot collide");
+        // Stable across walks, or every keystroke would replace the paragraph.
+        assert_eq!(map.run_id_for(parent, 0), first);
+        assert_eq!(map.run_id_for(parent, 1), second);
+        // A run of a different parent is a different run.
+        let other = map.id_for(&ElementKey::new(2, system_wide()));
+        assert_ne!(map.run_id_for(other, 0), first);
     }
 
     #[test]

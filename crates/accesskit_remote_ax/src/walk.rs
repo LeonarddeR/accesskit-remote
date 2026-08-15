@@ -86,12 +86,29 @@ pub fn build_window_update(nodes: &[AxNode], ids: &mut NodeIdMap) -> Option<acce
     for node in nodes {
         let id = ids.id_for(&node.key);
         let mut built = node::build_container(node, origin);
-        let children: Vec<accesskit::NodeId> = node
+        let mut children: Vec<accesskit::NodeId> = node
             .children
             .iter()
             .filter(|child| walked.contains(child))
             .filter_map(|child| ids.get(child))
             .collect();
+        // A text element's content becomes TextRun children, which is the only
+        // shape a consumer can resolve a range against. They are appended
+        // rather than replacing the element children, since a text view can
+        // legitimately contain both.
+        if node::has_text_runs(node.accesskit_role()) {
+            if let Some(value) = node.value.as_deref().and_then(crate::attr::as_string) {
+                let (runs, layout) =
+                    crate::text::build_runs(&value, |index| ids.run_id_for(id, index));
+                if let Some((start, len)) = node.selected_range {
+                    if let Some(selection) = crate::text::selection(&value, &layout, start, len) {
+                        built.set_text_selection(selection);
+                    }
+                }
+                children.extend(runs.iter().map(|(run_id, _)| *run_id));
+                out.extend(runs);
+            }
+        }
         if !children.is_empty() {
             built.set_children(children);
         }
@@ -154,6 +171,7 @@ mod tests {
             frame: None,
             states: NodeStates::default(),
             children,
+            selected_range: None,
         }
     }
 

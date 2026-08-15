@@ -320,6 +320,25 @@ pub fn as_rect(value: &CFType) -> Option<CGRect> {
     }
 }
 
+/// Unwraps an `AXValue` holding a `CFRange`, as `AXSelectedTextRange` does.
+///
+/// The units are UTF-16 code units; see [`crate::text`] for why that matters.
+pub fn as_range(value: &CFType) -> Option<(usize, usize)> {
+    let ax = value.downcast_ref::<AXValue>()?;
+    // SAFETY: the type tag is checked before reading, and `range` is a valid
+    // writable CFRange the callee fills in.
+    unsafe {
+        if ax.r#type() != AXValueType::CFRange {
+            return None;
+        }
+        let mut range = objc2_core_foundation::CFRange { location: 0, length: 0 };
+        let ptr = NonNull::from(&mut range).cast();
+        ax.value(AXValueType::CFRange, ptr).then(|| {
+            (range.location.max(0) as usize, range.length.max(0) as usize)
+        })
+    }
+}
+
 /// Unwraps an `AXValue` holding a `CGSize`.
 pub fn as_size(value: &CFType) -> Option<CGSize> {
     let ax = value.downcast_ref::<AXValue>()?;

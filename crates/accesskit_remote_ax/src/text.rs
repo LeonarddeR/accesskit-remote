@@ -1,0 +1,313 @@
+//! Turning an element's text into AccessKit text runs.
+//!
+//! A consumer reads text through `TextRun` children, not through a string on
+//! the container: the UIA Text pattern needs a role in `supports_text_ranges`
+//! with at least one `TextRun` child before it will resolve a range at all.
+//!
+//! **Three offset systems meet here, and confusing them silently misplaces the
+//! caret.** AX reports selection as a `CFRange` in *UTF-16 code units*, because
+//! that is what `NSRange` has always meant. AccessKit's `character_index`
+//! counts entries in `character_lengths`, which is one entry per *character*
+//! (Unicode scalar). And each entry is a length in *UTF-8 bytes*. A caret past
+//! any emoji or CJK text lands in the wrong place unless all three are kept
+//! apart, so the conversions live here as pure functions with tests over the
+//! astral planes rather than being written inline at the call site.
+
+use accesskit::{NodeId, Node, Role, TextPosition, TextSelection};
+
+/// Text longer than this is not mirrored.
+///
+/// A screen reader cannot usefully consume a megabyte in one node, and the
+/// per-character arrays below are proportional to it. Matches the AT-SPI
+/// source's cap.
+pub const MAX_TEXT_CHARS: usize = 65_536;
+
+/// Where one run sits in the element's text, so a caret offset can be resolved
+/// back to a run and an index within it.
+pub struct RunLayout {
+    pub id: NodeId,
+    /// Character offset of this run's first character within the whole text.
+    pub start: usize,
+    /// Number of characters in this run.
+    pub len: usize,
+}
+
+/// Truncates to [`MAX_TEXT_CHARS`] characters, on a character boundary.
+pub fn clamp(text: &str) -> &str {
+    match text.char_indices().nth(MAX_TEXT_CHARS) {
+        Some((index, _)) => &text[..index],
+        None => text,
+    }
+}
+
+/// Splits text into one run per hard line.
+///
+/// The trailing newline stays with its run, and text ending in a newline gets
+/// a final empty run — otherwise a caret at the very end of the document has
+/// no run to sit in, and neither does the caret in an empty field.
+pub fn split_runs(text: &str) -> Vec<&str> {
+    let mut runs = Vec::new();
+    let mut rest = text;
+    loop {
+        match rest.find('\n') {
+            Some(index) => {
+                runs.push(&rest[..=index]);
+                rest = &rest[index + 1..];
+            }
+            None => {
+                runs.push(rest);
+                return runs;
+            }
+        }
+    }
+}
+
+/// UTF-8 byte length of each character in the run.
+///
+/// This is what `character_lengths` means to AccessKit, and it is *not* the
+/// same as a UTF-16 length: an emoji is 4 bytes here and 2 UTF-16 units on the
+/// wire from AX.
+pub fn character_lengths(run: &str) -> Vec<u8> {
+    run.chars().map(|c| c.len_utf8() as u8).collect()
+}
+
+/// Index of the first character of each word in the run.
+///
+/// Indices are into [`character_lengths`], and the array degrades to empty if
+/// any index exceeds a `u8`, which is all AccessKit stores.
+pub fn word_starts(run: &str) -> Vec<u8> {
+    let mut starts = Vec::new();
+    let mut previous_was_space = true;
+    for (index, character) in run.chars().enumerate() {
+        let is_space = character.is_whitespace();
+        if previous_was_space && !is_space {
+            match u8::try_from(index) {
+                Ok(index) => starts.push(index),
+                Err(_) => return Vec::new(),
+            }
+        }
+        previous_was_space = is_space;
+    }
+    starts
+}
+
+/// Converts a UTF-16 offset, as AX reports selection, into a character index.
+///
+/// Offsets beyond the text clamp to its length rather than failing: AX and the
+/// mirror can disagree momentarily when text changes between two reads, and a
+/// caret at the end is a far better answer than no caret at all.
+pub fn utf16_to_char_index(text: &str, utf16_offset: usize) -> usize {
+    let mut utf16 = 0usize;
+    for (index, character) in text.chars().enumerate() {
+        if utf16 >= utf16_offset {
+            return index;
+        }
+        utf16 += character.len_utf16();
+    }
+    text.chars().count()
+}
+
+/// Resolves a character offset within the whole text to a position in a run.
+///
+/// An offset on a run boundary lands at the start of the *following* run,
+/// matching where a caret appears when it moves off the end of a line.
+pub fn position(layout: &[RunLayout], offset: usize) -> Option<TextPosition> {
+    for run in layout {
+        if offset < run.start + run.len {
+            return Some(TextPosition {
+                node: run.id,
+                character_index: offset.saturating_sub(run.start),
+            });
+        }
+    }
+    // Past every run: the end of the last one, which is where an
+    // end-of-document caret belongs.
+    layout.last().map(|run| TextPosition {
+        node: run.id,
+        character_index: run.len,
+    })
+}
+
+/// Builds the `TextRun` children of a text element.
+///
+/// Returns the runs and their layout, the latter so a caret offset can be
+/// resolved afterwards. `id_for_run` supplies a stable id per run index — run
+/// ids must survive a re-walk exactly as element ids do, or every keystroke
+/// would replace the whole paragraph rather than update it.
+pub fn build_runs(
+    text: &str,
+    mut id_for_run: impl FnMut(usize) -> NodeId,
+) -> (Vec<(NodeId, Node)>, Vec<RunLayout>) {
+    let text = clamp(text);
+    let mut nodes = Vec::new();
+    let mut layout = Vec::new();
+    let mut start = 0usize;
+    for (index, run) in split_runs(text).into_iter().enumerate() {
+        let id = id_for_run(index);
+        let mut node = Node::new(Role::TextRun);
+        node.set_value(run);
+        let lengths = character_lengths(run);
+        let len = lengths.len();
+        node.set_character_lengths(lengths);
+        let words = word_starts(run);
+        if !words.is_empty() {
+            node.set_word_starts(words);
+        }
+        nodes.push((id, node));
+        layout.push(RunLayout { id, start, len });
+        start += len;
+    }
+    (nodes, layout)
+}
+
+/// Builds the container's selection from AX's UTF-16 range.
+///
+/// A zero-length range is a caret, which AccessKit represents as a degenerate
+/// selection — anchor equal to focus.
+pub fn selection(
+    text: &str,
+    layout: &[RunLayout],
+    utf16_start: usize,
+    utf16_len: usize,
+) -> Option<TextSelection> {
+    let start = utf16_to_char_index(text, utf16_start);
+    let end = utf16_to_char_index(text, utf16_start + utf16_len);
+    Some(TextSelection {
+        anchor: position(layout, start)?,
+        focus: position(layout, end)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout_of(text: &str) -> Vec<RunLayout> {
+        let mut next = 100u64;
+        build_runs(text, |_| {
+            next += 1;
+            NodeId(next)
+        })
+        .1
+    }
+
+    #[test]
+    fn runs_are_lines_and_keep_their_newline() {
+        assert_eq!(split_runs("one\ntwo"), vec!["one\n", "two"]);
+        assert_eq!(split_runs("single"), vec!["single"]);
+    }
+
+    #[test]
+    fn a_caret_at_the_very_end_always_has_a_run_to_sit_in() {
+        // Text ending in a newline, and empty text, are the two cases where a
+        // naive split leaves the caret homeless.
+        assert_eq!(split_runs("line\n"), vec!["line\n", ""]);
+        assert_eq!(split_runs(""), vec![""]);
+    }
+
+    #[test]
+    fn character_lengths_are_utf8_bytes_per_character() {
+        assert_eq!(character_lengths("abc"), vec![1, 1, 1]);
+        // Not UTF-16 units: an emoji is one character of four bytes.
+        assert_eq!(character_lengths("a😀b"), vec![1, 4, 1]);
+        assert_eq!(character_lengths("日本"), vec![3, 3]);
+    }
+
+    /// **The conversion that misplaces a caret if it is wrong.** AX counts
+    /// UTF-16 units, AccessKit counts characters, and an emoji is two of the
+    /// former and one of the latter.
+    #[test]
+    fn utf16_offsets_convert_across_the_astral_planes() {
+        // "a😀b": UTF-16 is [a][😀 hi][😀 lo][b], characters are [a][😀][b].
+        let text = "a😀b";
+        assert_eq!(utf16_to_char_index(text, 0), 0);
+        assert_eq!(utf16_to_char_index(text, 1), 1, "start of the emoji");
+        assert_eq!(utf16_to_char_index(text, 3), 2, "after the surrogate pair");
+        assert_eq!(utf16_to_char_index(text, 4), 3, "end of the text");
+
+        // BMP multi-byte characters are one UTF-16 unit each, so offsets track.
+        let cjk = "日本語";
+        assert_eq!(utf16_to_char_index(cjk, 2), 2);
+        assert_eq!(utf16_to_char_index(cjk, 3), 3);
+
+        // Past the end clamps rather than failing: the two sides can disagree
+        // for an instant when text changes between reads.
+        assert_eq!(utf16_to_char_index(text, 999), 3);
+    }
+
+    #[test]
+    fn a_position_resolves_into_the_right_run() {
+        // "ab\ncd" is runs ["ab\n", "cd"], characters 0..3 and 3..5.
+        let layout = layout_of("ab\ncd");
+        assert_eq!(layout.len(), 2);
+        let first = layout[0].id;
+        let second = layout[1].id;
+
+        assert_eq!(position(&layout, 0).unwrap(), TextPosition { node: first, character_index: 0 });
+        assert_eq!(position(&layout, 2).unwrap(), TextPosition { node: first, character_index: 2 });
+        // The boundary belongs to the next line, which is where the caret goes
+        // when it moves off the end of one.
+        assert_eq!(position(&layout, 3).unwrap(), TextPosition { node: second, character_index: 0 });
+        // Past the end sits at the end of the last run.
+        assert_eq!(position(&layout, 99).unwrap(), TextPosition { node: second, character_index: 2 });
+    }
+
+    #[test]
+    fn a_caret_is_a_degenerate_selection() {
+        let layout = layout_of("hello");
+        let caret = selection("hello", &layout, 2, 0).unwrap();
+        assert_eq!(caret.anchor, caret.focus, "a caret has no extent");
+        assert_eq!(caret.focus.character_index, 2);
+    }
+
+    #[test]
+    fn a_real_selection_keeps_its_direction() {
+        let layout = layout_of("hello world");
+        let selected = selection("hello world", &layout, 6, 5).unwrap();
+        assert_eq!(selected.anchor.character_index, 6);
+        assert_eq!(selected.focus.character_index, 11);
+    }
+
+    #[test]
+    fn a_selection_measured_in_utf16_lands_on_the_right_characters() {
+        // The case that would silently break: selecting "b" after an emoji.
+        let text = "a😀b";
+        let layout = layout_of(text);
+        // UTF-16: a=0, emoji=1..3, b=3. Selecting b is start 3, length 1.
+        let selected = selection(text, &layout, 3, 1).unwrap();
+        assert_eq!(selected.anchor.character_index, 2, "b is the third character");
+        assert_eq!(selected.focus.character_index, 3);
+    }
+
+    #[test]
+    fn runs_carry_their_text_and_per_character_data() {
+        let (nodes, layout) = build_runs("hi there", |index| NodeId(index as u64 + 1));
+        assert_eq!(nodes.len(), 1);
+        let (id, node) = &nodes[0];
+        assert_eq!(*id, NodeId(1));
+        assert_eq!(node.role(), Role::TextRun);
+        assert_eq!(node.value(), Some("hi there"));
+        assert_eq!(node.character_lengths().len(), 8);
+        assert_eq!(node.word_starts(), &[0, 3], "two words");
+        assert_eq!(layout[0].len, 8);
+    }
+
+    #[test]
+    fn overlong_text_is_clamped_on_a_character_boundary() {
+        let long = "😀".repeat(MAX_TEXT_CHARS + 10);
+        let clamped = clamp(&long);
+        assert_eq!(clamped.chars().count(), MAX_TEXT_CHARS);
+        // Still valid UTF-8, i.e. not cut through a multi-byte character.
+        assert!(clamped.chars().all(|c| c == '😀'));
+    }
+
+    #[test]
+    fn word_starts_degrade_rather_than_truncate() {
+        // AccessKit stores these as u8, so a run with a word starting past 255
+        // has no usable word data — reporting none is honest, reporting wrong
+        // offsets is not.
+        let long = format!("{}word", " ".repeat(300));
+        assert!(word_starts(&long).is_empty());
+        assert_eq!(word_starts("one two"), vec![0, 4]);
+    }
+}

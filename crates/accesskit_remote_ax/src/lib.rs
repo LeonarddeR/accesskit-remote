@@ -11,6 +11,7 @@ pub mod observe;
 pub mod opt_in;
 pub mod role;
 mod source;
+pub mod text;
 pub mod trust;
 pub mod walk;
 

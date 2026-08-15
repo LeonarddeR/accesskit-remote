@@ -419,6 +419,24 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   Settings, an indiscriminate version would toggle the machine's real
   configuration.
 
+- **Text is exposed as `TextRun` children**, one per hard line, with a trailing
+  empty run so an end-of-document caret (and the caret in an empty field) has
+  somewhere to sit. Live on TextEdit: `MultilineTextInput` with its content run
+  and the empty one.
+- **Three offset systems meet in the text path** and confusing them silently
+  misplaces the caret: AX reports selection as a `CFRange` in *UTF-16 code
+  units*, AccessKit's `character_index` counts *characters*, and each
+  `character_lengths` entry is a count of *UTF-8 bytes*. An emoji is 2, 1 and 4
+  of those respectively. The conversions are pure functions tested across the
+  astral planes rather than written inline.
+- Run ids come from the same counter as element ids and are equally
+  append-only. A run whose id changed per walk would make every keystroke
+  replace the paragraph instead of updating it.
+- Not yet done: per-character geometry (`kAXBoundsForRangeParameterizedAttribute`
+  gets a run's rect in one call, so the AT-SPI per-code-point cost does not
+  apply), and soft-wrapped visual lines via `kAXRangeForLineParameterizedAttribute`
+  rather than splitting on hard newlines.
+
 ### macOS / AX at scale
 
 Measured 2026-08-16 against a long Wikipedia article ("World War II") in Safari,
