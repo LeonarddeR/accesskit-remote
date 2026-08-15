@@ -93,10 +93,13 @@ Inside a Linux distro (from Windows, wrap in `wsl -e bash -lc '...'`):
 ```
 cargo test -p accesskit_remote -p accesskit_remote_transport \
            -p accesskit_remote_server -p accesskit_remote_client \
-           -p accesskit_remote_atspi -p accesskit_remoted -p xtask
+           -p accesskit_remote_source -p accesskit_remote_atspi \
+           -p accesskit_remoted -p xtask
 ```
 
-`.github/workflows/ci.yml` is the authoritative form of both.
+On macOS, the same list without `accesskit_remote_atspi`.
+
+`.github/workflows/ci.yml` is the authoritative form of all three.
 
 ## Workspace layout
 
@@ -105,6 +108,7 @@ cargo test -p accesskit_remote -p accesskit_remote_transport \
 | `accesskit_remote` | any | Wire protocol: message schema, DVC-compatible framing, handshake. No I/O. |
 | `accesskit_remote_transport` | any | Byte-pump trait with DVC semantics + socket implementations. |
 | `accesskit_remote_server` | any | Session/window registry, tree multiplexing, action routing over a `TreeSource` trait. |
+| `accesskit_remote_source` | any | Source-agnostic tree-source building blocks: re-walk debounce, per-node refresh limiting, focus tracking, window reconciliation. |
 | `accesskit_remote_atspi` | Linux | AT-SPI tree source: mirrors AT-SPI into AccessKit trees. |
 | `accesskit_remoted` | Linux | The daemon: AT-SPI source + server + socket transport. |
 | `accesskit_remote_client` | any | Client core: receives the protocol, maintains per-window tree stores, routes actions. |

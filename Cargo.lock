@@ -40,6 +40,7 @@ dependencies = [
  "accesskit_consumer",
  "accesskit_remote",
  "accesskit_remote_server",
+ "accesskit_remote_source",
  "atspi",
  "tokio",
  "tokio-stream",
@@ -87,6 +88,13 @@ dependencies = [
  "accesskit",
  "accesskit_remote",
  "accesskit_remote_transport",
+]
+
+[[package]]
+name = "accesskit_remote_source"
+version = "0.1.0"
+dependencies = [
+ "accesskit_remote",
 ]
 
 [[package]]

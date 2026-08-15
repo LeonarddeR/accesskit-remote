@@ -34,7 +34,7 @@ jobs:
       # CARGO_MANIFEST_DIR (absolute, arch-aware). A relative override would be
       # wrong here, since cargo test runs with the package dir as CWD.
       - name: Test Windows crates
-        run: cargo test --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin -p accesskit_remote_windows
+        run: cargo test --target ${{ matrix.target }} -p accesskit_remote_dvc_plugin -p accesskit_remote_windows -p accesskit_remote_source
 
   linux:
     name: linux (${{ matrix.runner }})
@@ -55,6 +55,28 @@ jobs:
           -p accesskit_remote_transport
           -p accesskit_remote_server
           -p accesskit_remote_client
+          -p accesskit_remote_source
           -p accesskit_remote_atspi
+          -p accesskit_remoted
+          -p xtask
+
+  macos:
+    name: macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The macOS runner has no logged-in session and no Accessibility grant,
+      # so only the pure crates run here; a live AX source is exercised by the
+      # examples on a real desktop, never by `cargo test`.
+      - name: Test platform-agnostic crates
+        run: >
+          cargo test
+          -p accesskit_remote
+          -p accesskit_remote_transport
+          -p accesskit_remote_server
+          -p accesskit_remote_client
+          -p accesskit_remote_source
           -p accesskit_remoted
           -p xtask

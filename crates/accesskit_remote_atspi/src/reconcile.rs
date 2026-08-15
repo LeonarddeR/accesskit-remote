@@ -1,8 +1,9 @@
-//! Pure, bus-free reconciliation of the tracked toplevel window set against a
-//! fresh discovery snapshot. Operates on plain [`WindowKey`]s so it can be
-//! unit tested without a live accessibility bus.
-
-use std::collections::HashSet;
+//! AT-SPI's notion of toplevel window identity, for
+//! [`accesskit_remote_source::reconcile::reconcile_windows`].
+//!
+//! The diff itself is source-agnostic and lives in the shared crate; what is
+//! AT-SPI-specific is what makes two windows the same window, which is what
+//! [`WindowKey`] captures.
 
 /// Stable identity of a toplevel window: its owning application's unique bus
 /// name plus the frame's object path. AT-SPI object paths repeat across
@@ -13,38 +14,10 @@ pub struct WindowKey {
     pub path: String,
 }
 
-/// The result of diffing tracked windows against a fresh discovery: indices
-/// into `discovered` that are new, and indices into `tracked` that are gone.
-/// Windows present in both are absent from both lists.
-#[derive(Debug, PartialEq, Eq)]
-pub struct WindowDiff {
-    pub added: Vec<usize>,
-    pub removed: Vec<usize>,
-}
-
-/// Diffs the freshly `discovered` window keys against the currently `tracked`
-/// ones by identity.
-pub fn reconcile_windows(tracked: &[WindowKey], discovered: &[WindowKey]) -> WindowDiff {
-    let tracked_set: HashSet<&WindowKey> = tracked.iter().collect();
-    let discovered_set: HashSet<&WindowKey> = discovered.iter().collect();
-    let added = discovered
-        .iter()
-        .enumerate()
-        .filter(|(_, key)| !tracked_set.contains(key))
-        .map(|(index, _)| index)
-        .collect();
-    let removed = tracked
-        .iter()
-        .enumerate()
-        .filter(|(_, key)| !discovered_set.contains(key))
-        .map(|(index, _)| index)
-        .collect();
-    WindowDiff { added, removed }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accesskit_remote_source::reconcile::reconcile_windows;
 
     fn key(bus_name: &str, path: &str) -> WindowKey {
         WindowKey {

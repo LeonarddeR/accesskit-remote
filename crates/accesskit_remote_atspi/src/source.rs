@@ -4,18 +4,18 @@
 //! actions in via a tokio channel, tree events out via a std channel.
 
 use crate::app_id::AppIdResolver;
-use crate::coalesce::RewalkCoalescer;
-use crate::focus::FocusTracker;
-use crate::invalidate::{
-    property_is_mirrored, selection_refresh_targets, state_is_mirrored, NodeRefreshLimiter,
-};
+use crate::invalidate::{property_is_mirrored, state_is_mirrored};
 use crate::mapping::{
     build_window_update, emitted_children, focus_update, merge_update, rebuild_text_node,
     refresh_node, splice_chain_update, text_offset, NodeIdMap, WindowCache,
 };
 use crate::mirror::{self, BridgeResult, SelectedChildren};
-use crate::reconcile::{reconcile_windows, WindowKey};
+use crate::reconcile::WindowKey;
 use accesskit_remote::WindowId;
+use accesskit_remote_source::coalesce::RewalkCoalescer;
+use accesskit_remote_source::focus::FocusTracker;
+use accesskit_remote_source::limiter::{selection_refresh_targets, NodeRefreshLimiter};
+use accesskit_remote_source::reconcile::reconcile_windows;
 use accesskit_remote_server::{SourceEvent, TreeSource, WindowDescriptor};
 use atspi::connection::AccessibilityConnection;
 use atspi::events::object::{
@@ -62,6 +62,9 @@ const NODE_REFRESH_MAX_DELAY: Duration = Duration::from_millis(500);
 const MAX_SELECTED_CHILDREN: usize = 32;
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
+
+/// The shared per-node refresh limiter, keyed by AT-SPI object path.
+type NodeRefresh = NodeRefreshLimiter<String>;
 
 /// An action to perform, routed from the sync side to the bridge thread with
 /// its request payload intact.
@@ -187,7 +190,7 @@ async fn bridge_main(
     let mut reconcile_timer = tokio::time::interval(RECONCILE_INTERVAL);
     reconcile_timer.tick().await; // Drop the immediate first tick; the initial enumeration just ran.
     let mut pending = RewalkCoalescer::new(REWALK_DEBOUNCE_QUIET, REWALK_DEBOUNCE_MAX_DELAY);
-    let mut refresh = NodeRefreshLimiter::new(NODE_REFRESH_MIN_INTERVAL, NODE_REFRESH_MAX_DELAY);
+    let mut refresh = NodeRefresh::new(NODE_REFRESH_MIN_INTERVAL, NODE_REFRESH_MAX_DELAY);
     'pump: loop {
         // One timer arm serves both schedules; each drains whatever is due.
         let next_timer = earliest(pending.next_deadline(), refresh.next_deadline());
@@ -469,7 +472,7 @@ impl Mirror {
         conn: &AccessibilityConnection,
         event: Event,
         pending: &mut RewalkCoalescer,
-        refresh: &mut NodeRefreshLimiter,
+        refresh: &mut NodeRefresh,
     ) -> Vec<SourceEvent> {
         if is_window_lifecycle_event(&event) {
             let out = self.reconcile(conn).await;
@@ -754,7 +757,7 @@ impl Mirror {
         conn: &AccessibilityConnection,
         sender: &str,
         path: &str,
-        refresh: &mut NodeRefreshLimiter,
+        refresh: &mut NodeRefresh,
     ) -> Vec<SourceEvent> {
         let Some(index) = resolve_tracked_node(&self.windows, sender, path) else {
             return Vec::new();
@@ -776,7 +779,7 @@ impl Mirror {
         conn: &AccessibilityConnection,
         sender: &str,
         path: &str,
-        refresh: &mut NodeRefreshLimiter,
+        refresh: &mut NodeRefresh,
         pending: &mut RewalkCoalescer,
     ) -> Vec<SourceEvent> {
         let Some(index) = resolve_tracked_node(&self.windows, sender, path) else {

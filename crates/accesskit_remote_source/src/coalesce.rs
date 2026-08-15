@@ -1,9 +1,9 @@
-//! Trailing per-window debounce for AT-SPI subtree re-walks. A burst of
+//! Trailing per-window debounce for subtree re-walks. A burst of
 //! invalidations for the same window collapses into one walk, fired `quiet`
 //! after the last invalidation but never later than `max_delay` after the
 //! first — so a window that keeps changing still gets walked eventually.
-//! Pure and clock-free: callers supply `now`, so it is unit tested without
-//! tokio or a live bus.
+//! Pure and clock-free: callers supply `now`, so it is unit tested without a
+//! live accessibility API.
 
 use accesskit_remote::WindowId;
 use std::collections::HashMap;

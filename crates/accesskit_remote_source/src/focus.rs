@@ -1,11 +1,11 @@
-//! Window-level focus tracking for the mirror.
+//! Window-level focus tracking for a tree source.
 //!
-//! Pure, bus-free bookkeeping of which toplevel holds session focus. It
-//! deduplicates and orders the window-level `FocusChanged` the mirror emits so
-//! that redundant activations produce no wire traffic and a removed window
-//! never produces a `FocusChanged(Some(removed))` — the daemon closes the
-//! connection if asked to focus an unannounced window, and the client already
-//! nulls its own focus when a focused window is removed.
+//! Pure bookkeeping of which toplevel holds session focus, with no
+//! accessibility API involved. It deduplicates and orders the window-level
+//! `FocusChanged` a source emits so that redundant activations produce no wire
+//! traffic and a removed window never produces a `FocusChanged(Some(removed))`
+//! — the daemon closes the connection if asked to focus an unannounced window,
+//! and the client already nulls its own focus when a focused window is removed.
 
 use accesskit_remote::WindowId;
 
