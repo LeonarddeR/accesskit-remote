@@ -330,6 +330,31 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   consumer (77%). That is the tree-inflation metric to watch when the role map
   is broadened.
 
+- **Notifications arrive, and every application registered all 22 without a
+  single refusal** (Finder, TextEdit, Safari, System Settings, 1Password).
+  That is a sharp contrast with GTK4, which emitted no `window:create` at all
+  and forced a whole fallback route on the Linux side. Measured with
+  `ax_events`, the AX counterpart of `busctl monitor`.
+- **`AXUIElementDestroyed` fires per *element*, not per window** — 49 of them
+  in one burst from merely activating TextEdit. It is therefore routed to a
+  debounced re-walk, not to a window-set reconcile; spending a full desktop
+  enumeration on transient views being torn down would be ruinous. The element
+  is already gone when the notification arrives, so its role cannot be read to
+  tell a window from a subview. A window that genuinely vanishes is caught by
+  the periodic reconcile.
+- **`AXValueChanged` arrives in duplicated bursts**: 33 events at one
+  timestamp, each element reporting twice (font face, style and size popups all
+  firing on a single app activation). This is exactly the shape the
+  `NodeRefreshLimiter`'s leading-plus-trailing rate limit exists for, and it
+  confirms the AT-SPI constants are worth inheriting rather than re-deriving.
+- App switching produced `AXApplicationActivated`/`Deactivated` but **no
+  `AXFocusedUIElementChanged`** in that run. Whether within-window focus moves
+  are reported at all is still open, and matters: focus is the one route that
+  costs no reads.
+- Observer sources must be added to the *current thread's* run loop, never the
+  main one. Getting that wrong yields an observer that registers cleanly,
+  reports its source as attached, and never fires.
+
 Still unmeasured: a large document or lazily-populated table (identity and walk
 cost at scale), a Java or Qt application, and an *unlocked* Electron window —
 1Password was at its lock screen, so the opt-in was verified by acceptance and

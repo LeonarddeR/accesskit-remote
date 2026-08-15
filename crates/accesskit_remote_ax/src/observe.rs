@@ -55,9 +55,17 @@ pub enum Route {
 pub const SUBSCRIPTIONS: &[(&str, Route)] = &[
     // Window set.
     ("AXWindowCreated", Route::Lifecycle),
-    ("AXUIElementDestroyed", Route::Lifecycle),
     ("AXDrawerCreated", Route::Lifecycle),
     ("AXSheetCreated", Route::Lifecycle),
+    // Measured, not assumed: `AXUIElementDestroyed` fires for *any* element,
+    // not just windows — 49 of them arrived in a single burst from merely
+    // activating TextEdit. Routing each to a window-set reconcile would spend
+    // a full desktop enumeration on transient views being torn down. It is a
+    // structural change to one window, so it debounces like one; a window that
+    // genuinely vanishes is caught by the periodic reconcile instead. The
+    // element is already destroyed by the time this arrives, so its role
+    // cannot be read to tell the two apart.
+    ("AXUIElementDestroyed", Route::Rewalk),
     // Focus.
     ("AXFocusedUIElementChanged", Route::Focus),
     ("AXFocusedWindowChanged", Route::Focus),
@@ -291,6 +299,15 @@ mod tests {
                 "{noisy} would fire on every drag"
             );
         }
+    }
+
+    /// Pins the measured routing of the highest-volume notification. It fires
+    /// per element, not per window: 49 in one burst from a single app
+    /// activation, so a window-set reconcile each would be ruinous.
+    #[test]
+    fn a_destroyed_element_re_walks_rather_than_reconciles() {
+        assert_eq!(route("AXUIElementDestroyed"), Route::Rewalk);
+        assert_eq!(route("AXWindowCreated"), Route::Lifecycle);
     }
 
     #[test]
