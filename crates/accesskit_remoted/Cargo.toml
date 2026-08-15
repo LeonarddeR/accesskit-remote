@@ -17,3 +17,6 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 accesskit_remote_atspi.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accesskit_remote_ax.workspace = true

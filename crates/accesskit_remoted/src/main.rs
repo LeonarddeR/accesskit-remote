@@ -1,8 +1,8 @@
 //! The provider daemon. Serves a tree source over a socket.
 //!
-//! Usage: `accesskit_remoted [--tcp PORT | --vsock PORT] [--atspi]`
+//! Usage: `accesskit_remoted [--tcp PORT | --vsock PORT] [--atspi | --ax]`
 //! Defaults to `--tcp 4750` with the demo source; `--vsock` and `--atspi`
-//! are Linux-only.
+//! are Linux-only, `--ax` is macOS-only.
 
 mod demo;
 // Only the AT-SPI path wraps the source, so the module is unused off Linux.
@@ -42,6 +42,8 @@ enum Source {
     Demo,
     #[cfg(target_os = "linux")]
     Atspi,
+    #[cfg(target_os = "macos")]
+    Ax,
 }
 
 #[cfg(target_os = "linux")]
@@ -52,6 +54,16 @@ fn select_atspi() -> io::Result<Source> {
 #[cfg(not(target_os = "linux"))]
 fn select_atspi() -> io::Result<Source> {
     Err(io::Error::other("--atspi is only supported on Linux"))
+}
+
+#[cfg(target_os = "macos")]
+fn select_ax() -> io::Result<Source> {
+    Ok(Source::Ax)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn select_ax() -> io::Result<Source> {
+    Err(io::Error::other("--ax is only supported on macOS"))
 }
 
 fn main() -> io::Result<()> {
@@ -85,6 +97,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<(Listener, Strin
     for arg in args {
         match arg.as_str() {
             "--atspi" => source = select_atspi()?,
+            "--ax" => source = select_ax()?,
             _ => positional.push(arg),
         }
     }
@@ -98,7 +111,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<(Listener, Strin
         ),
         _ => {
             return Err(io::Error::other(
-                "usage: accesskit_remoted [--tcp PORT | --vsock PORT] [--atspi]",
+                "usage: accesskit_remoted [--tcp PORT | --vsock PORT] [--atspi | --ax]",
             ))
         }
     };
@@ -130,6 +143,14 @@ fn serve(stream: Socket, source: Source) -> io::Result<()> {
                 None => Box::new(inner),
             };
             (source, "accesskit_remoted-atspi")
+        }
+        #[cfg(target_os = "macos")]
+        Source::Ax => {
+            // The Accessibility grant is checked here rather than at start-up:
+            // a daemon that outlives a revoked grant should fail the next
+            // connection with the explanation, not have exited hours earlier.
+            let source = accesskit_remote_ax::AxSource::new().map_err(io::Error::other)?;
+            (Box::new(source) as Box<dyn TreeSource>, "accesskit_remoted-ax")
         }
     };
     let mut server = ServerConnection::new(name);

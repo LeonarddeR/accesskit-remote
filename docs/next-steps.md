@@ -20,7 +20,8 @@ Two end-to-end milestones are proven live:
 |---|---|
 | `accesskit_remote` | Framing, JSON codec, sans-I/O `Session` handshake; `WindowAdded` carries an optional `nativeWindowId` |
 | `accesskit_remote_transport` | TCP + vsock listener (Linux) + hvsocket connector (Windows), verified across the WSL boundary |
-| `accesskit_remoted` | `--tcp\|--vsock [PORT]`; `--atspi` swaps `DemoSource` for `AtspiSource`; WSLg window-id enrichment off the weston log; tracing via `ACCESSKIT_REMOTED_LOG` |
+| `accesskit_remoted` | `--tcp\|--vsock [PORT]`; `--atspi`/`--ax` swap `DemoSource` for `AtspiSource`/`AxSource`; WSLg window-id enrichment off the weston log; tracing via `ACCESSKIT_REMOTED_LOG` |
+| `accesskit_remote_ax` | macOS AX source: role+subrole map, batched per-element reads, window discovery, window-relative geometry, `AxSource` implementing `TreeSource`. Live end to end: `accesskit_remoted --ax --tcp` serves real Mac windows to the platform-agnostic `probe` client |
 | `accesskit_remote_source` | Source-agnostic and platform-neutral: `RewalkCoalescer`, `NodeRefreshLimiter<K>`, `FocusTracker`, `reconcile_windows<K>`. Shared by every tree source; tested on Linux, Windows and macOS |
 | `accesskit_remote_atspi` | Roles, states, text runs + geometry + widget-level direction, focus, caret, numeric value, table geometry, cell coordinates, placeholder/level/posinset/setsize, relations, window lifecycle, per-node refresh, debounced re-walks |
 | `accesskit_remote_windows` | Visible-window adapter (no visibility precondition), `post_delta` / `post_focus` via a registered window message |

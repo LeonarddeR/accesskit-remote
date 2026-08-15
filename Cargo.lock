@@ -145,6 +145,7 @@ dependencies = [
  "accesskit",
  "accesskit_remote",
  "accesskit_remote_atspi",
+ "accesskit_remote_ax",
  "accesskit_remote_server",
  "accesskit_remote_transport",
  "tracing",
