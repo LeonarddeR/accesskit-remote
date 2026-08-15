@@ -5,6 +5,7 @@ pub mod ax;
 pub mod element;
 pub mod names;
 pub mod node;
+pub mod observe;
 pub mod opt_in;
 pub mod role;
 mod source;
