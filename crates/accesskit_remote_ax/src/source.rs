@@ -53,6 +53,15 @@ const REWALK_MAX_DELAY: Duration = Duration::from_secs(2);
 const REFRESH_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const REFRESH_MAX_DELAY: Duration = Duration::from_millis(500);
 
+/// How often the window set is re-discovered and the focused window re-walked.
+///
+/// Two jobs. It catches window lifecycle an application did not announce — the
+/// safety net the AT-SPI source uses it for. And it is the only thing that
+/// corrects geometry after a scroll: scrolling a WebKit page produces no
+/// notification at all, so without this every element's bounds stay wrong from
+/// the first scroll onwards.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
+
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
 /// Work sent from the sync side to the AX thread.
@@ -172,6 +181,7 @@ fn worker(
     let mut pending = RewalkCoalescer::new(REWALK_QUIET, REWALK_MAX_DELAY);
     let mut refresh: NodeRefreshLimiter<ElementKey> =
         NodeRefreshLimiter::new(REFRESH_MIN_INTERVAL, REFRESH_MAX_DELAY);
+    let mut next_reconcile = Instant::now() + RECONCILE_INTERVAL;
 
     let snapshot =
         enumerate(&names, &mut windows, &mut next_id, &mut focus, &queue, &mut observers);
@@ -205,12 +215,21 @@ fn worker(
 
         let now = Instant::now();
         if !route_notifications(
-            &events, &queue, &names, &mut windows, &mut pending, &mut refresh, now,
+            &events, &queue, &names, &mut windows, &mut pending, &mut refresh, &mut focus, now,
         ) {
             break;
         }
         if !drain_due(&events, &names, &mut windows, &mut pending, &mut refresh, now) {
             break;
+        }
+        if now >= next_reconcile {
+            next_reconcile = now + RECONCILE_INTERVAL;
+            if !reconcile(
+                &events, &names, &mut windows, &mut next_id, &mut focus, &queue, &mut observers,
+                &mut pending, now,
+            ) {
+                break;
+            }
         }
     }
     // Observers hold sources on this thread's run loop and must be dropped
@@ -230,6 +249,7 @@ fn route_notifications(
     windows: &mut [WindowState],
     pending: &mut RewalkCoalescer,
     refresh: &mut NodeRefreshLimiter<ElementKey>,
+    focus: &mut FocusTracker,
     now: Instant,
 ) -> bool {
     let drained: Vec<observe::Notification> = queue.borrow_mut().drain(..).collect();
@@ -257,6 +277,24 @@ fn route_notifications(
                 }
                 if !emit_refresh(events, names, &mut windows[index], &key) {
                     return false;
+                }
+            }
+            // Focus moved. Which *window* now holds it is what the wire
+            // carries; focus within a window rides its next tree update. This
+            // costs no reads: the focused element came with the notification.
+            Route::Focus => {
+                let window = window_holding(windows, &key)
+                    .or_else(|| windows.iter().position(|w| w.pid == notification.pid))
+                    .map(|index| windows[index].id);
+                if let Some(id) = window {
+                    // A window whose element moved focus is also the one whose
+                    // geometry a reader is about to need, so refresh it.
+                    pending.note(id, now);
+                }
+                if let Some(change) = window.and_then(|id| focus.focus(id)) {
+                    if events.send(SourceEvent::FocusChanged(change)).is_err() {
+                        return false;
+                    }
                 }
             }
             // Structure changed, or an element vanished: the shape of the
@@ -386,6 +424,135 @@ fn drain_due(
             .is_err()
         {
             return false;
+        }
+    }
+    true
+}
+
+/// Re-discovers the window set, announcing what appeared and retiring what is
+/// gone, and marks the focused window for a walk.
+///
+/// The safety net, and on macOS also a necessity rather than a backstop:
+/// scrolling produces no notification, so this tick is the only thing that ever
+/// corrects a scrolled window's geometry.
+#[allow(clippy::too_many_arguments)]
+fn reconcile(
+    events: &mpsc::Sender<SourceEvent>,
+    names: &Names,
+    windows: &mut Vec<WindowState>,
+    next_id: &mut u64,
+    focus: &mut FocusTracker,
+    queue: &Queue,
+    observers: &mut Vec<AppObserver>,
+    pending: &mut RewalkCoalescer,
+    now: Instant,
+) -> bool {
+    let apps = ax::running_apps();
+    let mut discovered: Vec<(ax::Window, i32)> = Vec::new();
+    let mut live_pids: HashSet<i32> = HashSet::new();
+    for app in &apps {
+        live_pids.insert(app.pid);
+        // An application seen for the first time needs its opt-in and its
+        // observer; one already known must not be asked twice.
+        if !observers.iter().any(|observer| observer.pid() == app.pid) {
+            opt_in::request(&app.element, names);
+            if let Ok((observer, _)) = AppObserver::new(app.pid, &app.element, queue) {
+                observers.push(observer);
+            }
+        }
+        for window in ax::windows_of(app, names).unwrap_or_default() {
+            discovered.push((window, app.pid));
+        }
+    }
+    // An application that quit takes its observer with it, so the run loop
+    // stops carrying a source for a process that no longer exists.
+    observers.retain(|observer| live_pids.contains(&observer.pid()));
+
+    tracing::debug!(
+        apps = apps.len(),
+        discovered = discovered.len(),
+        tracked = windows.len(),
+        "reconcile"
+    );
+    let present: HashSet<&ElementKey> = discovered.iter().map(|(w, _)| &w.key).collect();
+    let gone: Vec<WindowId> = windows
+        .iter()
+        .filter(|window| !present.contains(&window.key))
+        .map(|window| window.id)
+        .collect();
+    for id in &gone {
+        // Never emitted as a focus change: the client nulls its own focus when
+        // a window is removed, and naming a retired window would reference one
+        // the consumer has already been told to forget.
+        focus.remove(*id);
+        pending.discard(*id);
+        if events.send(SourceEvent::WindowRemoved(*id)).is_err() {
+            return false;
+        }
+    }
+    windows.retain(|window| !gone.contains(&window.id));
+
+    let known: HashSet<ElementKey> = windows.iter().map(|window| window.key.clone()).collect();
+    for (window, pid) in discovered {
+        if known.contains(&window.key) {
+            // Already tracked. A window the user is looking at is the one whose
+            // geometry matters, so keep it fresh against silent scrolling.
+            if window.active {
+                if let Some(state) = windows.iter().find(|state| state.key == window.key) {
+                    pending.note(state.id, now);
+                }
+            }
+            continue;
+        }
+        tracing::debug!(title = %window.title, pid, "reconcile found a new window");
+        let nodes = walk::walk_window(window.key.clone(), names);
+        let mut ids = NodeIdMap::new();
+        let mut emitted = EmittedTree::new();
+        let Some(update) = walk::build_window_update(&nodes, &mut ids)
+            .and_then(|full| emitted.reduce(full))
+        else {
+            tracing::debug!(title = %window.title, "new window walked empty; retrying next tick");
+            // Walks empty: almost always a window whose tree is not ready yet,
+            // measured as a delay of a second or more after it appears. Leaving
+            // it unannounced means the next tick picks it up, rather than the
+            // consumer holding a permanently blank window.
+            continue;
+        };
+        let id = WindowId(*next_id);
+        *next_id += 1;
+        let descriptor = WindowDescriptor {
+            id,
+            title: window.title,
+            app: window.app,
+            native_window_id: window.native_window_id,
+        };
+        windows.push(WindowState {
+            id,
+            key: window.key,
+            pid,
+            ids,
+            emitted,
+            origin: nodes
+                .first()
+                .and_then(|root| root.frame)
+                .map(|frame| (frame.origin.x, frame.origin.y)),
+            children: walk::emitted_children(&nodes),
+        });
+        if events
+            .send(SourceEvent::WindowAdded {
+                descriptor,
+                tree: update,
+            })
+            .is_err()
+        {
+            return false;
+        }
+        if window.active {
+            if let Some(change) = focus.focus(id) {
+                if events.send(SourceEvent::FocusChanged(change)).is_err() {
+                    return false;
+                }
+            }
         }
     }
     true

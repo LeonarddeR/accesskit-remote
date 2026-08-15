@@ -34,6 +34,15 @@ fn main() {
         }
     }
 
+    // `RUST_LOG=debug` surfaces the source's own reconcile and routing
+    // decisions, which is the difference between "nothing changed" and
+    // "something changed and we failed to notice".
+    tracing_subscriber::fmt()
+        .with_max_level(if std::env::var("RUST_LOG").is_ok() { tracing::Level::DEBUG } else { tracing::Level::WARN })
+        .with_writer(std::io::stderr)
+        .compact()
+        .init();
+
     let started = Instant::now();
     let mut source = match AxSource::new() {
         Ok(source) => source,

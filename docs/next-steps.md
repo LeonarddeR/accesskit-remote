@@ -385,6 +385,23 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   movement therefore has its own route — folding it into the semantic refresh
   would re-read a whole node on every cursor key.
 
+- **`NSWorkspace::runningApplications` is unusable from a worker thread.** It
+  is a cache refreshed from the *main* thread's run loop, so on the AX thread
+  it returns the same applications forever: one launched after start-up never
+  appears, one that quits never goes away. Measured directly — reconcile
+  reported `apps=5` indefinitely while a freshly started process saw 6. It
+  fails silently and looks exactly like a broken reconcile.
+  Discovery now takes its pid set from `CGWindowListCopyWindowInfo`, which has
+  no such cache and answers the question actually being asked (which
+  applications have windows), with `NSRunningApplication` used only for
+  per-pid metadata.
+- Window-level focus is emitted from the `AXApplicationActivated`/`Deactivated`
+  route and deduplicated by the shared `FocusTracker`: one `FocusChanged` per
+  application switch, not one per notification.
+- The reconcile tick is 3s rather than the AT-SPI source's 60s, because on
+  macOS it is not only a safety net — it is the sole mechanism that corrects a
+  scrolled window's geometry (see the scale findings below).
+
 ### macOS / AX at scale
 
 Measured 2026-08-16 against a long Wikipedia article ("World War II") in Safari,

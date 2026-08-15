@@ -60,20 +60,20 @@ pub struct Window {
 /// agents and daemons, which own no ordinary windows but would otherwise cost
 /// an IPC round trip each, on every reconcile, forever.
 pub fn running_apps() -> Vec<App> {
-    use objc2_app_kit::{NSApplicationActivationPolicy, NSWorkspace};
+    use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 
-    let workspace = NSWorkspace::sharedWorkspace();
-    let running = workspace.runningApplications();
     let mut apps = Vec::new();
-    for app in running.iter() {
+    for pid in on_screen_pids() {
+        // A per-pid lookup, deliberately not `NSWorkspace::runningApplications`
+        // — see `on_screen_pids` for why that list is unusable here.
+        let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid)
+        else {
+            continue;
+        };
         // SAFETY: `app` is a live NSRunningApplication; these are plain
         // property reads with no pointer arguments.
         unsafe {
             if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
-                continue;
-            }
-            let pid = app.processIdentifier();
-            if pid <= 0 {
                 continue;
             }
             let element = AXUIElement::new_application(pid);
@@ -102,6 +102,58 @@ pub fn running_apps() -> Vec<App> {
         }
     }
     apps
+}
+
+/// The pids of every process owning an on-screen window, from the window
+/// server.
+///
+/// **Not `NSWorkspace::runningApplications`**, which was the obvious choice and
+/// is silently wrong here. That list is a cache refreshed from the *main*
+/// thread's run loop; this source runs on a worker thread, so it returned the
+/// same applications forever — an application launched after start-up never
+/// appeared, and one that quit never went away. Measured directly: reconcile
+/// reported `apps=5` indefinitely while a freshly started process saw 6.
+///
+/// The window server has no such cache. It also answers the question actually
+/// being asked — which applications have windows — rather than which processes
+/// exist.
+fn on_screen_pids() -> Vec<i32> {
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString, CFType};
+    use objc2_core_graphics::{kCGWindowOwnerPID, CGWindowListCopyWindowInfo, CGWindowListOption};
+
+    // Excludes the desktop picture and its icons, which are windows but not
+    // application windows.
+    let options = CGWindowListOption::OptionOnScreenOnly
+        | CGWindowListOption::ExcludeDesktopElements;
+    let Some(list) = CGWindowListCopyWindowInfo(options, 0) else {
+        return Vec::new();
+    };
+
+    let mut pids = Vec::new();
+    for index in 0..list.count().max(0) as usize {
+        // SAFETY: `index` is within the array's count.
+        let entry = unsafe { list.value_at_index(index as isize) };
+        if entry.is_null() {
+            continue;
+        }
+        // SAFETY: the array holds CFDictionary entries per the API contract,
+        // borrowed for the lifetime of `list`.
+        let entry = unsafe { &*(entry as *const CFDictionary) };
+        // SAFETY: a live dictionary and a valid static key.
+        let value = unsafe { entry.value(kCGWindowOwnerPID.as_ref() as *const CFString as *const _) };
+        if value.is_null() {
+            continue;
+        }
+        // SAFETY: kCGWindowOwnerPID maps to a CFNumber per the API contract.
+        let number = unsafe { &*(value as *const CFType) };
+        if let Some(pid) = number.downcast_ref::<CFNumber>().and_then(|n| n.as_i32()) {
+            if pid > 0 && !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+        let _: Option<CFRetained<CFType>> = None;
+    }
+    pids
 }
 
 /// The windows of one application.
