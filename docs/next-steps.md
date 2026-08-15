@@ -385,7 +385,35 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   movement therefore has its own route — folding it into the semantic refresh
   would re-read a whole node on every cursor key.
 
-Still unmeasured: a large document or lazily-populated table (identity and walk
+### macOS / AX at scale
+
+Measured 2026-08-16 against a long Wikipedia article ("World War II") in Safari,
+the reproducible large-tree case.
+
+- **Identity holds at scale: 100% retention across a 6000-element re-walk.**
+  This is the result that de-risks the architecture. The equivalent assumption
+  broke on Linux against LibreOffice, whose lazily-minted per-cell accessibles
+  defeated id reuse; WebKit does not do that.
+- **WebKit is the *fastest* toolkit per node, not the slowest**: 5000 nodes in
+  522ms, ~0.10ms/node — 7x faster than the small AppKit windows and ~70x faster
+  than Catalyst. Tree size alone is not what costs.
+- **The 5000-node cap is reached by a single ordinary web page.** The article
+  walks to exactly `MAX_NODES_PER_WINDOW`, so its tail is truncated and
+  invisible to a reader. The cap was inherited from the AT-SPI source, where
+  the largest real tree was ~2400 nodes. It needs revisiting: either raised, or
+  replaced by something that keeps the *reachable* part of the document rather
+  than the first 5000 nodes breadth-first.
+- **Scrolling produces no notification at all** — zero, across the whole
+  subscription set, while scrolling the article. Two consequences. Good: a
+  lazily-populated document costs nothing to scroll, because WebKit exposes the
+  whole document regardless of scroll position. Bad: **every element's geometry
+  is stale the moment the user scrolls**, and nothing triggers a re-walk to fix
+  it. `AXMoved`/`AXResized` would fix it and cost a storm per scroll frame on a
+  5000-node page, which is why they are excluded. The workable answer is a
+  periodic re-walk of the focused window, which the reconcile tick provides.
+  Until then, bounds are correct only until the first scroll.
+
+Still unmeasured: a lazily-populated *table* (as opposed to document) (identity and walk
 cost at scale), a Java or Qt application, and an *unlocked* Electron window —
 1Password was at its lock screen, so the opt-in was verified by acceptance and
 by the presence of `AXWebArea` rather than by a tree that grew.
