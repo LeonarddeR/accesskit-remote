@@ -1,0 +1,21 @@
+[package]
+name = "accesskit_remote_ax"
+description = "macOS Accessibility (AXUIElement) tree source: mirrors AX trees into AccessKit trees"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accesskit.workspace = true
+accesskit_remote.workspace = true
+accesskit_remote_server.workspace = true
+accesskit_remote_source.workspace = true
+tracing.workspace = true
+objc2 = "0.6"
+libc = "0.2"
+objc2-application-services = "0.3"
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"

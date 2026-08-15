@@ -97,7 +97,10 @@ cargo test -p accesskit_remote -p accesskit_remote_transport \
            -p accesskit_remoted -p xtask
 ```
 
-On macOS, the same list without `accesskit_remote_atspi`.
+On macOS, the same list with `accesskit_remote_ax` in place of
+`accesskit_remote_atspi`. Reading a live tree needs the Accessibility grant;
+`cargo run -p accesskit_remote_ax --example ax_probe` reports whether the
+process has it.
 
 `.github/workflows/ci.yml` is the authoritative form of all three.
 
@@ -110,6 +113,7 @@ On macOS, the same list without `accesskit_remote_atspi`.
 | `accesskit_remote_server` | any | Session/window registry, tree multiplexing, action routing over a `TreeSource` trait. |
 | `accesskit_remote_source` | any | Source-agnostic tree-source building blocks: re-walk debounce, per-node refresh limiting, focus tracking, window reconciliation. |
 | `accesskit_remote_atspi` | Linux | AT-SPI tree source: mirrors AT-SPI into AccessKit trees. |
+| `accesskit_remote_ax` | macOS | Apple Accessibility (AXUIElement) tree source. |
 | `accesskit_remoted` | Linux | The daemon: AT-SPI source + server + socket transport. |
 | `accesskit_remote_client` | any | Client core: receives the protocol, maintains per-window tree stores, routes actions. |
 | `accesskit_remote_windows` | Windows | Exposes remote trees to UIA on RAIL window HWNDs. |

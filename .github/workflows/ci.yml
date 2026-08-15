@@ -78,5 +78,6 @@ jobs:
           -p accesskit_remote_server
           -p accesskit_remote_client
           -p accesskit_remote_source
+          -p accesskit_remote_ax
           -p accesskit_remoted
           -p xtask
