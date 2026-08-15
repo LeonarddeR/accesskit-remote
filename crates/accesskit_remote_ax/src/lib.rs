@@ -5,5 +5,6 @@ pub mod ax;
 pub mod element;
 pub mod names;
 pub mod opt_in;
+pub mod role;
 pub mod trust;
 pub mod window_id;

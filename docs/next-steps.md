@@ -282,6 +282,23 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   Either grant `/usr/libexec/sshd-keygen-wrapper` (which widens access to every
   later SSH session) or run from a granted terminal on the Mac.
 
+- **The role map covers a real desktop.** `ax_probe --roles` over Finder,
+  TextEdit, Safari, System Settings and 1Password: 422 elements, every
+  (role, subrole) pair mapped deliberately, none reaching the catch-all. 348
+  reach the consumer and 74 (17.5%) are filtered as structural containers —
+  that ratio is the tree-inflation metric to watch when broadening the map.
+  Subroles genuinely carry information the role does not: `AXSearchField` and
+  `AXSecureTextField` both sit under `AXTextField`, and `AXSwitch` under
+  `AXCheckBox`.
+- **A freshly launched application reports no windows for a second or two.**
+  Same code and same applications went from 0 windows to 1 each with nothing
+  but time passing. So an app appearing in discovery with no usable tree is
+  normal and must be retried rather than announced broken — which is what the
+  AT-SPI source already does by returning `Ok(None)` from `add_discovered`.
+- ~4% of elements in a deep walk will not answer `AXRole` at all (17 of 439),
+  having vanished between being enqueued and being read. Not a mapping gap;
+  the walk must tolerate it silently rather than log per element.
+
 Still unmeasured: a large document or lazily-populated table (identity and walk
 cost at scale), a Java or Qt application, and an *unlocked* Electron window —
 1Password was at its lock screen, so the opt-in was verified by acceptance and

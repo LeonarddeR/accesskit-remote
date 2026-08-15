@@ -15,6 +15,7 @@
 //!   ax_probe --churn                     ... measured across a content change
 //!   ax_probe --opt-in                    what AXManualAccessibility changes
 //!   ax_probe --menu-bar                  whether menu bars sit outside AXWindows
+//!   ax_probe --roles                     role-map coverage over the live desktop
 //!
 //! Options: --depth N (default 6), --timeout MS (default 1000), --max N.
 
@@ -49,6 +50,7 @@ mod probe {
         churn: bool,
         opt_in: bool,
         menu_bar: bool,
+        roles: bool,
         depth: usize,
         max_nodes: usize,
         timeout: f32,
@@ -89,6 +91,8 @@ mod probe {
             report_opt_in(&apps, &names, &options);
         } else if options.identity {
             report_identity(&apps, &names, &options);
+        } else if options.roles {
+            report_roles(&apps, &names, &options);
         } else if options.menu_bar {
             report_menu_bar(&apps, &names, &options);
         } else if options.app_filter.is_some() {
@@ -108,13 +112,19 @@ mod probe {
     /// inflates it many-fold, exactly as AT-SPI's did.
     fn summarize(apps: &[App], names: &Names, options: &Options) {
         println!(
-            "{:<28} {:<34} {:>5} {:>7} {:>8} {:>8}  {}",
-            "APPLICATION", "BUNDLE ID", "PID", "WINDOWS", "NODES", "WALK", "NOTE"
+            "{:<26} {:<30} {:>5} {:>4} {:>7} {:>7} {:>7}  {}",
+            "APPLICATION", "BUNDLE ID", "PID", "RAW", "WINDOWS", "NODES", "WALK", "NOTE"
         );
         let mut total_nodes = 0usize;
         let mut total_time = Duration::ZERO;
         for app in apps {
             let started = Instant::now();
+            // Raw AXWindows versus what discovery kept: the gap is what the
+            // window-role filter dropped, and seeing it is the difference
+            // between "this app has no windows" and "we rejected them all".
+            let raw = attr::elements(&app.element, &names.windows)
+                .map(|w| w.len())
+                .unwrap_or(0);
             let windows = ax::windows_of(app, names).unwrap_or_default();
             let mut nodes = 0;
             for window in &windows {
@@ -137,10 +147,11 @@ mod probe {
                 ""
             };
             println!(
-                "{:<28} {:<34} {:>5} {:>7} {:>8} {:>7.0?}  {}",
-                truncate(&app.info.name, 28),
-                truncate(app.info.app_id.as_deref().unwrap_or("-"), 34),
+                "{:<26} {:<30} {:>5} {:>4} {:>7} {:>7} {:>6.0?}  {}",
+                truncate(&app.info.name, 26),
+                truncate(app.info.app_id.as_deref().unwrap_or("-"), 30),
                 app.pid,
+                raw,
                 windows.len(),
                 nodes,
                 elapsed,
@@ -155,6 +166,82 @@ mod probe {
             "depth cap {}, node cap {} per window — a capped walk under-reports",
             options.depth, options.max_nodes
         );
+    }
+
+    // ---------------------------------------------------------------- roles
+
+    /// Every (role, subrole) pair on the desktop, what it maps to, and whether
+    /// the map actually recognised it.
+    ///
+    /// Two numbers matter. UNMAPPED pairs reached `GenericContainer` through
+    /// the catch-all rather than by intent — each is a real element a consumer
+    /// currently cannot see. And the *visible* count is the tree-inflation
+    /// metric: `common_filter` drops `GenericContainer` and `TextRun`, so it is
+    /// what a screen reader would actually encounter, and it is the number to
+    /// watch when broadening the map.
+    fn report_roles(apps: &[App], names: &Names, options: &Options) {
+        let mut seen: BTreeMap<(String, Option<String>), usize> = BTreeMap::new();
+        let mut unreadable = 0usize;
+        for app in apps {
+            let Ok(windows) = ax::windows_of(app, names) else {
+                continue;
+            };
+            for window in windows {
+                for key in walk(window.key.clone(), names, options) {
+                    // An element that will not answer AXRole is a different
+                    // thing from one whose role is unmapped — usually one that
+                    // died between the walk and the read. Counting them
+                    // together would report a mapping gap that does not exist.
+                    let Some(role) = attr::string(key.element(), &names.role).ok().flatten()
+                    else {
+                        unreadable += 1;
+                        continue;
+                    };
+                    let subrole = attr::string(key.element(), &names.subrole).ok().flatten();
+                    *seen.entry((role, subrole)).or_default() += 1;
+                }
+            }
+        }
+
+        println!("{:<22} {:<24} {:>6}  {:<22} {}", "AX ROLE", "AX SUBROLE", "COUNT", "ACCESSKIT", "");
+        let (mut total, mut visible, mut unmapped) = (0usize, 0usize, 0usize);
+        let mut rows: Vec<_> = seen.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((role, subrole), count) in rows {
+            let mapped = accesskit_remote_ax::role::map(&role, subrole.as_deref());
+            let known = accesskit_remote_ax::role::is_known(&role, subrole.as_deref());
+            let hidden = matches!(
+                mapped,
+                accesskit::Role::GenericContainer | accesskit::Role::TextRun
+            );
+            total += count;
+            if !hidden {
+                visible += count;
+            }
+            if !known {
+                unmapped += count;
+            }
+            println!(
+                "{:<22} {:<24} {:>6}  {:<22} {}",
+                truncate(&role, 22),
+                truncate(subrole.as_deref().unwrap_or("-"), 24),
+                count,
+                format!("{mapped:?}"),
+                if !known { "UNMAPPED" } else if hidden { "(filtered)" } else { "" },
+            );
+        }
+        println!("\n{total} elements: {visible} reach the consumer, {} filtered", total - visible);
+        if unmapped > 0 {
+            println!("{unmapped} element(s) hit the catch-all — each is invisible to a screen reader");
+        } else {
+            println!("every role on this desktop is mapped deliberately");
+        }
+        if unreadable > 0 {
+            println!(
+                "{unreadable} element(s) would not answer AXRole at all (vanished mid-walk, \
+                 or an unresponsive app) — not a mapping gap"
+            );
+        }
     }
 
     // ------------------------------------------------------------- identity
@@ -527,6 +614,7 @@ mod probe {
             churn: false,
             opt_in: false,
             menu_bar: false,
+            roles: false,
             depth: 6,
             max_nodes: 5000,
             timeout: 1.0,
@@ -543,6 +631,7 @@ mod probe {
                 }
                 "--opt-in" => options.opt_in = true,
                 "--menu-bar" => options.menu_bar = true,
+                "--roles" => options.roles = true,
                 "--depth" => options.depth = args.next().and_then(|v| v.parse().ok()).unwrap_or(6),
                 "--max" => {
                     options.max_nodes = args.next().and_then(|v| v.parse().ok()).unwrap_or(5000)

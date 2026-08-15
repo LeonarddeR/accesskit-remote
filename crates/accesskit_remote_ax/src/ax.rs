@@ -29,10 +29,6 @@ use objc2_core_foundation::CFRetained;
 /// bounded pause rather than the session.
 pub const MESSAGING_TIMEOUT_SECS: f32 = 1.0;
 
-/// The role a real toplevel window reports. Dialogs are this role too, told
-/// apart by their subrole, so this is the only value worth exporting.
-const WINDOW_ROLE: &str = "AXWindow";
-
 /// A running application that may publish an accessibility tree.
 pub struct App {
     pub element: CFRetained<AXUIElement>,
@@ -135,7 +131,7 @@ pub fn windows_of(app: &App, names: &Names) -> Result<Vec<Window>, AxError> {
         // `CGWindowID`, no title, and is not a window any user would name. The
         // AT-SPI source filters the same way, to Frame/Window/Dialog.
         let role = attr::string(key.element(), &names.role).ok().flatten();
-        if role.as_deref() != Some(WINDOW_ROLE) {
+        if !role.as_deref().is_some_and(crate::role::is_window) {
             tracing::debug!(
                 app = %app.info.name,
                 ?role,
