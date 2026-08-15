@@ -54,6 +54,9 @@ Known gaps:
 - Verified with UIA test clients; not yet exercised with a real screen reader.
 - Exercised only against WSLg on Windows 11, with GTK4 and LibreOffice/VCL apps.
 
+`docs/macos-e2e.md` is the shortest path from the macOS provider to a Windows
+screen reader — an SSH tunnel and two commands, no RDP client involved.
+
 `docs/next-steps.md` tracks current state, open work and the toolkit findings
 behind the design; `docs/spikes.md` records the environment and RDP-plumbing
 findings; `docs/newton.md` records why the AT-SPI mirror stays the source
