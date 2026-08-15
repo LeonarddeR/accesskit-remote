@@ -2,6 +2,7 @@
 
 pub mod attr;
 pub mod ax;
+pub mod delta;
 pub mod element;
 pub mod names;
 pub mod node;

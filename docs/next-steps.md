@@ -355,6 +355,25 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   main one. Getting that wrong yields an observer that registers cleanly,
   reports its source as attached, and never fires.
 
+- **A re-walk must be reduced to its difference before it goes on the wire.**
+  Measured before `delta::EmittedTree` existed: an *idle* desktop emitted 6
+  updates and **800 nodes in 8 seconds**, because one node inside System
+  Settings flickers and dragged its whole 133-node tree along each time.
+  Reducing to changed nodes cut that to ~205, and the AT-SPI source's
+  "unchanged ⇒ no traffic" invariant now holds at tree level here too. This
+  works only because element identity is stable: the same node id in two walks
+  denotes the same node, so the two can be compared at all.
+- Residual, open: System Settings still reports ~13-30 genuinely changed nodes
+  per second while idle, all `TreeItem`/`Cell` in its navigation sidebar.
+  Bounds jitter from lazy layout is the likeliest cause. It is bounded damage
+  rather than a correctness problem, but it is the first candidate for the
+  per-node refresh route, which would re-read one node instead of re-walking
+  133 at ~7ms each.
+- Typing produces both `AXValueChanged` (content) and `AXSelectedTextChanged`
+  (caret) on the `AXTextArea`; arrow keys produce only the latter. Caret
+  movement therefore has its own route — folding it into the semantic refresh
+  would re-read a whole node on every cursor key.
+
 Still unmeasured: a large document or lazily-populated table (identity and walk
 cost at scale), a Java or Qt application, and an *unlocked* Electron window —
 1Password was at its lock screen, so the opt-in was verified by acceptance and

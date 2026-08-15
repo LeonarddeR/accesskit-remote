@@ -39,6 +39,10 @@ pub enum Route {
     /// Keyboard focus moved. Costs no reads — the focused element is carried
     /// on the notification itself.
     Focus,
+    /// Caret or selection moved: rebuild that node's text runs only. Cheaper
+    /// than a semantic refresh and far cheaper than a re-walk, which is why it
+    /// is a route of its own rather than folded into [`Route::Refresh`].
+    Text,
     /// A window appeared or vanished: reconcile the window set.
     Lifecycle,
     /// Deliberately ignored.
@@ -80,6 +84,9 @@ pub const SUBSCRIPTIONS: &[(&str, Route)] = &[
     ("AXRowCollapsed", Route::Rewalk),
     ("AXMenuOpened", Route::Rewalk),
     ("AXMenuClosed", Route::Rewalk),
+    // Text. Caret and selection movement, which typing produces continuously
+    // and which must not drag a whole node refresh behind it.
+    ("AXSelectedTextChanged", Route::Text),
     // Semantics.
     ("AXValueChanged", Route::Refresh),
     ("AXTitleChanged", Route::Refresh),
@@ -320,6 +327,9 @@ mod tests {
         assert_eq!(route("AXTitleChanged"), Route::Refresh);
         assert_eq!(route("AXFocusedUIElementChanged"), Route::Focus);
         assert_eq!(route("AXWindowCreated"), Route::Lifecycle);
+        // Caret movement is its own route: typing produces it continuously,
+        // and it must not drag a full node refresh behind it.
+        assert_eq!(route("AXSelectedTextChanged"), Route::Text);
     }
 
     #[test]
