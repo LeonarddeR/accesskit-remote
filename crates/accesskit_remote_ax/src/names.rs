@@ -48,7 +48,9 @@ names! {
     focused_ui_element => "AXFocusedUIElement",
     menu_bar => "AXMenuBar",
 
-    // Geometry.
+    // Geometry. `AXFrame` carries origin and size together and is present on
+    // every element surveyed, so it is the one read the walk makes.
+    frame => "AXFrame",
     position => "AXPosition",
     size => "AXSize",
 
@@ -61,6 +63,8 @@ names! {
     main => "AXMain",
     minimized => "AXMinimized",
     hidden => "AXHidden",
+    placeholder => "AXPlaceholderValue",
+    title_ui_element => "AXTitleUIElement",
 
     // The Chromium/Electron accessibility opt-in. Not a real attribute on any
     // native element; writing it is the request.

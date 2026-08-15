@@ -62,6 +62,7 @@ dependencies = [
  "objc2-application-services",
  "objc2-core-foundation",
  "objc2-foundation",
+ "serde_json",
  "tracing",
 ]
 

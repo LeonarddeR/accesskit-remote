@@ -16,7 +16,7 @@
 
 use objc2_application_services::{AXError, AXUIElement, AXValue, AXValueType};
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGSize,
+    CFArray, CFBoolean, CFNumber, CFRetained, CFString, CFType, CGPoint, CGRect, CGSize,
 };
 use std::ptr::NonNull;
 
@@ -301,6 +301,25 @@ pub fn as_point(value: &CFType) -> Option<CGPoint> {
     }
 }
 
+/// Unwraps an `AXValue` holding a `CGRect`.
+///
+/// `AXFrame` is present on 100% of elements surveyed on a real desktop and
+/// carries position and size together, so preferring it over `AXPosition` plus
+/// `AXSize` halves the geometry cost per node.
+pub fn as_rect(value: &CFType) -> Option<CGRect> {
+    let ax = value.downcast_ref::<AXValue>()?;
+    // SAFETY: the type tag is checked before reading, and `rect` is a valid
+    // writable CGRect the callee fills in.
+    unsafe {
+        if ax.r#type() != AXValueType::CGRect {
+            return None;
+        }
+        let mut rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0));
+        let ptr = NonNull::from(&mut rect).cast();
+        ax.value(AXValueType::CGRect, ptr).then_some(rect)
+    }
+}
+
 /// Unwraps an `AXValue` holding a `CGSize`.
 pub fn as_size(value: &CFType) -> Option<CGSize> {
     let ax = value.downcast_ref::<AXValue>()?;
@@ -393,6 +412,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_array_yields_nothing() {
+        // The case that matters most: AX returns an empty `AXWindows` array for
+        // an application with no windows, and reading index 0 of it would hand
+        // back whatever CoreFoundation had lying there.
+        let empty: [CFRetained<CFType>; 0] = [];
+        let array = CFArray::from_retained_objects(&empty);
+        let array = array.as_opaque();
+        assert_eq!(array.count(), 0, "an empty array must report zero entries");
+        assert!(array_get(array, 0).is_none(), "index 0 of an empty array is not a value");
+        assert!(strings(array).is_empty());
+    }
+
+    #[test]
     fn non_string_entries_are_skipped_rather_than_faked() {
         let items: [CFRetained<CFType>; 3] = [
             CFString::from_static_str("a").into(),
@@ -419,6 +451,19 @@ mod tests {
         assert!(as_point(&wrapped).is_none(), "a size is not a point");
         let read = as_size(&wrapped).expect("reads back as a size");
         assert_eq!((read.width, read.height), (80.0, 22.0));
+    }
+
+    #[test]
+    fn a_frame_reads_back_and_is_not_confused_with_a_point() {
+        let rect = CGRect::new(CGPoint::new(10.0, 20.0), CGSize::new(300.0, 40.0));
+        // SAFETY: the pointer is a valid CGRect matching the declared type.
+        let wrapped = unsafe { AXValue::new(AXValueType::CGRect, NonNull::from(&rect).cast()) }
+            .expect("AXValue wrapping a CGRect");
+        let read = as_rect(&wrapped).expect("reads back as a rect");
+        assert_eq!((read.origin.x, read.origin.y), (10.0, 20.0));
+        assert_eq!((read.size.width, read.size.height), (300.0, 40.0));
+        assert!(as_point(&wrapped).is_none(), "a rect is not a point");
+        assert!(as_size(&wrapped).is_none(), "nor a size");
     }
 
     #[test]

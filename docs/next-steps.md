@@ -299,6 +299,36 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   having vanished between being enqueued and being read. Not a mapping gap;
   the walk must tolerate it silently rather than log per element.
 
+- **A locked screen makes AX lie, quietly.** With the login session locked,
+  applications launch but report zero windows and `AXWindows` returns the
+  *application element itself*. It presents exactly like a bug in the window
+  filter or in CF array handling and is neither. Cross-check against
+  `osascript`/System Events: if both agree on zero, it is the environment.
+- **`AXChildren` of a window can name the application element**, unlocked too
+  (TextEdit, System Settings). That is a cycle back to the root of everything
+  and puts `Role::Application` inside a `Role::Window`, so the walk drops it
+  and does not descend. AT-SPI needs no such guard; its hierarchy is strict.
+- **`AXFrame` is present on 100% of elements** and carries origin and size
+  together, so geometry costs one read per node rather than two
+  (`AXPosition` + `AXSize`). It is screen-space with a top-left origin;
+  `build_container` subtracts the window origin, and a node read without a
+  window context carries no bounds at all rather than bounds in the wrong
+  space.
+- **Neither `AXTitle` nor `AXDescription` alone names the tree.** Of 313
+  elements surveyed, 29% carried a title and 54% a description; the name falls
+  back from one to the other. Other frequencies worth knowing: `AXRole` 100%,
+  `AXParent` 99%, `AXChildren` 82%, `AXFocused` 71% (38 settable), `AXEnabled`
+  61%, `AXSubrole` 50%, `AXSelected` 43% (40 settable), `AXValue` 31% (17
+  settable). `AXEnabled` being absent on 39% is why absence is not disablement.
+- **Catalyst is an order of magnitude slower per node.** System Settings walks
+  at ~7ms/node (133 nodes in 946ms) against 0.3ms/node for Electron and
+  0.85-1.3ms/node for AppKit and WebKit. A desktop-wide eager walk is
+  affordable today, but this is the number that would force lazy walking if a
+  session had several Catalyst apps open.
+- Post-filter ratio on a real desktop: 311 nodes walked, 240 reaching the
+  consumer (77%). That is the tree-inflation metric to watch when the role map
+  is broadened.
+
 Still unmeasured: a large document or lazily-populated table (identity and walk
 cost at scale), a Java or Qt application, and an *unlocked* Electron window —
 1Password was at its lock screen, so the opt-in was verified by acceptance and

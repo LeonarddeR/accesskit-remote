@@ -16,6 +16,7 @@
 //!   ax_probe --opt-in                    what AXManualAccessibility changes
 //!   ax_probe --menu-bar                  whether menu bars sit outside AXWindows
 //!   ax_probe --roles                     role-map coverage over the live desktop
+//!   ax_probe --attr-coverage             which attributes real apps expose, and how often
 //!
 //! Options: --depth N (default 6), --timeout MS (default 1000), --max N.
 
@@ -28,6 +29,11 @@ fn main() {
 #[cfg(target_os = "macos")]
 fn main() {
     probe::run()
+}
+
+#[cfg(target_os = "macos")]
+fn probe_is_window(role: &str) -> bool {
+    accesskit_remote_ax::role::is_window(role)
 }
 
 #[cfg(target_os = "macos")]
@@ -51,6 +57,7 @@ mod probe {
         opt_in: bool,
         menu_bar: bool,
         roles: bool,
+        attr_coverage: bool,
         depth: usize,
         max_nodes: usize,
         timeout: f32,
@@ -91,6 +98,8 @@ mod probe {
             report_opt_in(&apps, &names, &options);
         } else if options.identity {
             report_identity(&apps, &names, &options);
+        } else if options.attr_coverage {
+            report_attr_coverage(&apps, &names, &options);
         } else if options.roles {
             report_roles(&apps, &names, &options);
         } else if options.menu_bar {
@@ -122,9 +131,19 @@ mod probe {
             // Raw AXWindows versus what discovery kept: the gap is what the
             // window-role filter dropped, and seeing it is the difference
             // between "this app has no windows" and "we rejected them all".
-            let raw = attr::elements(&app.element, &names.windows)
-                .map(|w| w.len())
-                .unwrap_or(0);
+            let raw_elements = attr::elements(&app.element, &names.windows).unwrap_or_default();
+            let raw = raw_elements.len();
+            // What discovery rejected, and why. A role that reads as an error
+            // is a different problem from a role that is simply not a window.
+            let rejected: Vec<String> = raw_elements
+                .iter()
+                .map(|element| match attr::string(element, &names.role) {
+                    Ok(Some(role)) => role,
+                    Ok(None) => "<no AXRole>".to_owned(),
+                    Err(error) => format!("<{error}>"),
+                })
+                .filter(|role| !crate::probe_is_window(role))
+                .collect();
             let windows = ax::windows_of(app, names).unwrap_or_default();
             let mut nodes = 0;
             for window in &windows {
@@ -135,7 +154,9 @@ mod probe {
             total_time += elapsed;
 
             // An app with windows but no contents is the Chromium signature.
-            let note = if windows.is_empty() {
+            let note = if !rejected.is_empty() {
+                &format!("dropped: {}", rejected.join(", "))
+            } else if windows.is_empty() {
                 "no windows"
             } else if nodes <= windows.len() {
                 "EMPTY TREE (try --opt-in)"
@@ -166,6 +187,56 @@ mod probe {
             "depth cap {}, node cap {} per window — a capped walk under-reports",
             options.depth, options.max_nodes
         );
+    }
+
+    // -------------------------------------------------------- attr coverage
+
+    /// Which attributes the desktop actually exposes, how often, and how many
+    /// of those are writable.
+    ///
+    /// AX has no interface set, so there is no equivalent of asking "does this
+    /// implement Text?" — the attribute list *is* the capability surface. This
+    /// is therefore how the state mapping gets decided: an attribute nothing
+    /// exposes is not worth reading on every node, and a widely-exposed one
+    /// that nothing marks settable is not worth planning a write against.
+    fn report_attr_coverage(apps: &[App], names: &Names, options: &Options) {
+        let mut present: BTreeMap<String, usize> = BTreeMap::new();
+        let mut writable: BTreeMap<String, usize> = BTreeMap::new();
+        let mut elements = 0usize;
+        for app in apps {
+            let Ok(windows) = ax::windows_of(app, names) else {
+                continue;
+            };
+            for window in windows {
+                for key in walk(window.key.clone(), names, options) {
+                    let Ok(attributes) = attr::names(key.element()) else {
+                        continue;
+                    };
+                    elements += 1;
+                    for name in attributes {
+                        *present.entry(name.clone()).or_default() += 1;
+                        let cf = objc2_core_foundation::CFString::from_str(&name);
+                        if attr::is_settable(key.element(), &cf).unwrap_or(false) {
+                            *writable.entry(name).or_default() += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("{elements} element(s) surveyed\n");
+        println!("{:<34} {:>8} {:>7} {:>9}", "ATTRIBUTE", "PRESENT", "%", "SETTABLE");
+        let mut rows: Vec<_> = present.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        for (name, count) in rows {
+            println!(
+                "{:<34} {:>8} {:>6.0}% {:>9}",
+                truncate(&name, 34),
+                count,
+                count as f64 * 100.0 / elements.max(1) as f64,
+                writable.get(&name).copied().unwrap_or(0),
+            );
+        }
     }
 
     // ---------------------------------------------------------------- roles
@@ -615,6 +686,7 @@ mod probe {
             opt_in: false,
             menu_bar: false,
             roles: false,
+            attr_coverage: false,
             depth: 6,
             max_nodes: 5000,
             timeout: 1.0,
@@ -632,6 +704,7 @@ mod probe {
                 "--opt-in" => options.opt_in = true,
                 "--menu-bar" => options.menu_bar = true,
                 "--roles" => options.roles = true,
+                "--attr-coverage" => options.attr_coverage = true,
                 "--depth" => options.depth = args.next().and_then(|v| v.parse().ok()).unwrap_or(6),
                 "--max" => {
                     options.max_nodes = args.next().and_then(|v| v.parse().ok()).unwrap_or(5000)
