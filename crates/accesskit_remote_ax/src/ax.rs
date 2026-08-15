@@ -29,6 +29,10 @@ use objc2_core_foundation::CFRetained;
 /// bounded pause rather than the session.
 pub const MESSAGING_TIMEOUT_SECS: f32 = 1.0;
 
+/// The role a real toplevel window reports. Dialogs are this role too, told
+/// apart by their subrole, so this is the only value worth exporting.
+const WINDOW_ROLE: &str = "AXWindow";
+
 /// A running application that may publish an accessibility tree.
 pub struct App {
     pub element: CFRetained<AXUIElement>,
@@ -43,6 +47,10 @@ pub struct App {
 pub struct Window {
     pub key: ElementKey,
     pub title: String,
+    /// The window's `AXSubrole`, which is where AX puts the distinction AT-SPI
+    /// carries in the role itself — `AXStandardWindow` versus `AXDialog`,
+    /// `AXSystemDialog`, `AXFloatingWindow`.
+    pub subrole: Option<String>,
     pub app: AppInfo,
     /// The `CGWindowID`, when the SPI resolved it.
     pub native_window_id: Option<u64>,
@@ -122,11 +130,25 @@ pub fn windows_of(app: &App, names: &Names) -> Result<Vec<Window>, AxError> {
     let mut windows = Vec::with_capacity(elements.len());
     for element in elements {
         let key = ElementKey::new(app.pid, element);
+        // `AXWindows` is not exclusively windows. Finder publishes the desktop
+        // there as an `AXScrollArea` (measured 2026-08-15) — it has no
+        // `CGWindowID`, no title, and is not a window any user would name. The
+        // AT-SPI source filters the same way, to Frame/Window/Dialog.
+        let role = attr::string(key.element(), &names.role).ok().flatten();
+        if role.as_deref() != Some(WINDOW_ROLE) {
+            tracing::debug!(
+                app = %app.info.name,
+                ?role,
+                "skipping non-window entry in AXWindows"
+            );
+            continue;
+        }
         let title = attr::string(key.element(), &names.title)
             .ok()
             .flatten()
             .unwrap_or_default();
         windows.push(Window {
+            subrole: attr::string(key.element(), &names.subrole).ok().flatten(),
             native_window_id: window_id::window_id(key.element()),
             active: focused.as_ref() == Some(&key),
             title,

@@ -12,6 +12,7 @@
 //!   ax_probe --app Safari                dump matching applications' trees
 //!   ax_probe --app Safari --attrs        ... with every attribute and action
 //!   ax_probe --identity                  re-walk element identity survival
+//!   ax_probe --churn                     ... measured across a content change
 //!   ax_probe --opt-in                    what AXManualAccessibility changes
 //!   ax_probe --menu-bar                  whether menu bars sit outside AXWindows
 //!
@@ -45,6 +46,7 @@ mod probe {
         app_filter: Option<String>,
         attrs: bool,
         identity: bool,
+        churn: bool,
         opt_in: bool,
         menu_bar: bool,
         depth: usize,
@@ -170,7 +172,10 @@ mod probe {
     /// positional key before building anything on top.
     fn report_identity(apps: &[App], names: &Names, options: &Options) {
         println!("Re-walk element identity survival (CFEqual across two walks)\n");
-        println!("{:<28} {:<26} {:>7} {:>7} {:>9}", "APPLICATION", "WINDOW", "WALK1", "WALK2", "SURVIVED");
+        println!(
+            "{:<26} {:<24} {:>6} {:>6} {:>8} {:>6}",
+            "APPLICATION", "WINDOW", "WALK1", "WALK2", "KEPT", "NEW"
+        );
         let mut worst = 100.0f64;
         for app in apps {
             let Ok(windows) = ax::windows_of(app, names) else {
@@ -178,34 +183,87 @@ mod probe {
             };
             for window in windows {
                 let first = walk(window.key.clone(), names, options);
+                // An idle re-walk is the easy case. The failure mode that
+                // actually bit the AT-SPI source was LibreOffice minting a
+                // fresh accessible per *changed* cell, so identity has to be
+                // measured across a mutation too, not just across time.
+                let churned = options.churn && churn(&first, names);
                 let second = walk(window.key.clone(), names, options);
                 if first.is_empty() {
                     continue;
                 }
-                let seen: HashSet<&ElementKey> = first.iter().collect();
-                let survived = second.iter().filter(|key| seen.contains(key)).count();
-                let ratio = if second.is_empty() {
-                    0.0
-                } else {
-                    survived as f64 * 100.0 / second.len() as f64
-                };
+                if options.churn && !churned {
+                    println!(
+                        "{:<26} {:<24} {:>6} {:>6} {:>8} {:>6}",
+                        truncate(&app.info.name, 26),
+                        truncate(&window.title, 24),
+                        first.len(),
+                        second.len(),
+                        "-",
+                        "no target",
+                    );
+                    continue;
+                }
+                // Two separate questions, and only the first one threatens the
+                // design. KEPT is what fraction of the *original* elements the
+                // re-walk found again — a drop there means ids churn and every
+                // re-walk is a full replacement. NEW is elements the second
+                // walk added, which is the correct response to a real change
+                // and must not be read as identity loss.
+                let before: HashSet<&ElementKey> = first.iter().collect();
+                let after: HashSet<&ElementKey> = second.iter().collect();
+                let kept = first.iter().filter(|key| after.contains(*key)).count();
+                let fresh = second.iter().filter(|key| !before.contains(*key)).count();
+                let ratio = kept as f64 * 100.0 / first.len() as f64;
                 worst = worst.min(ratio);
                 println!(
-                    "{:<28} {:<26} {:>7} {:>7} {:>8.1}%",
-                    truncate(&app.info.name, 28),
-                    truncate(&window.title, 26),
+                    "{:<26} {:<24} {:>6} {:>6} {:>7.1}% {:>6}",
+                    truncate(&app.info.name, 26),
+                    truncate(&window.title, 24),
                     first.len(),
                     second.len(),
                     ratio,
+                    fresh,
                 );
             }
         }
-        println!("\nworst survival: {worst:.1}%");
+        println!("\nworst retention of pre-existing elements: {worst:.1}%");
         println!(
             "Near 100% means AXUIElement identity is stable enough for id reuse and\n\
              minimal deltas. Substantially below that, a positional key is needed\n\
              instead — see `element::ElementKey`."
         );
+    }
+
+    /// Mutates the window's content so the second walk is measured across a
+    /// real change, and returns whether anything was actually changed.
+    ///
+    /// Writes `AXValue` on the first settable text element — which is also an
+    /// early check that AX writes work at all, the thing GTK4 could never do
+    /// over AT-SPI (`GrabFocus` and `SetCaretOffset` answered `NotSupported`
+    /// in every environment).
+    fn churn(elements: &[ElementKey], names: &Names) -> bool {
+        for key in elements {
+            let element = key.element();
+            let Some(role) = attr::string(element, &names.role).ok().flatten() else {
+                continue;
+            };
+            if role != "AXTextArea" && role != "AXTextField" {
+                continue;
+            }
+            if !attr::is_settable(element, &names.value).unwrap_or(false) {
+                continue;
+            }
+            let existing = attr::string(element, &names.value).ok().flatten().unwrap_or_default();
+            let text = objc2_core_foundation::CFString::from_str(&format!("{existing}x"));
+            // SAFETY: a live element, a valid attribute name, a live CFString.
+            let error = unsafe { element.set_attribute_value(&names.value, &text) };
+            if error == objc2_application_services::AXError::Success {
+                std::thread::sleep(Duration::from_millis(250));
+                return true;
+            }
+        }
+        false
     }
 
     // --------------------------------------------------------------- opt-in
@@ -311,7 +369,7 @@ mod probe {
     /// This is the AX ground truth the role and state maps get written against.
     fn dump_app(app: &App, names: &Names, options: &Options) {
         println!("=== {} ({}) pid {}", app.info.name, app.info.app_id.as_deref().unwrap_or("-"), app.pid);
-        match opt_in::is_requested(&app.element, names) {
+        match opt_in::answers_opt_in(&app.element, names) {
             Some(set) => println!("    Chromium-based; AXManualAccessibility = {set}"),
             None => println!("    native (no AXManualAccessibility)"),
         }
@@ -466,6 +524,7 @@ mod probe {
             app_filter: None,
             attrs: false,
             identity: false,
+            churn: false,
             opt_in: false,
             menu_bar: false,
             depth: 6,
@@ -478,6 +537,10 @@ mod probe {
                 "--app" => options.app_filter = args.next(),
                 "--attrs" => options.attrs = true,
                 "--identity" => options.identity = true,
+                "--churn" => {
+                    options.identity = true;
+                    options.churn = true;
+                }
                 "--opt-in" => options.opt_in = true,
                 "--menu-bar" => options.menu_bar = true,
                 "--depth" => options.depth = args.next().and_then(|v| v.parse().ok()).unwrap_or(6),

@@ -224,6 +224,69 @@ remains is small, conditional, or blocked on the toolkit:
   index-0 fallback is their only drive route, verified live in 50 ms
   (`click_probe Bold`).
 
+### macOS / AX
+
+Measured 2026-08-15 with `ax_probe` against Finder, TextEdit, Safari, System
+Settings (Catalyst) and 1Password 8 (Electron) on one desktop. Every number
+below is from that run; nothing here is inherited from the AT-SPI findings.
+
+- **Element identity is stable, which is the finding the design rested on.**
+  `CFEqual` retention of pre-existing elements across a re-walk is **100%** for
+  AppKit, Catalyst and WebKit alike — idle, and also across a real content
+  mutation (`--churn` writes `AXValue`, then re-walks). The LibreOffice failure
+  mode on Linux, where a toolkit mints a fresh accessible per visit and defeats
+  id reuse, does not reproduce here. `ElementKey` stays identity-by-reference;
+  the positional-key fallback is not needed.
+  Caveat: measured on small trees (14-143 nodes). Re-measure on a big
+  document or a lazy table before relying on it there.
+- **AX writes work.** `AXUIElementSetAttributeValue(AXValue)` on a TextEdit
+  text field succeeds. This is the capability GTK4 never had over AT-SPI, where
+  `GrabFocus` and `SetCaretOffset` answered `NotSupported` in every
+  environment and left two whole drive routes untestable.
+- **Walking is roughly 3× cheaper than AT-SPI, unbatched.** 267 nodes across 5
+  applications in ~204ms — about 0.75ms/node against AT-SPI's ~1.9ms/node
+  *after* its 41% batching win. `AXUIElementCopyMultipleAttributeValues` is not
+  used by the probe at all, so the per-node cost has room to fall further.
+- **Menu bars are free.** Each application publishes 233-631 menu nodes
+  (Safari 631), and **none is reachable from a window-rooted walk** —
+  `AXMenuBar` is a sibling of `AXWindows` on the application element. The
+  equivalent on Linux was not free: LibreOffice Writer's ~770 MenuItems were
+  inside the window tree and had to be walked.
+- **`AXWindows` is not exclusively windows.** Finder publishes the desktop
+  there as an `AXScrollArea` with no title and no `CGWindowID`. Discovery
+  therefore gates on `AXRole == "AXWindow"`, mirroring the AT-SPI source's
+  Frame/Window/Dialog filter. Dialogs share that role and are told apart by
+  subrole (`AXStandardWindow` vs `AXDialog`/`AXSystemDialog`).
+- **`_AXUIElementGetWindow` resolves and works** (Safari window → `305`). It is
+  private SPI, so it is loaded by `dlsym` and a miss degrades to
+  `native_window_id: None`, which the wire already models. This one call
+  replaces the entire WSLg Weston-log ledger (`wslg.rs`, 744 lines) for the
+  same field.
+- **`AXManualAccessibility` is accepted by Electron and moves no windows.**
+  1Password 8 accepted the write; every native application answered
+  `AttributeUnsupported`; **no application's window frame changed** in a
+  before/after comparison. That is the property that makes it safe to set on a
+  machine being screen-shared, and it is why `AXEnhancedUserInterface` — which
+  does move windows — is never written.
+- **The opt-in does not read back.** After a write that returned success,
+  `AXManualAccessibility` still reads `false`. Chromium treats it as a
+  write-only signal, so gating the request on a read would mean never enabling
+  accessibility at all. `opt_in::answers_opt_in` is documented as diagnostic
+  only; its real use is telling a Chromium application (answers) from a native
+  one (does not).
+- WebKit publishes page content (`AXHeading`, `AXLink`, `AXStaticText` under an
+  `AXWebArea`) with no opt-in of its own.
+- **Development needs the grant, and SSH does not inherit one.** macOS
+  attributes the Accessibility grant to a responsible GUI application; a
+  process tree rooted in `sshd` has none, so granting the binary does nothing.
+  Either grant `/usr/libexec/sshd-keygen-wrapper` (which widens access to every
+  later SSH session) or run from a granted terminal on the Mac.
+
+Still unmeasured: a large document or lazily-populated table (identity and walk
+cost at scale), a Java or Qt application, and an *unlocked* Electron window —
+1Password was at its lock screen, so the opt-in was verified by acceptance and
+by the presence of `AXWebArea` rather than by a tree that grew.
+
 ### AT-SPI and mirror plumbing
 
 - **The event stream needs its own connection.** Sharing one with method calls

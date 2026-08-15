@@ -54,11 +54,17 @@ pub fn request(app: &AXUIElement, names: &Names) -> OptIn {
     }
 }
 
-/// Whether an application element currently reports the opt-in as set.
+/// Whether an application element answers the opt-in attribute at all.
 ///
-/// Only Chromium-based applications answer at all, so `None` means "not one of
-/// those" rather than "off".
-pub fn is_requested(app: &AXUIElement, names: &Names) -> Option<bool> {
+/// **Diagnostic only — never gate the request on this.** Measured against
+/// 1Password 8 (2026-08-15): a `request` that returned [`OptIn::Accepted`]
+/// still reads back as `Some(false)` afterwards. Chromium treats the attribute
+/// as a write-only signal and does not reflect it, so a caller that skipped
+/// the write because the read said `false` would never turn accessibility on.
+///
+/// What it is good for is telling a Chromium-based application (answers at
+/// all) from a native one (answers `None`).
+pub fn answers_opt_in(app: &AXUIElement, names: &Names) -> Option<bool> {
     attr::boolean(app, &names.manual_accessibility).ok().flatten()
 }
 
@@ -78,7 +84,7 @@ mod tests {
             matches!(request(&system_wide, &names), OptIn::NotApplicable | OptIn::Failed(_)),
             "the system-wide element must never report a successful opt-in"
         );
-        assert_eq!(is_requested(&system_wide, &names), None);
+        assert_eq!(answers_opt_in(&system_wide, &names), None);
     }
 
     #[test]
