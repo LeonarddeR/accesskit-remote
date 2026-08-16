@@ -107,6 +107,15 @@ impl TreeStore {
 
     /// Rebuilds a full `TreeUpdate` from the nodes reachable from the root;
     /// nodes orphaned by child-list removals are excluded (and pruned).
+    ///
+    /// **The focus is re-checked against what survives.** A child-list change
+    /// can orphan the node that last held focus, and this is where that node
+    /// stops existing — so a snapshot that repeated the recorded focus would
+    /// hand the host a tree whose focus is not in it. `accesskit_consumer`
+    /// rejects that with a panic, and in a platform adapter that panic fires
+    /// inside a window procedure, which cannot unwind: the process aborts.
+    /// Falling back to the root is what AccessKit specifies for a tree with no
+    /// focused node of its own.
     fn snapshot(&mut self) -> Option<accesskit::TreeUpdate> {
         let tree = self.tree.clone()?;
         let mut nodes = Vec::new();
@@ -122,12 +131,27 @@ impl TreeStore {
             }
         }
         self.nodes.retain(|id, _| reachable.contains(id));
+        let focus = if self.nodes.contains_key(&self.focus) {
+            self.focus
+        } else {
+            tree.root
+        };
+        self.focus = focus;
         Some(accesskit::TreeUpdate {
             nodes,
             tree: Some(tree),
             tree_id: self.tree_id,
-            focus: self.focus,
+            focus,
         })
+    }
+
+    /// Whether this store holds the node an update claims has focus.
+    fn holds(&self, id: accesskit::NodeId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
+    fn root(&self) -> Option<accesskit::NodeId> {
+        self.tree.as_ref().map(|tree| tree.root)
     }
 }
 
@@ -245,11 +269,21 @@ impl ClientConnection {
                     }
                     out.push(ClientEvent::WindowRemoved { window });
                 }
-                Message::TreeUpdate { window, update } => {
+                Message::TreeUpdate { window, mut update } => {
                     let Some(entry) = self.windows.get_mut(&window) else {
                         return Err(ClientError::UnknownWindow(window));
                     };
                     entry.store.apply(&update);
+                    // Same rule as `snapshot`, on the other path in: a delta
+                    // naming a focus the tree does not contain aborts the host
+                    // process rather than failing softly, so it never leaves
+                    // here.
+                    if !entry.store.holds(update.focus) {
+                        if let Some(root) = entry.store.root() {
+                            update.focus = root;
+                            entry.store.focus = root;
+                        }
+                    }
                     out.push(ClientEvent::TreeUpdated { window, update });
                 }
                 Message::FocusChanged { window } => {

@@ -452,6 +452,87 @@ mod tests {
         }
     }
 
+    /// **Regression: the abort that desktop mode hit and window mode did not.**
+    ///
+    /// A child-list change orphans the node that last held focus. The store
+    /// prunes it on the next snapshot, and if the snapshot repeated the
+    /// recorded focus, the subtree it was grafted into would have a focus that
+    /// is not in it. `accesskit_consumer` rejects that from
+    /// `update_host_focus_state`, i.e. from inside the platform adapter's
+    /// window procedure — which is `extern "system"` and cannot unwind, so the
+    /// process aborts rather than panicking catchably.
+    ///
+    /// Desktop mode hit it because it snapshots every window on every
+    /// activation, where window mode snapshots one window once.
+    #[test]
+    fn a_focus_orphaned_by_a_child_list_change_never_reaches_the_host() {
+        let mut harness = Harness::new();
+        harness.add_window(1, "a window");
+
+        // Focus the button, then re-parent it out of the tree — exactly what a
+        // re-walk that drops a subtree does.
+        let root = NodeId(1);
+        let mut with_focus = tree_of("a window");
+        with_focus.focus = NodeId(2);
+        harness.send(&Message::TreeUpdate { window: WindowId(1), update: with_focus });
+
+        let mut orphaning = Node::new(Role::Window);
+        orphaning.set_label("a window");
+        orphaning.set_children(Vec::<NodeId>::new());
+        harness.send(&Message::TreeUpdate {
+            window: WindowId(1),
+            update: TreeUpdate {
+                nodes: vec![(root, orphaning)],
+                tree: None,
+                tree_id: TreeId::ROOT,
+                // The provider still believes the button has focus.
+                focus: NodeId(2),
+            },
+        });
+
+        let mut desktop = DesktopTree::new("a mac");
+        let updates = desktop.sync(&mut harness.client);
+        for update in &updates {
+            if update.tree_id == TreeId::ROOT {
+                continue;
+            }
+            let present: Vec<NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+            assert!(
+                present.contains(&update.focus),
+                "a subtree whose focus is not in it aborts the host: focus {:?} in {present:?}",
+                update.focus,
+            );
+        }
+        // And the consumer agrees, which is the check that actually matters.
+        feed(updates);
+    }
+
+    /// The same rule on the other path in: a live delta, not a snapshot.
+    #[test]
+    fn a_delta_naming_an_unknown_focus_is_corrected_before_it_is_handed_on() {
+        let mut harness = Harness::new();
+        harness.add_window(1, "a window");
+
+        let events = harness.send(&Message::TreeUpdate {
+            window: WindowId(1),
+            update: TreeUpdate {
+                nodes: Vec::new(),
+                tree: None,
+                tree_id: TreeId::ROOT,
+                // A node this window has never had.
+                focus: NodeId(9999),
+            },
+        });
+        let focus = events
+            .iter()
+            .find_map(|event| match event {
+                ClientEvent::TreeUpdated { update, .. } => Some(update.focus),
+                _ => None,
+            })
+            .expect("the delta is surfaced");
+        assert_eq!(focus, NodeId(1), "rewritten to the tree root, not passed on");
+    }
+
     /// Action routing: a request names its subtree, and the subtree names the
     /// window it must be sent to.
     #[test]
