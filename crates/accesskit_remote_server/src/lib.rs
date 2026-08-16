@@ -14,6 +14,10 @@
 //! [`send_focus`]: ServerConnection::send_focus
 //! [`remove_window`]: ServerConnection::remove_window
 
+mod host;
+
+pub use host::{HostError, SourceHost};
+
 use accesskit_remote::{
     AppInfo, Message, PeerRole, Session, SessionConfig, SessionError, SessionEvent, WindowId,
 };

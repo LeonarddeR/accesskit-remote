@@ -9,9 +9,7 @@ mod demo;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod wslg;
 
-use accesskit_remote_server::{
-    apply_source_event, ServerConnection, ServerError, ServerEvent, TreeSource,
-};
+use accesskit_remote_server::{HostError, SourceHost, TreeSource};
 use accesskit_remote_transport::Socket;
 use demo::DemoSource;
 use std::io::{self, Read, Write};
@@ -130,7 +128,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> io::Result<(Listener, Strin
 }
 
 fn serve(stream: Socket, source: Source) -> io::Result<()> {
-    let (mut source, name): (Box<dyn TreeSource>, &str) = match source {
+    let (source, name): (Box<dyn TreeSource>, &str) = match source {
         Source::Demo => (Box::new(DemoSource::new()), "accesskit_remoted-demo"),
         #[cfg(target_os = "linux")]
         Source::Atspi => {
@@ -153,7 +151,7 @@ fn serve(stream: Socket, source: Source) -> io::Result<()> {
             (Box::new(source) as Box<dyn TreeSource>, "accesskit_remoted-ax")
         }
     };
-    let mut server = ServerConnection::new(name);
+    let mut host = SourceHost::new(name, source);
     let mut writer = stream.try_clone()?;
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
 
@@ -172,161 +170,55 @@ fn serve(stream: Socket, source: Source) -> io::Result<()> {
         }
     });
 
-    let result = pump(&mut server, source.as_mut(), &rx, &mut writer);
+    let result = pump(&mut host, &rx, &mut writer);
     let _ = writer.shutdown(std::net::Shutdown::Both);
     drop(rx);
     let _ = reader_thread.join();
     result
 }
 
+/// Moves bytes between the socket and the host until either end is done.
+///
+/// The 50ms timeout is what makes source-driven traffic possible at all: a
+/// blocking read would only ever wake on consumer input, and the consumer has
+/// nothing to say while the desktop changes underneath it.
 fn pump(
-    server: &mut ServerConnection,
-    source: &mut dyn TreeSource,
+    host: &mut SourceHost<Box<dyn TreeSource>>,
     rx: &mpsc::Receiver<Vec<u8>>,
     writer: &mut Socket,
 ) -> io::Result<()> {
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(chunk) => {
-                if let Err(e) = dispatch(server, source, &chunk) {
-                    let _ = writer.write_all(&server.take_output());
-                    return Err(io::Error::other(e));
-                }
-            }
+            Ok(chunk) => write_or_explain(host.handle_input(&chunk), writer)?,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
-        if let Err(e) = drain_source(server, source) {
-            let _ = writer.write_all(&server.take_output());
-            return Err(io::Error::other(e));
+        write_or_explain(host.pump(), writer)?;
+        if let Some(reason) = host.peer_goodbye() {
+            eprintln!("accesskit_remoted: peer said goodbye: {reason}");
         }
-        let out = server.take_output();
-        if !out.is_empty() {
-            writer.write_all(&out)?;
-        }
-        if server.is_closed() {
+        if host.is_closed() {
             return Ok(());
         }
     }
 }
 
-/// Applies the source's buffered changes to the connection, but only once
-/// the session is established; events polled before that are dropped.
-fn drain_source(server: &mut ServerConnection, source: &mut dyn TreeSource) -> Result<(), ServerError> {
-    let events = source.poll_events();
-    if !server.is_established() {
-        return Ok(());
-    }
-    for event in events {
-        apply_source_event(server, event)?;
-    }
-    Ok(())
-}
-
-fn dispatch(
-    server: &mut ServerConnection,
-    source: &mut dyn TreeSource,
-    chunk: &[u8],
-) -> Result<(), ServerError> {
-    for event in server.handle_input(chunk)? {
-        match event {
-            ServerEvent::Established => {
-                let (windows, focus) = source.initial_state();
-                server.sync_initial_state(windows, focus)?;
+/// Writes whatever the host produced — including the goodbye it produced while
+/// failing, which is the consumer's only explanation.
+fn write_or_explain(
+    produced: Result<Vec<u8>, HostError>,
+    writer: &mut Socket,
+) -> io::Result<()> {
+    match produced {
+        Ok(out) => {
+            if !out.is_empty() {
+                writer.write_all(&out)?;
             }
-            ServerEvent::Action { window, request } => {
-                source.perform(window, &request);
-            }
-            ServerEvent::Closed { reason } => {
-                eprintln!("accesskit_remoted: peer said goodbye: {reason}");
-            }
-            ServerEvent::Pong { .. } => {}
+            Ok(())
         }
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use accesskit_remote::{
-        AppInfo, Message, PeerRole, Session, SessionConfig, SessionEvent, WindowId,
-    };
-    use accesskit_remote_server::{SourceEvent, WindowDescriptor};
-
-    struct StubSource {
-        events: Vec<SourceEvent>,
-    }
-
-    impl TreeSource for StubSource {
-        fn initial_state(
-            &mut self,
-        ) -> (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>) {
-            (Vec::new(), None)
+        Err(e) => {
+            let _ = writer.write_all(&e.farewell);
+            Err(io::Error::other(e))
         }
-        fn perform(&mut self, _window: WindowId, _request: &accesskit::ActionRequest) {}
-        fn poll_events(&mut self) -> Vec<SourceEvent> {
-            std::mem::take(&mut self.events)
-        }
-    }
-
-    fn established_server() -> (ServerConnection, Session) {
-        let mut server = ServerConnection::new("test");
-        let mut consumer = Session::new(SessionConfig::new(PeerRole::Consumer, "consumer"));
-        consumer.handle_input(&server.take_output()).unwrap();
-        server.handle_input(&consumer.take_output()).unwrap();
-        assert!(server.is_established());
-        (server, consumer)
-    }
-
-    fn empty_tree() -> accesskit::TreeUpdate {
-        accesskit::TreeUpdate {
-            nodes: vec![(
-                accesskit::NodeId(0),
-                accesskit::Node::new(accesskit::Role::Window),
-            )],
-            tree: Some(accesskit::Tree::new(accesskit::NodeId(0))),
-            tree_id: accesskit::TreeId::ROOT,
-            focus: accesskit::NodeId(0),
-        }
-    }
-
-    #[test]
-    fn drain_forwards_events_when_established() {
-        let (mut server, mut consumer) = established_server();
-        let mut source = StubSource {
-            events: vec![SourceEvent::WindowAdded {
-                descriptor: WindowDescriptor {
-                    id: WindowId(1),
-                    title: "w".into(),
-                    app: AppInfo::default(),
-                    native_window_id: None,
-                },
-                tree: empty_tree(),
-            }],
-        };
-        drain_source(&mut server, &mut source).unwrap();
-        let events = consumer.handle_input(&server.take_output()).unwrap();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SessionEvent::Message(Message::WindowAdded { .. }))));
-    }
-
-    #[test]
-    fn drain_drops_events_before_established() {
-        let mut server = ServerConnection::new("test");
-        let _ = server.take_output(); // discard the queued handshake hello
-        let mut source = StubSource {
-            events: vec![SourceEvent::FocusChanged(None)],
-        };
-        drain_source(&mut server, &mut source).unwrap();
-        assert!(
-            server.take_output().is_empty(),
-            "no session messages emitted before established"
-        );
-        assert!(
-            source.poll_events().is_empty(),
-            "buffered events were drained and dropped"
-        );
     }
 }
