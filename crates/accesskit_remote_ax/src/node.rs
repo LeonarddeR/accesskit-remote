@@ -328,7 +328,12 @@ fn text_within(children: &[ElementKey], names: &Names, depth: usize) -> Option<S
     // is the difference between a System Settings walk costing 1s and 4s: the
     // sidebar has 40 nameless rows, each searched two levels deep, so the
     // per-child call count is multiplied by 80 before anything else happens.
-    let batch = [names.role.clone(), names.value.clone(), names.title.clone()];
+    let batch = [
+        names.role.clone(),
+        names.description.clone(),
+        names.value.clone(),
+        names.title.clone(),
+    ];
     for child in children {
         let Ok(values) = attr::multiple(child.element(), &batch) else {
             continue;
@@ -341,14 +346,17 @@ fn text_within(children: &[ElementKey], names: &Names, depth: usize) -> Option<S
         if role != "AXStaticText" {
             continue;
         }
-        let text = values
-            .get(1)
-            .and_then(|v| v.as_deref())
-            .and_then(attr::as_string)
-            .filter(|t| !t.is_empty())
-            .or_else(|| {
-                values.get(2).and_then(|v| v.as_deref()).and_then(attr::as_string)
-            });
+        // `AXDescription` first, then `AXValue`, then `AXTitle`. AppKit splits
+        // a label across the first two where a row carries a badge: System
+        // Settings' Software Update row has `AXValue = "1"` and
+        // `AXDescription = "Software-update beschikbaar, 1 nieuw onderdeel"`,
+        // so preferring the value announced the badge count with the name
+        // stripped off. Ordinary rows carry only a value and are unaffected.
+        let text = [1usize, 2, 3]
+            .into_iter()
+            .filter_map(|index| values.get(index).and_then(|v| v.as_deref()))
+            .filter_map(attr::as_string)
+            .find(|text| !text.is_empty());
         if let Some(text) = text.filter(|t| !t.is_empty()) {
             return Some(text);
         }

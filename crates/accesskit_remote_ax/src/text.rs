@@ -173,6 +173,19 @@ pub fn build_runs(
         if !words.is_empty() {
             node.set_word_starts(words);
         }
+        // **Required for any geometry to be usable.** `accesskit_consumer`
+        // needs four properties to produce a rectangle — bounds, character
+        // positions, character widths and direction — and returns an empty
+        // vector if *any* is absent. Omitting this one made every range query
+        // answer zero rectangles while the other three were computed, paid for
+        // and delivered intact: a silent loss at the last step.
+        //
+        // Always left-to-right for now. AX exposes no per-run direction, and
+        // the AT-SPI source could only ever read a widget-level one; deriving
+        // real bidirectional runs is unbuilt on both. Declaring LTR is wrong
+        // for RTL text and is still strictly better than declaring nothing,
+        // which loses the geometry for everyone.
+        node.set_text_direction(accesskit::TextDirection::LeftToRight);
         if let Some(geometry) = geometry {
             apply_geometry(&mut node, geometry, start, len);
         }
@@ -382,6 +395,22 @@ mod tests {
         let second = &nodes[1].1;
         assert_eq!(second.character_positions(), Some(&[0.0f32][..]), "the second line restarts at zero");
         assert_eq!(second.bounds().expect("bounds").y0, 16.0, "and sits lower");
+    }
+
+    /// **Regression.** Every range query returned zero rectangles because this
+    /// one property was missing, while bounds, positions and widths were all
+    /// computed and delivered. `accesskit_consumer` requires all four.
+    #[test]
+    fn every_run_declares_a_text_direction() {
+        let geo = geometry(&[(0.0, 0.0, 8.0, 16.0), (8.0, 0.0, 8.0, 16.0)]);
+        for source in [None, Some(&geo)] {
+            let (nodes, _) = build_runs("ab", source, |i| NodeId(i as u64 + 1));
+            assert_eq!(
+                nodes[0].1.text_direction(),
+                Some(accesskit::TextDirection::LeftToRight),
+                "a run without a direction yields no rectangles at all"
+            );
+        }
     }
 
     #[test]

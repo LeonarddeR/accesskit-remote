@@ -560,6 +560,38 @@ So the accurate statement is: focus data is correct and complete on the wire;
 whether a screen reader announces it is untested, and belongs to the RDP
 consumer where the answer will mean something.
 
+**Fourth UIA pass (2026-08-16).** Row naming landed well — unnamed elements
+5.3% -> **3.1%**, and the System Settings sidebar went from 40 silent rows to 8,
+each of the 8 being an empty group row with no text to derive from. Three
+findings acted on since:
+
+- **Per-character geometry was computed, paid for, delivered — and discarded.**
+  `accesskit_consumer` needs *four* properties on a `TextRun` to produce a
+  rectangle: bounds, character positions, character widths and **text
+  direction**. It returns an empty vector if any is absent, so omitting the
+  last made every range query answer zero rectangles while the other three
+  crossed the wire intact. Exactly the same silent-failure shape as the
+  `AXBoundsForRange` naming mistake one commit earlier. Runs now declare
+  left-to-right; AX exposes no per-run direction, and the AT-SPI source could
+  only ever read a widget-level one, so real bidirectional runs remain unbuilt
+  on both sides. Declaring LTR is wrong for RTL text and still strictly better
+  than declaring nothing, which loses the geometry for everyone.
+- **Widening the post-action settle window made toggle latency worse, and it
+  has been put back.** At 1500ms: 0.9s, 1.25s, 1.69s, with one in four falling
+  through to the reconcile tick at 3.24s. At 3500ms the *median* became 2.93s,
+  with eight of ten trials clustered within 110ms just under
+  `RECONCILE_INTERVAL` — the shape of updates arriving on the periodic tick
+  rather than from the post-action walks — and two still overran at 4.17s and
+  4.62s. Why a longer settle delays delivery is not understood; anyone
+  revisiting it should instrument which walk actually carries the change rather
+  than tune the number again.
+- **A derived name must prefer `AXDescription` over `AXValue`.** AppKit splits
+  a label across the two where a row carries a badge: System Settings' Software
+  Update row has `AXValue = "1"` and
+  `AXDescription = "Software-update beschikbaar, 1 nieuw onderdeel"`, so
+  preferring the value announced the badge count with the name stripped off.
+  Ordinary rows carry only a value and are unaffected.
+
 Still open from that report, not yet addressed:
 
 - 32 of 272 elements report an empty rect, and some bounds fall outside their
