@@ -86,11 +86,11 @@ them live, and that activating a control still drives the real Mac application
 
 ## 3. Read it
 
-**With a screen reader.** Alt-Tab to a viewer window and navigate it. This is
-the interesting test, and worth being clear about: *no screen reader has ever
-been run against this project on any platform* — `docs/next-steps.md` lists
-that as open work for the Linux side too. Whatever it reports is new
-information.
+**With a screen reader.** Alt-Tab to a viewer window and navigate it. NVDA has
+read window mode and the trees came out right — an informal look, and still the
+only screen-reader evidence this project has on any platform, so anything a
+systematic pass turns up is new information. Desktop mode has not been read by
+one at all.
 
 What should work: window titles, control roles and names, focus following the
 Mac's focus, text content in a document with a caret, and activating a control

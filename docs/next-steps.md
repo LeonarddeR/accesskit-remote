@@ -59,7 +59,12 @@ interactive RAIL focus exercise, widget-level RTL, the Newton note). What
 remains is small, conditional, or blocked on the toolkit:
 
 1. **Real screen-reader validation.** Everything is verified with UIA test
-   clients; NVDA/Narrator have not been run against a RAIL window yet.
+   clients. **NVDA has now been pointed at the macOS provider** through the
+   `viewer` (window mode, over the SSH tunnel, 2026-08-16) and the trees read
+   correctly — an informal look rather than a systematic pass, but the first
+   time any screen reader has read this project's output on any platform.
+   Still open: a systematic NVDA/Narrator pass, and anything at all against a
+   RAIL window on the Linux side.
 2. **Release workflow.** `.github/workflows/release.yml` has never executed;
    it gets its first run on the first `v*` tag (deliberate).
 3. **Toolkit-blocked, watch upstream GTK.**
