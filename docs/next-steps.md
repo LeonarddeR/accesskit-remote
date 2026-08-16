@@ -592,6 +592,34 @@ findings acted on since:
   preferring the value announced the badge count with the name stripped off.
   Ordinary rows carry only a value and are unaffected.
 
+**Fifth UIA pass (2026-08-16).** Text rectangles reach a UIA client for the
+first time: distinct, plausibly sized, advancing left to right. Toggle latency
+is the best measured yet — median **1.00s, six of six inside the settle
+window** — vindicating the revert. The badge row announces its full label.
+
+- **A `TextRun` is one *visual* line, not one paragraph.** AccessKit gives a run
+  a single bounding rectangle and a one-dimensional `character_positions`
+  array, so it has nowhere to put a second line's vertical offset. Emitting a
+  wrapped paragraph as one run drew its later lines *on top of* its earlier
+  ones: measured through UIA, x correctly restarted at the wrap point while
+  every character reported the same y, so a magnifier following the text jumped
+  back to line one midway through. Runs are now split on wraps as well as hard
+  newlines, detected from the per-character rectangles already being fetched —
+  no extra reads. Live on TextEdit: one run of 85 characters at y=100 and one
+  of 41 at y=114, splitting exactly where the wrap was measured.
+  Without geometry only hard lines can be known, which is the right
+  degradation: the text and caret are still correct, and there were no
+  rectangles to misplace anyway.
+- Still open from that pass: **`RangeFromPoint` maps every point to the end of
+  the document**, so hit-testing — mouse review, touch exploration — reports
+  nothing wherever the user points. Worth re-measuring now that runs are one
+  line each, since the single-line collapse may have been its cause.
+- A degenerate (caret-width) range returns an empty rectangle at every offset
+  while the one-character range at the same place returns a real one. Possibly
+  intended `accesskit_consumer` behaviour — a zero-length range bounds no
+  characters — but a client following the caret must expand by a character
+  first, and the naive query answers nothing.
+
 Still open from that report, not yet addressed:
 
 - 32 of 272 elements report an empty rect, and some bounds fall outside their

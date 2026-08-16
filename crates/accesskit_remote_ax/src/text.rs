@@ -50,11 +50,71 @@ pub fn clamp(text: &str) -> &str {
     }
 }
 
+/// Where each run starts and how many characters it holds.
+///
+/// **A `TextRun` is one visual line, not one paragraph.** AccessKit gives a run
+/// a single bounding rectangle and a one-dimensional `character_positions`
+/// array, so it has nowhere to put a second line's vertical offset. Emitting a
+/// wrapped paragraph as one run therefore draws its later lines on top of its
+/// earlier ones — measured through UIA: x correctly restarted at the wrap
+/// point while every character reported the same y, so a magnifier following
+/// the text jumped back to line one midway through.
+///
+/// Hard newlines always split. Wrapped lines can only be found from geometry,
+/// and are: a character whose rectangle sits on a different row than its
+/// predecessor begins a new run. Without geometry only hard lines are known,
+/// which is the correct degradation — the text is still complete and the caret
+/// still lands in the right place, only the rectangles are absent anyway.
+fn line_spans(text: &str, geometry: Option<&Geometry>) -> Vec<(usize, usize)> {
+    let count = text.chars().count();
+    if count == 0 {
+        // An empty field still needs somewhere for its caret to sit.
+        return vec![(0, 0)];
+    }
+    let mut spans = Vec::new();
+    let mut start = 0usize;
+    let mut previous_was_newline = false;
+    for (index, character) in text.chars().enumerate() {
+        let wrapped = index > start && starts_new_visual_line(geometry, index);
+        if (previous_was_newline || wrapped) && index > start {
+            spans.push((start, index - start));
+            start = index;
+        }
+        previous_was_newline = character == '\n';
+    }
+    spans.push((start, count - start));
+    // Text ending in a newline gets a final empty run, so an end-of-document
+    // caret has a run to sit in.
+    if previous_was_newline {
+        spans.push((count, 0));
+    }
+    spans
+}
+
+/// Whether the character at `index` sits on a lower row than the one before it.
+///
+/// Compared against half the taller of the two characters, so ordinary
+/// baseline differences within a line do not read as a wrap while a real line
+/// break always does.
+fn starts_new_visual_line(geometry: Option<&Geometry>, index: usize) -> bool {
+    let Some(geometry) = geometry else {
+        return false;
+    };
+    let (Some(previous), Some(current)) = (
+        geometry.characters.get(index - 1),
+        geometry.characters.get(index),
+    ) else {
+        return false;
+    };
+    let tolerance = previous.3.max(current.3) * 0.5;
+    (current.1 - previous.1).abs() > tolerance.max(1.0)
+}
+
 /// Splits text into one run per hard line.
 ///
-/// The trailing newline stays with its run, and text ending in a newline gets
-/// a final empty run — otherwise a caret at the very end of the document has
-/// no run to sit in, and neither does the caret in an empty field.
+/// Used where no geometry is available, and by the tests that pin newline
+/// handling. The trailing newline stays with its run, and text ending in a
+/// newline gets a final empty run.
 pub fn split_runs(text: &str) -> Vec<&str> {
     let mut runs = Vec::new();
     let mut rest = text;
@@ -161,15 +221,15 @@ pub fn build_runs(
     let text = clamp(text);
     let mut nodes = Vec::new();
     let mut layout = Vec::new();
-    let mut start = 0usize;
-    for (index, run) in split_runs(text).into_iter().enumerate() {
+    let chars: Vec<char> = text.chars().collect();
+    for (index, (start, len)) in line_spans(text, geometry).into_iter().enumerate() {
+        let run: String = chars[start..start + len].iter().collect();
         let id = id_for_run(index);
         let mut node = Node::new(Role::TextRun);
-        node.set_value(run);
-        let lengths = character_lengths(run);
-        let len = lengths.len();
+        node.set_value(run.as_str());
+        let lengths = character_lengths(&run);
         node.set_character_lengths(lengths);
-        let words = word_starts(run);
+        let words = word_starts(&run);
         if !words.is_empty() {
             node.set_word_starts(words);
         }
@@ -191,7 +251,6 @@ pub fn build_runs(
         }
         nodes.push((id, node));
         layout.push(RunLayout { id, start, len });
-        start += len;
     }
     (nodes, layout)
 }
@@ -411,6 +470,68 @@ mod tests {
                 "a run without a direction yields no rectangles at all"
             );
         }
+    }
+
+    /// **Regression: wrapped text was drawn on top of itself.** A `TextRun` is
+    /// one visual line — AccessKit gives it a single rectangle and a
+    /// one-dimensional position array — so a wrapped paragraph emitted as one
+    /// run has nowhere to put the second line's y, and a magnifier following
+    /// the text jumps back to line one midway through.
+    #[test]
+    fn a_wrapped_line_becomes_its_own_run() {
+        // "abcd" with no newline, wrapping after "ab": the third character
+        // starts a new row.
+        let geo = geometry(&[
+            (0.0, 0.0, 8.0, 16.0),
+            (8.0, 0.0, 8.0, 16.0),
+            (0.0, 16.0, 8.0, 16.0),
+            (8.0, 16.0, 8.0, 16.0),
+        ]);
+        let (nodes, layout) = build_runs("abcd", Some(&geo), |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes.len(), 2, "one run per visual line");
+        assert_eq!(nodes[0].1.value(), Some("ab"));
+        assert_eq!(nodes[1].1.value(), Some("cd"));
+
+        // Each run sits on its own row, and positions restart within it.
+        assert_eq!(nodes[0].1.bounds().unwrap().y0, 0.0);
+        assert_eq!(nodes[1].1.bounds().unwrap().y0, 16.0);
+        assert_eq!(nodes[1].1.character_positions(), Some(&[0.0f32, 8.0][..]));
+
+        // The layout still spans the whole text, so caret offsets resolve.
+        assert_eq!(layout[0].start, 0);
+        assert_eq!(layout[1].start, 2);
+        assert_eq!(position(&layout, 3).unwrap().node, nodes[1].0);
+    }
+
+    #[test]
+    fn a_baseline_wobble_within_a_line_is_not_a_wrap() {
+        // Mixed font sizes on one line shift y slightly; that must not split.
+        let geo = geometry(&[
+            (0.0, 0.0, 8.0, 16.0),
+            (8.0, 2.0, 8.0, 14.0),
+            (16.0, 0.0, 8.0, 16.0),
+        ]);
+        let (nodes, _) = build_runs("abc", Some(&geo), |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes.len(), 1, "a 2px shift is not a new line");
+    }
+
+    #[test]
+    fn hard_newlines_still_split_without_geometry() {
+        let (nodes, _) = build_runs("one\ntwo", None, |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].1.value(), Some("one\n"));
+        assert_eq!(nodes[1].1.value(), Some("two"));
+    }
+
+    #[test]
+    fn an_empty_field_and_a_trailing_newline_keep_a_run_for_the_caret() {
+        let (nodes, layout) = build_runs("", None, |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(layout[0].len, 0);
+
+        let (nodes, _) = build_runs("line\n", None, |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes.len(), 2, "the caret past the newline needs a run");
+        assert_eq!(nodes[1].1.value(), Some(""));
     }
 
     #[test]
