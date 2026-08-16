@@ -478,12 +478,31 @@ absent. `dump_tree --validate` is now the standing check — it asserts exactly
 what `accesskit_consumer` asserts, which is the difference between a
 diagnosable provider bug and a crashed screen reader.
 
+**Second UIA pass (2026-08-16), after those fixes.** Duplicate-child panic gone;
+the Wikipedia window now survives with a screen reader attached. Buttons with
+`InvokePattern` went 0/89 to **57/73**, and invoking Calculator's `7` changed
+its display and relabelled Clear-All to Clear — the action reached the Mac.
+Unnamed elements fell from **65% to 5.4%**. Two further findings:
+
+- **The node cap produces an invalid *delta*, not just a truncated tree.** The
+  viewer survived 211s and then panicked on `[#5000]` — exactly
+  `MAX_NODES_PER_WINDOW` — from `RemoteWindowBinding::apply`, i.e. a live
+  update rather than the initial one. A capped walk leaves nodes present but
+  *orphaned*; the consumer prunes what it cannot reach from the root, and a
+  later delta naming such a node references something already discarded. Fixed
+  by emitting only nodes reachable from the root. `dump_tree --validate` passed
+  throughout because it only ever checked the initial walk.
+- **The earlier "toggle state never returns" was wrong, and so was the theory
+  behind it.** `AXValue` *is* present on those checkboxes, as a `CFNumber`,
+  read correctly by the existing mapping. The state is not stuck, it is late:
+  measured at 3.1s, 4.2s and 3.6s across three trials — the reconcile tick. The
+  controls are `AXSubrole = AXSegment`, segments of an `NSSegmentedControl`,
+  which emit no notification when driven. The post-action re-walk fired 250ms
+  after the write, before the application had updated, and nothing looked
+  again. Now a window is re-walked repeatedly for 1.5s after an action.
+
 Still open from that report, not yet addressed:
 
-- Toggling works but the state never comes back: `TogglePattern.Toggle()` did
-  flip Bold in TextEdit, yet UIA still read `Off` afterwards. The checkbox
-  arrives with `value=None`, so its toggle state is never populated — needs a
-  measurement of where AppKit actually puts it.
 - 32 of 272 elements report an empty rect, and some bounds fall outside their
   own window (Calculator's display starts 99px left of the window's left edge).
 - Names on `TreeItem`/`DataItem` sit on a nested `Text` descendant with no

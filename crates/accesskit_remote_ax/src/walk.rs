@@ -94,20 +94,51 @@ pub fn build_window_update(nodes: &[AxNode], ids: &mut NodeIdMap) -> Option<acce
     // are reached before columns, which is also the hierarchy a reader wants.
     let mut claimed: HashSet<ElementKey> = HashSet::new();
 
-    let mut focus = root_id;
-    let mut out = Vec::with_capacity(nodes.len());
+    // Pass one: resolve every node's child list under the single-parent rule.
+    let mut child_ids: HashMap<accesskit::NodeId, Vec<accesskit::NodeId>> =
+        HashMap::with_capacity(nodes.len());
     for node in nodes {
         let id = ids.id_for(&node.key);
-        let mut built = node::build_container(node, origin);
-        let mut children: Vec<accesskit::NodeId> = node
+        let children: Vec<accesskit::NodeId> = node
             .children
             .iter()
             .filter(|child| walked.contains(child))
-            // `insert` returns false for a child another parent already took,
-            // and also for one this same parent listed twice.
             .filter(|child| claimed.insert((*child).clone()))
             .filter_map(|child| ids.get(child))
             .collect();
+        child_ids.insert(id, children);
+    }
+
+    // Pass two: keep only what the root can actually reach.
+    //
+    // A walked node is not necessarily a *reachable* one. The node cap stops
+    // the walk mid-tree, and the single-parent rule takes children away from
+    // later claimants, so a node can be present and orphaned. Emitting an
+    // orphan is not merely untidy: the consumer prunes what it cannot reach
+    // from the root, and a later delta naming that node then references
+    // something the consumer has thrown away — which is a panic, observed live
+    // as "children ids which are neither in the current tree nor the ID of
+    // another node from the update: [#5000]", #5000 being exactly the cap.
+    let mut reachable: HashSet<accesskit::NodeId> = HashSet::new();
+    let mut stack = vec![root_id];
+    while let Some(id) = stack.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        if let Some(children) = child_ids.get(&id) {
+            stack.extend(children.iter().copied());
+        }
+    }
+
+    let mut focus = root_id;
+    let mut out = Vec::with_capacity(reachable.len());
+    for node in nodes {
+        let id = ids.id_for(&node.key);
+        if !reachable.contains(&id) {
+            continue;
+        }
+        let mut built = node::build_container(node, origin);
+        let mut children: Vec<accesskit::NodeId> = child_ids.remove(&id).unwrap_or_default();
         // A text element's content becomes TextRun children, which is the only
         // shape a consumer can resolve a range against. They are appended
         // rather than replacing the element children, since a text view can
@@ -343,6 +374,70 @@ mod tests {
     /// The refresh path reads structure from `emitted_children`, so it must
     /// apply the same rule — otherwise a refresh hands a node back the children
     /// the walk had deliberately taken away, reintroducing the duplicate.
+    /// **Regression: this panicked a consumer minutes into a session.** The
+    /// node cap stops a walk mid-tree, leaving nodes present but orphaned. An
+    /// orphan is pruned by the consumer as unreachable, and a later delta
+    /// naming it then references something the consumer has discarded —
+    /// "children ids which are neither in the current tree nor the ID of
+    /// another node from the update: [#5000]", where 5000 is the cap exactly.
+    #[test]
+    fn an_orphaned_node_is_not_emitted_at_all() {
+        // key(9) is walked but nobody claims it: the walk stopped before its
+        // parent could be read, which is exactly what the cap does.
+        let nodes = [
+            window(1, vec![key(2)]),
+            node(2, "AXButton", vec![]),
+            node(9, "AXCell", vec![]),
+        ];
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&nodes, &mut ids).unwrap();
+        assert_eq!(update.nodes.len(), 2, "the orphan must not be emitted");
+        let emitted: Vec<accesskit::NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+        assert!(!emitted.contains(&ids.get(&key(9)).unwrap()));
+    }
+
+    /// The general guarantee the consumer needs: everything emitted is
+    /// reachable from the root, and every child named is emitted.
+    #[test]
+    fn every_emitted_node_is_reachable_and_every_child_is_emitted() {
+        let nodes = [
+            window(1, vec![key(2), key(3)]),
+            node(2, "AXGroup", vec![key(4)]),
+            node(3, "AXButton", vec![]),
+            node(4, "AXStaticText", vec![]),
+            node(9, "AXCell", vec![]), // orphan
+        ];
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&nodes, &mut ids).unwrap();
+        let emitted: HashSet<accesskit::NodeId> =
+            update.nodes.iter().map(|(id, _)| *id).collect();
+        for (parent, node) in &update.nodes {
+            for child in node.children() {
+                assert!(
+                    emitted.contains(child),
+                    "node {} names child {} which was not emitted",
+                    parent.0,
+                    child.0
+                );
+            }
+        }
+        // Walk the emitted tree from the root; it must cover everything sent.
+        let root = update.tree.as_ref().unwrap().root;
+        let by_id: HashMap<accesskit::NodeId, &accesskit::Node> =
+            update.nodes.iter().map(|(id, node)| (*id, node)).collect();
+        let mut seen = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(node) = by_id.get(&id) {
+                stack.extend(node.children().iter().copied());
+            }
+        }
+        assert_eq!(seen, emitted, "every emitted node is reachable from the root");
+    }
+
     #[test]
     fn emitted_children_applies_the_same_single_parent_rule() {
         let cell = key(9);

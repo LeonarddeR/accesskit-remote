@@ -62,6 +62,12 @@ const REFRESH_MAX_DELAY: Duration = Duration::from_millis(500);
 /// the first scroll onwards.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How long a window is re-walked after an action is performed on it.
+///
+/// Covers the gap between an AX write being accepted and the application
+/// actually updating, for controls that report nothing when driven.
+const SETTLE_AFTER_ACTION: Duration = Duration::from_millis(1500);
+
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 
 /// Work sent from the sync side to the AX thread.
@@ -164,6 +170,16 @@ struct WindowState {
     /// lazily-populated table would otherwise splice thousands of unwalked
     /// nodes into the consumer's tree.
     children: HashMap<ElementKey, Vec<ElementKey>>,
+    /// Keep re-walking this window until this moment, because an action was
+    /// just performed on it.
+    ///
+    /// A single post-action walk is not enough. An AX write returns as soon as
+    /// the application accepts it, not once the application has updated, so a
+    /// walk 250ms later frequently reads the *old* state and then nothing
+    /// prompts another look. Measured through UIA: a checkbox toggled by a
+    /// consumer took 3.1-4.2s to report its new state, which is the reconcile
+    /// tick — the post-action walk had already come and gone too early.
+    settle_until: Option<Instant>,
 }
 
 /// The AX thread's body: enumerate once, hand the snapshot back, then serve.
@@ -261,7 +277,14 @@ fn perform(
         .map(|node| node.accesskit_role())
         .unwrap_or(accesskit::Role::Unknown);
     ax::perform(key, request, role, names);
-    pending.note(window, Instant::now());
+    // Watch the window for a short while rather than looking once. Some
+    // controls emit no notification at all when driven — an `NSSegmentedControl`
+    // segment is one — so this is the only thing that will notice the change.
+    let now = Instant::now();
+    pending.note(window, now);
+    if let Some(state) = windows.iter_mut().find(|state| state.id == window) {
+        state.settle_until = Some(now + SETTLE_AFTER_ACTION);
+    }
 }
 
 /// Turns queued notifications into invalidations, and services the ones that
@@ -450,6 +473,13 @@ fn drain_due(
         // application was otherwise putting its whole tree on the wire every
         // second — so the walk is reduced to its difference, and a walk that
         // changed nothing sends nothing at all.
+        // Still settling after an action: look again shortly, whether or not
+        // anything changed this time.
+        if window.settle_until.is_some_and(|until| now < until) {
+            pending.note(id, now);
+        } else {
+            window.settle_until = None;
+        }
         let Some(update) = window.emitted.reduce(full) else {
             continue;
         };
@@ -571,6 +601,7 @@ fn reconcile(
                 .and_then(|root| root.frame)
                 .map(|frame| (frame.origin.x, frame.origin.y)),
             children: walk::emitted_children(&nodes),
+            settle_until: None,
         });
         if events
             .send(SourceEvent::WindowAdded {
@@ -669,6 +700,7 @@ fn enumerate(
                     .and_then(|root| root.frame)
                     .map(|frame| (frame.origin.x, frame.origin.y)),
                 children: walk::emitted_children(&nodes),
+                settle_until: None,
             });
         }
     }
