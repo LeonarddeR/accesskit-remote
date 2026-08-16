@@ -234,8 +234,22 @@ fn print_tree(update: &accesskit::TreeUpdate) {
         .filter(|a| node.supports_action(**a))
         .map(|a| format!("{a:?}"))
         .collect();
+        // Character geometry is what a magnifier follows; showing the count
+        // makes "present but empty" distinguishable from "not read at all".
+        let geometry = match (node.bounds(), node.character_positions()) {
+            (Some(b), Some(p)) => format!(
+                " [{:.0},{:.0} {:.0}x{:.0}] {}ch",
+                b.x0,
+                b.y0,
+                b.x1 - b.x0,
+                b.y1 - b.y0,
+                p.len()
+            ),
+            (Some(b), None) => format!(" [{:.0},{:.0} {:.0}x{:.0}]", b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0),
+            _ => String::new(),
+        };
         println!(
-            "{}{:?}{name}{}{}{}",
+            "{}{:?}{name}{geometry}{}{}{}",
             "  ".repeat(depth),
             node.role(),
             if actions.is_empty() { String::new() } else { format!(" <{}>", actions.join(",")) },

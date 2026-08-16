@@ -64,6 +64,14 @@ names! {
     minimized => "AXMinimized",
     hidden => "AXHidden",
     selected_text_range => "AXSelectedTextRange",
+    // Parameterized: takes a CFRange, answers the rectangle that range
+    // occupies on screen.
+    //
+    // The wire name is `AXBoundsForRange`. The C constant is *called*
+    // `kAXBoundsForRangeParameterizedAttribute`, and using that identifier as
+    // the string — which is what the first version did — fails silently:
+    // every read returns nothing and the geometry is simply never populated.
+    bounds_for_range => "AXBoundsForRange",
     placeholder => "AXPlaceholderValue",
     title_ui_element => "AXTitleUIElement",
 
@@ -93,6 +101,25 @@ mod tests {
         }
         assert_eq!(names.role.to_string(), "AXRole");
         assert_eq!(names.manual_accessibility.to_string(), "AXManualAccessibility");
+    }
+
+    /// Guards a mistake that fails *silently*: using a C constant's identifier
+    /// as its value. `kAXBoundsForRangeParameterizedAttribute` is the name of
+    /// the constant; `AXBoundsForRange` is the string it holds. Reading the
+    /// wrong one returns nothing at all, so the geometry simply never appears
+    /// and nothing anywhere reports an error.
+    #[test]
+    fn no_name_is_a_c_constant_identifier() {
+        for (field, value) in ALL {
+            assert!(
+                !value.ends_with("Attribute"),
+                "{field} = {value:?} looks like a constant's name, not its value"
+            );
+            assert!(
+                !value.starts_with("kAX"),
+                "{field} = {value:?} is the C identifier rather than the wire name"
+            );
+        }
     }
 
     #[test]

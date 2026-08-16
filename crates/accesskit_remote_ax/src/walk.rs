@@ -29,7 +29,7 @@ const APPLICATION_ROLE: &str = "AXApplication";
 /// reached, which is correct — an element that will not answer has no
 /// retrievable subtree either.
 pub fn walk_window(root: ElementKey, names: &Names) -> Vec<AxNode> {
-    let mut out = Vec::new();
+    let mut out: Vec<AxNode> = Vec::new();
     let mut queue = VecDeque::from([root]);
     let mut seen: HashSet<ElementKey> = HashSet::new();
     while let Some(key) = queue.pop_front() {
@@ -54,6 +54,17 @@ pub fn walk_window(root: ElementKey, names: &Names) -> Vec<AxNode> {
         }
         queue.extend(node.children.iter().cloned());
         out.push(node);
+    }
+
+    // Text geometry last, because it needs the window's own origin to express
+    // character rectangles in the coordinate space the rest of the tree uses,
+    // and that is only known once the root has been read.
+    let origin = out
+        .first()
+        .and_then(|root| root.frame)
+        .map(|frame| (frame.origin.x, frame.origin.y));
+    for node in &mut out {
+        node::read_geometry_into(node, origin, names);
     }
     out
 }
@@ -145,8 +156,11 @@ pub fn build_window_update(nodes: &[AxNode], ids: &mut NodeIdMap) -> Option<acce
         // legitimately contain both.
         if node::has_text_runs(node.accesskit_role()) {
             if let Some(value) = node.value.as_deref().and_then(crate::attr::as_string) {
-                let (runs, layout) =
-                    crate::text::build_runs(&value, |index| ids.run_id_for(id, index));
+                let (runs, layout) = crate::text::build_runs(
+                    &value,
+                    node.text_geometry.as_ref(),
+                    |index| ids.run_id_for(id, index),
+                );
                 if let Some((start, len)) = node.selected_range {
                     if let Some(selection) = crate::text::selection(&value, &layout, start, len) {
                         built.set_text_selection(selection);
@@ -225,6 +239,7 @@ mod tests {
             children,
             selected_range: None,
             name_from_contents: None,
+            text_geometry: None,
             actions: Vec::new(),
         }
     }

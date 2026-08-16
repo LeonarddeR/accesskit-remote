@@ -101,6 +101,10 @@ pub struct AxNode {
     /// A name recovered from the element's own contents, for roles whose label
     /// lives in a descendant rather than on themselves.
     pub name_from_contents: Option<String>,
+    /// Per-character rectangles, window-relative. `None` when the element
+    /// carries no text, the geometry could not be read, or the text is longer
+    /// than the cap.
+    pub text_geometry: Option<crate::text::Geometry>,
 }
 
 impl AxNode {
@@ -221,6 +225,7 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
         },
         selected_range: None,
         name_from_contents: None,
+        text_geometry: None,
         actions: attr::action_names(key.element()).unwrap_or_default(),
         children: attr::elements(key.element(), &names.children)
             .unwrap_or_default()
@@ -248,6 +253,67 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
             .and_then(attr::as_range);
     }
     Ok(node)
+}
+
+/// Reads the on-screen rectangle of every character, window-relative.
+///
+/// **This is the expensive read in the crate.** `AXBoundsForRange` is
+/// parameterized, so it cannot be batched — one crossing per character. AX
+/// still improves on AT-SPI here, where the same information cost a call per
+/// code point *and* gave no cheap way to get a run's own rectangle; but the
+/// per-character part is irreducible, which is why it is capped and why an
+/// element over the cap keeps its text and caret and simply loses its
+/// rectangles. A reader is unaffected; a magnifier loses the ability to follow
+/// the caret.
+fn read_text_geometry(
+    key: &ElementKey,
+    text: &str,
+    window_origin: Option<(f64, f64)>,
+    names: &Names,
+) -> Option<crate::text::Geometry> {
+    let (origin_x, origin_y) = window_origin?;
+    let count = text.chars().count();
+    if count == 0 || count > crate::text::MAX_GEOMETRY_CHARS {
+        return None;
+    }
+    let element = key.element();
+    let mut characters = Vec::with_capacity(count);
+    let mut utf16 = 0usize;
+    for character in text.chars() {
+        let units = character.len_utf16();
+        let rect = attr::range_value(utf16, units)
+            .and_then(|range| attr::parameterized(element, &names.bounds_for_range, &range).ok())
+            .flatten()
+            .as_deref()
+            .and_then(attr::as_rect);
+        utf16 += units;
+        // All or nothing: a partially-populated array would misalign every
+        // character after the gap, which is worse than having none.
+        let rect = rect?;
+        characters.push((
+            rect.origin.x - origin_x,
+            rect.origin.y - origin_y,
+            rect.size.width,
+            rect.size.height,
+        ));
+    }
+    Some(crate::text::Geometry { characters })
+}
+
+/// Fills in an already-read node's text geometry.
+///
+/// Separate from [`read`] because it needs the window origin, which only the
+/// walk knows, and because it is the one read a caller may reasonably decline
+/// to pay for.
+pub fn read_geometry_into(node: &mut AxNode, window_origin: Option<(f64, f64)>, names: &Names) {
+    if !has_text_runs(node.accesskit_role()) {
+        return;
+    }
+    let Some(text) = node.value.as_deref().and_then(attr::as_string) else {
+        return;
+    };
+    node.text_geometry =
+        read_text_geometry(&node.key, crate::text::clamp(&text), window_origin, names);
 }
 
 /// The first static text found within these elements, searched breadth-first.
@@ -454,6 +520,7 @@ mod tests {
             children: Vec::new(),
             selected_range: None,
             name_from_contents: None,
+            text_geometry: None,
             actions: Vec::new(),
         }
     }

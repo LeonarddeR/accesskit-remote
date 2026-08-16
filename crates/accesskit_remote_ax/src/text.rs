@@ -15,6 +15,16 @@
 
 use accesskit::{NodeId, Node, Role, TextPosition, TextSelection};
 
+/// The most characters one element gets per-character geometry for.
+///
+/// Geometry is the only read here that cannot be batched: each character needs
+/// its own `AXBoundsForRange` call. A run's *own* rectangle is one call, which
+/// is the part AX makes cheap — AT-SPI needed a call per code point simply to
+/// reach that. Above this cap an element still carries text and a caret, just
+/// no per-character rectangles, which degrades a magnifier rather than a
+/// reader.
+pub const MAX_GEOMETRY_CHARS: usize = 512;
+
 /// Text longer than this is not mirrored.
 ///
 /// A screen reader cannot usefully consume a megabyte in one node, and the
@@ -91,6 +101,15 @@ pub fn word_starts(run: &str) -> Vec<u8> {
     starts
 }
 
+/// Converts a character index into the UTF-16 offset AX expects.
+///
+/// The inverse of [`utf16_to_char_index`], and needed because every AX text
+/// range — selection, and the geometry queries below — is measured in UTF-16
+/// code units while everything on the AccessKit side counts characters.
+pub fn char_to_utf16_offset(text: &str, char_index: usize) -> usize {
+    text.chars().take(char_index).map(char::len_utf16).sum()
+}
+
 /// Converts a UTF-16 offset, as AX reports selection, into a character index.
 ///
 /// Offsets beyond the text clamp to its length rather than failing: AX and the
@@ -136,6 +155,7 @@ pub fn position(layout: &[RunLayout], offset: usize) -> Option<TextPosition> {
 /// would replace the whole paragraph rather than update it.
 pub fn build_runs(
     text: &str,
+    geometry: Option<&Geometry>,
     mut id_for_run: impl FnMut(usize) -> NodeId,
 ) -> (Vec<(NodeId, Node)>, Vec<RunLayout>) {
     let text = clamp(text);
@@ -153,11 +173,56 @@ pub fn build_runs(
         if !words.is_empty() {
             node.set_word_starts(words);
         }
+        if let Some(geometry) = geometry {
+            apply_geometry(&mut node, geometry, start, len);
+        }
         nodes.push((id, node));
         layout.push(RunLayout { id, start, len });
         start += len;
     }
     (nodes, layout)
+}
+
+/// Per-character rectangles for an element's whole text, window-relative and
+/// in character order.
+pub struct Geometry {
+    /// One entry per character: `(x, y, width, height)`.
+    pub characters: Vec<(f64, f64, f64, f64)>,
+}
+
+/// Attaches one run's slice of the geometry to its node.
+///
+/// AccessKit wants the run's own bounds plus, *relative to those bounds*, the
+/// horizontal position and width of each character. A run whose characters
+/// disagree in count with its text gets no geometry at all rather than
+/// mismatched arrays — a caret placed from a misaligned array is worse than a
+/// caret with no rectangle.
+fn apply_geometry(node: &mut Node, geometry: &Geometry, start: usize, len: usize) {
+    let Some(chars) = geometry.characters.get(start..start + len) else {
+        return;
+    };
+    if chars.is_empty() {
+        return;
+    }
+    // The run's rectangle is the union of its characters'. A newline reports a
+    // zero-width box, which contributes its position but no extent.
+    let left = chars.iter().map(|c| c.0).fold(f64::INFINITY, f64::min);
+    let top = chars.iter().map(|c| c.1).fold(f64::INFINITY, f64::min);
+    let right = chars.iter().map(|c| c.0 + c.2).fold(f64::NEG_INFINITY, f64::max);
+    let bottom = chars.iter().map(|c| c.1 + c.3).fold(f64::NEG_INFINITY, f64::max);
+    if !left.is_finite() || !top.is_finite() || right <= left {
+        return;
+    }
+    node.set_bounds(accesskit::Rect {
+        x0: left,
+        y0: top,
+        x1: right,
+        y1: bottom,
+    });
+    let positions: Vec<f32> = chars.iter().map(|c| (c.0 - left) as f32).collect();
+    let widths: Vec<f32> = chars.iter().map(|c| c.2 as f32).collect();
+    node.set_character_positions(positions);
+    node.set_character_widths(widths);
 }
 
 /// Builds the container's selection from AX's UTF-16 range.
@@ -184,7 +249,7 @@ mod tests {
 
     fn layout_of(text: &str) -> Vec<RunLayout> {
         let mut next = 100u64;
-        build_runs(text, |_| {
+        build_runs(text, None, |_| {
             next += 1;
             NodeId(next)
         })
@@ -281,7 +346,7 @@ mod tests {
 
     #[test]
     fn runs_carry_their_text_and_per_character_data() {
-        let (nodes, layout) = build_runs("hi there", |index| NodeId(index as u64 + 1));
+        let (nodes, layout) = build_runs("hi there", None, |index| NodeId(index as u64 + 1));
         assert_eq!(nodes.len(), 1);
         let (id, node) = &nodes[0];
         assert_eq!(*id, NodeId(1));
@@ -290,6 +355,64 @@ mod tests {
         assert_eq!(node.character_lengths().len(), 8);
         assert_eq!(node.word_starts(), &[0, 3], "two words");
         assert_eq!(layout[0].len, 8);
+    }
+
+    fn geometry(chars: &[(f64, f64, f64, f64)]) -> Geometry {
+        Geometry { characters: chars.to_vec() }
+    }
+
+    #[test]
+    fn character_positions_are_relative_to_their_own_run() {
+        // Two lines, the second lower down. Each run's positions must be
+        // measured from that run's own left edge, not the element's.
+        let geo = geometry(&[
+            (10.0, 0.0, 8.0, 16.0),
+            (18.0, 0.0, 4.0, 16.0),
+            (10.0, 16.0, 9.0, 16.0),
+        ]);
+        let (nodes, _) = build_runs("a\nb", Some(&geo), |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes.len(), 2);
+
+        let first = &nodes[0].1;
+        assert_eq!(first.character_positions(), Some(&[0.0f32, 8.0][..]), "offset from this run's left");
+        assert_eq!(first.character_widths(), Some(&[8.0f32, 4.0][..]));
+        let bounds = first.bounds().expect("a run with geometry has bounds");
+        assert_eq!((bounds.x0, bounds.y0, bounds.x1), (10.0, 0.0, 22.0));
+
+        let second = &nodes[1].1;
+        assert_eq!(second.character_positions(), Some(&[0.0f32][..]), "the second line restarts at zero");
+        assert_eq!(second.bounds().expect("bounds").y0, 16.0, "and sits lower");
+    }
+
+    #[test]
+    fn text_without_geometry_still_carries_its_content() {
+        // Over the cap, or an unanswering element, must cost a reader nothing
+        // — only a magnifier.
+        let (nodes, _) = build_runs("hello", None, |i| NodeId(i as u64 + 1));
+        assert_eq!(nodes[0].1.value(), Some("hello"));
+        assert!(nodes[0].1.bounds().is_none());
+        assert!(nodes[0].1.character_positions().is_none());
+    }
+
+    #[test]
+    fn a_geometry_that_does_not_match_the_text_is_declined() {
+        // Misaligned arrays misplace every character after the gap, which is
+        // worse than having none.
+        let geo = geometry(&[(0.0, 0.0, 8.0, 16.0)]);
+        let (nodes, _) = build_runs("abc", Some(&geo), |i| NodeId(i as u64 + 1));
+        assert!(nodes[0].1.bounds().is_none(), "3 characters, 1 rectangle: refuse");
+    }
+
+    #[test]
+    fn utf16_offsets_round_trip_through_character_indices() {
+        // The geometry reads walk the text in UTF-16 units, so both
+        // conversions must agree or every rectangle after an emoji is wrong.
+        for text in ["abc", "a\u{1F600}b", "\u{65E5}\u{672C}\u{8A9E}"] {
+            for index in 0..=text.chars().count() {
+                let utf16 = char_to_utf16_offset(text, index);
+                assert_eq!(utf16_to_char_index(text, utf16), index, "{text:?} at {index}");
+            }
+        }
     }
 
     #[test]

@@ -320,6 +320,42 @@ pub fn as_rect(value: &CFType) -> Option<CGRect> {
     }
 }
 
+/// Reads a parameterized attribute — one that takes an argument, such as
+/// "the bounds of this character range".
+///
+/// These are the only reads that cannot be batched: each carries its own
+/// parameter, so `AXUIElementCopyMultipleAttributeValues` cannot express them.
+/// That makes them the expensive kind, and the caller is responsible for
+/// bounding how many it makes.
+pub fn parameterized(
+    element: &AXUIElement,
+    attribute: &CFString,
+    parameter: &CFType,
+) -> Result<Option<CFRetained<CFType>>, AxError> {
+    let mut out: *const CFType = std::ptr::null();
+    // SAFETY: a live element, a valid attribute name, a live parameter, and a
+    // valid writable slot which the callee fills with a +1 reference.
+    let error = unsafe {
+        element.copy_parameterized_attribute_value(attribute, parameter, NonNull::from(&mut out))
+    };
+    let retained = NonNull::new(out.cast_mut())
+        // SAFETY: +1 reference from a Copy-rule function.
+        .map(|ptr| unsafe { CFRetained::from_raw(ptr) });
+    classify(error, retained)
+}
+
+/// Wraps a character range as the `AXValue` a parameterized attribute expects.
+///
+/// The units are UTF-16, as everywhere AX speaks about text offsets.
+pub fn range_value(start: usize, len: usize) -> Option<CFRetained<AXValue>> {
+    let range = objc2_core_foundation::CFRange {
+        location: start as isize,
+        length: len as isize,
+    };
+    // SAFETY: the pointer is a valid CFRange matching the declared type.
+    unsafe { AXValue::new(AXValueType::CFRange, NonNull::from(&range).cast()) }
+}
+
 /// Unwraps an `AXValue` holding a `CFRange`, as `AXSelectedTextRange` does.
 ///
 /// The units are UTF-16 code units; see [`crate::text`] for why that matters.

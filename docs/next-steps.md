@@ -374,6 +374,20 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   slider. Mapping it blindly would put a string where a consumer expects a
   number; omitting it makes text editing invisible, since the node is identical
   before and after and the delta reducer correctly suppresses it.
+- **Per-character geometry works, and is cheap.** `AXBoundsForRange` gives one
+  character's rectangle per call — not batchable, since each carries its own
+  parameter — but AppKit answers fast enough that a 126-character field costs
+  ~3ms, taking a TextEdit walk from 26ms to 29ms. Capped at 512 characters, as
+  the AT-SPI source is; above it an element keeps its text and caret and loses
+  only its rectangles, which degrades a magnifier rather than a reader.
+  Character positions are stored relative to their own run's bounds, so a
+  second line restarts at zero rather than continuing the first.
+- **The attribute is `AXBoundsForRange`, not
+  `AXBoundsForRangeParameterizedAttribute`.** The latter is the *C constant's
+  identifier*; the former is the string it holds. Using the identifier fails
+  completely silently — every read returns nothing, geometry is never
+  populated, and no error surfaces anywhere. Pinned by a test that rejects any
+  attribute name looking like a C identifier.
 - Residual, open: System Settings still reports ~13-30 genuinely changed nodes
   per second while idle, all `TreeItem`/`Cell` in its navigation sidebar.
   Bounds jitter from lazy layout is the likeliest cause. It is bounded damage
@@ -525,6 +539,26 @@ Acted on since:
   were batched into one `AXUIElementCopyMultipleAttributeValues` per candidate,
   which brought it to 3s. Bounded in practice: reconcile only re-walks the
   *active* window, so a background Catalyst window pays it once.
+
+**On focus, and why it stays where it is (2026-08-16).** Window-level focus
+(`FocusChanged`) crosses the wire correctly, within a second, deduplicated —
+proven in all three UIA passes by the viewer's own log. What no consumer has
+ever tested is whether a focus change is *announced*: the AccessKit adapter
+raises UIA focus events only when it believes its window is focused, and
+nothing in the standalone `viewer` tells it that.
+
+Deliberately not fixed there. The viewer gives each remote window its own HWND,
+matching the WSLg RAIL arrangement that `visible.rs`'s `post_focus` was built
+for. The eventual macrdp consumer serves a *full desktop*: one session window
+holding the whole Mac, where the question is which node in one fragment tree
+has focus, not which of N HWNDs. Building the RAIL-shaped plumbing in a testbed
+would model an arrangement that will not exist. The viewer's windows are also
+background windows, so "which one has keyboard focus" has no honest answer
+while the user is driving it from elsewhere.
+
+So the accurate statement is: focus data is correct and complete on the wire;
+whether a screen reader announces it is untested, and belongs to the RDP
+consumer where the answer will mean something.
 
 Still open from that report, not yet addressed:
 
