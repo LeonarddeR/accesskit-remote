@@ -2,8 +2,10 @@
 //! channel add-in mechanism.
 //!
 //! COM plugin scaffolding (IWTSPlugin and friends) wiring the client core and
-//! the UIA host to a transport: an out-of-band socket to the WSL user distro
-//! in phase 1, a real DVC once a server-side channel endpoint exists.
+//! the UIA host to a transport. Which transport depends on what is at the other
+//! end: an out-of-band hvsocket into the WSL VM for a WSL session, where such a
+//! thing exists, and the AccessKit dynamic virtual channel for a connection to
+//! a real remote machine, where it is the only path there is.
 //!
 //! The DLL is loaded via the instance method: it exports
 //! [`VirtualChannelGetInstance`], which the RDC client calls by name to obtain
@@ -13,10 +15,13 @@
 pub mod association;
 mod chain_load;
 mod channel;
+mod desktop_host;
+mod dvc_session;
 mod listener;
 mod plugin;
 mod rail;
 mod register;
+pub mod session_window;
 pub mod transport;
 mod wslgconfig;
 

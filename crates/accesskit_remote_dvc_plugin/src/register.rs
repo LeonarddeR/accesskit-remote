@@ -1,8 +1,16 @@
-//! Self-registration: writing the HKCU `OptionalAddIns\WSLDVC_PRIVATE` entry
-//! (and the `.wslgconfig` flag) so `regsvr32 <dll>` installs the plug-in with no
-//! elevation, and `regsvr32 /u <dll>` removes both. Just the DLL path — no COM
-//! CLSID / `InprocServer32` class registration (the plug-in loads via the
+//! Self-registration, so `regsvr32 <dll>` installs the plug-in with no
+//! elevation and `regsvr32 /u <dll>` removes it again. Just the DLL path — no
+//! COM CLSID / `InprocServer32` class registration (the plug-in loads via the
 //! instance-method entry point, not a class factory).
+//!
+//! **Two keys, because there are two clients to be loaded by.**
+//! `OptionalAddIns\WSLDVC_PRIVATE` is WSLg's private slot in msrdc, which is how
+//! the plug-in reaches a WSL session. `AddIns\AccessKit` is the ordinary
+//! Terminal Server Client add-in route that mstsc reads for any connection —
+//! which is the only way in for a session against a real remote machine, such
+//! as an RDP server on a Mac. Registering both costs nothing: each client reads
+//! the key it knows, and the plug-in decides at runtime which arrangement it is
+//! in.
 
 use std::path::PathBuf;
 use tracing::{debug, error};
@@ -14,6 +22,9 @@ use crate::wslgconfig;
 
 const OPTIONAL_ADDINS_WSLDVC_PRIVATE: &str =
     r"Software\Microsoft\Terminal Server Client\Default\OptionalAddIns\WSLDVC_PRIVATE";
+/// The ordinary add-in route, read by mstsc for every connection.
+const ADDINS_ACCESSKIT: &str =
+    r"Software\Microsoft\Terminal Server Client\Default\AddIns\AccessKit";
 const NAME_VALUE: &str = "Name";
 
 /// This DLL's own filesystem path, resolved from the module handle captured in
@@ -41,14 +52,16 @@ pub fn register() -> HRESULT {
         return E_FAIL;
     };
     let path = path.to_string_lossy().into_owned();
-    let write = windows_registry::CURRENT_USER
-        .create(OPTIONAL_ADDINS_WSLDVC_PRIVATE)
-        .and_then(|k| k.set_string(NAME_VALUE, &path));
-    if let Err(e) = write {
-        error!("register: registry write failed: {e:?}");
-        return E_FAIL;
+    for key in [OPTIONAL_ADDINS_WSLDVC_PRIVATE, ADDINS_ACCESSKIT] {
+        let write = windows_registry::CURRENT_USER
+            .create(key)
+            .and_then(|k| k.set_string(NAME_VALUE, &path));
+        if let Err(e) = write {
+            error!("register: registry write to {key} failed: {e:?}");
+            return E_FAIL;
+        }
+        debug!("register: HKCU {key} Name={path}");
     }
-    debug!("register: HKCU OptionalAddIns\\WSLDVC_PRIVATE Name={path}");
     if let Err(e) = wslgconfig::install() {
         error!("register: .wslgconfig update failed: {e:?}");
         return E_FAIL;
@@ -57,8 +70,10 @@ pub fn register() -> HRESULT {
 }
 
 pub fn unregister() -> HRESULT {
-    if let Err(e) = windows_registry::CURRENT_USER.remove_tree(OPTIONAL_ADDINS_WSLDVC_PRIVATE) {
-        debug!("unregister: remove_tree returned {e:?} (ok if key absent)");
+    for key in [OPTIONAL_ADDINS_WSLDVC_PRIVATE, ADDINS_ACCESSKIT] {
+        if let Err(e) = windows_registry::CURRENT_USER.remove_tree(key) {
+            debug!("unregister: remove_tree {key} returned {e:?} (ok if key absent)");
+        }
     }
     if let Err(e) = wslgconfig::uninstall() {
         error!("unregister: .wslgconfig update failed: {e:?}");

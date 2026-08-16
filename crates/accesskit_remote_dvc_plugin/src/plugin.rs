@@ -1,6 +1,24 @@
-//! `IWTSPlugin` implementation: registers a DVC listener when the RDC client
-//! initializes the plug-in, and runs the out-of-band hvsocket client for the
-//! lifetime of the RDP connection.
+//! `IWTSPlugin` implementation: registers the DVC listener when the RDC client
+//! initializes the plug-in, and — in a WSL session — runs the out-of-band
+//! hvsocket client for the lifetime of the RDP connection.
+//!
+//! **There are two arrangements, and which one this is decides everything.**
+//!
+//! *WSL*: the client is msrdc showing a WSL distro's windows through RAIL. The
+//! trees do not come over RDP at all — they come over an hvsocket straight into
+//! the WSL2 VM, which is possible only because that VM is on this machine. Each
+//! remote window has its own `RAIL_WINDOW` HWND, so `crate::rail` binds them one
+//! for one. The DVC listener is never connected in this arrangement.
+//!
+//! *A real remote machine*: the client is connected to an RDP server somewhere
+//! else — macrdp on a Mac — and there is no side channel at all. **The DVC is
+//! the only path**, so the listener carries the trees, and the session is a
+//! whole desktop rather than a set of windows: one session window, every remote
+//! window grafted into one composed tree (`crate::desktop_host`).
+//!
+//! The discriminator is msrdc's own command line: a WSL session is launched
+//! with `/v:<vm-guid>`, and nothing else is. So an absent VM id means a real
+//! remote, and the plug-in waits for the channel instead of dialling out.
 
 use accesskit_remote_client::{ClientConnection, ClientEvent};
 use accesskit_remote_windows::SharedClient;
@@ -17,14 +35,14 @@ use crate::listener::AccessKitListenerCallback;
 use crate::rail::{self, RailHook, RailShared, Registry};
 use crate::transport::{self, PumpHandle};
 
-/// The channel name the plug-in listens on. Phase-1 placeholder: in `/wslg`
-/// there is no server-side AccessKit DVC channel, so the listener never
-/// receives a connection — it exists to prove the plug-in is driven by the
-/// client. Distinct from the stock `Microsoft::Windows::RDS::RemoteApplicationList`.
+/// The channel name the plug-in listens on, and the one macrdp serves.
+/// Distinct from the stock `Microsoft::Windows::RDS::RemoteApplicationList`.
 pub const CHANNEL_NAME: &str = "AccessKit";
 
-/// Per-RDP-connection state: the shared client store, the hvsocket pump, the
-/// RAIL hook, and the action channel bindings send UIA actions into.
+/// Per-RDP-connection state for a **WSL** session: the hvsocket pump and the
+/// RAIL hook. A session against a real remote machine keeps no state here —
+/// everything it needs is built when the channel connects, in
+/// [`crate::listener`].
 struct Session {
     pump: PumpHandle,
     hook: Option<RailHook>,
@@ -174,8 +192,18 @@ impl IWTSPlugin_Impl for AccessKitDvcPlugin_Impl {
             return Ok(());
         }
         match Session::start() {
-            Some(s) => *session = Some(s),
-            None => warn!("no /v:<vm-id> on the host command line; hvsocket client not started"),
+            Some(s) => {
+                info!("WSL session: reading trees over an hvsocket into the VM");
+                *session = Some(s);
+            }
+            // Not a WSL session, so there is no VM to dial and no side channel
+            // to dial it over: this is a connection to a real remote machine,
+            // and everything happens when the provider opens the AccessKit
+            // channel. Nothing to start here, and nothing wrong.
+            None => info!(
+                "no /v:<vm-id> on the client's command line: waiting for the remote desktop \
+                 to open the {CHANNEL_NAME} channel"
+            ),
         }
         Ok(())
     }
