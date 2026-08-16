@@ -74,8 +74,18 @@ What should work: window titles, control roles and names, focus following the
 Mac's focus, text content in a document with a caret, and activating a control
 (the action travels back and drives the real Mac application).
 
-What will not: anything needing per-character geometry, since that is not
-implemented yet — a magnifier following the caret has nothing to follow.
+Per-character geometry is implemented, so a range's rectangles and hit-testing
+a point both answer. Before blaming the wire for a text result that looks wrong,
+check it against the consumer on the Mac itself:
+
+```
+cargo run -p accesskit_remote_ax --example hit_probe -- --empty
+```
+
+It feeds real walked trees to the same `accesskit_consumer` the Windows adapter
+runs behind UIA and reports whether the centre of every character rectangle
+resolves to that character. A UIA finding that survives `hit_probe` passing is a
+consumer- or transport-side problem, not a provider one.
 
 **With inspect.exe** (Windows SDK), if you want the raw provider view:
 point it at a viewer window; the AccessKit subtree reports `FrameworkId`

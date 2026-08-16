@@ -24,6 +24,11 @@ objc2-app-kit = "0.3"
 objc2-core-graphics = "0.3"
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
+# The real consumer, used to check what a screen reader would actually get out
+# of the trees this crate builds. Every silent text defect so far — missing
+# `text_direction`, runs drawn on top of each other — was invisible from the
+# provider side and would have been caught here.
+accesskit_consumer = "0.38"
 serde_json.workspace = true
 accesskit_remote_server.workspace = true
 tracing-subscriber.workspace = true

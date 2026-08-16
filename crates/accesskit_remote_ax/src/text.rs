@@ -583,4 +583,92 @@ mod tests {
         assert!(word_starts(&long).is_empty());
         assert_eq!(word_starts("one two"), vec![0, 4]);
     }
+
+    /// A two-line text element inside a window, in the shape the walk emits.
+    ///
+    /// The container's rectangle deliberately extends far below its text, as a
+    /// real text view's does: a few lines in a tall window leave most of the
+    /// element empty. That empty region is where hit-testing gets interesting.
+    ///
+    /// Characters are 8pt wide and 16pt tall, the first line at y 0 and the
+    /// second at y 16, both starting at x 10.
+    fn two_line_text_element() -> accesskit::TreeUpdate {
+        let geo = geometry(&[
+            (10.0, 0.0, 8.0, 16.0),  // 'a'
+            (18.0, 0.0, 8.0, 16.0),  // 'b'
+            (26.0, 0.0, 0.0, 16.0),  // the newline, zero width
+            (10.0, 16.0, 8.0, 16.0), // 'c'
+            (18.0, 16.0, 8.0, 16.0), // 'd'
+        ]);
+        let (runs, _) = build_runs("ab\ncd", Some(&geo), |index| NodeId(index as u64 + 10));
+
+        let mut container = Node::new(Role::MultilineTextInput);
+        container.set_children(runs.iter().map(|(id, _)| *id).collect::<Vec<_>>());
+        container.set_bounds(accesskit::Rect { x0: 10.0, y0: 0.0, x1: 400.0, y1: 300.0 });
+
+        let mut root = Node::new(Role::Window);
+        root.set_children(vec![NodeId(2)]);
+        root.set_bounds(accesskit::Rect { x0: 0.0, y0: 0.0, x1: 400.0, y1: 300.0 });
+
+        let mut nodes = vec![(NodeId(1), root), (NodeId(2), container)];
+        nodes.extend(runs);
+        accesskit::TreeUpdate {
+            nodes,
+            tree: Some(accesskit::Tree::new(NodeId(1))),
+            tree_id: accesskit::TreeId::ROOT,
+            focus: NodeId(2),
+        }
+    }
+
+    /// **The coordinate-space contract for hit-testing, checked against the
+    /// real consumer.** A point handed to `text_position_at_point` is in the
+    /// same space the node's own bounds are in — for this crate, window-relative
+    /// points — and it is not offset by the element's origin first. Getting that
+    /// wrong sends every hit test to the end of the document, which is exactly
+    /// what a UIA `RangeFromPoint` reported from Windows.
+    #[test]
+    fn a_point_on_a_character_resolves_to_that_character() {
+        let tree = accesskit_consumer::Tree::new(two_line_text_element(), true);
+        let state = tree.state();
+        let element = state
+            .node_by_tree_local_id(NodeId(2), accesskit::TreeId::ROOT)
+            .expect("the text element is in the consumer's tree");
+        assert!(element.supports_text_ranges(), "a consumer will answer range queries");
+
+        // The centre of each character, in window coordinates, must resolve to
+        // that character's index across the whole element — including the
+        // second visual line, whose run restarts its own positions at zero.
+        for (x, y, expected, what) in [
+            (14.0, 8.0, 0, "'a', first line"),
+            (22.0, 8.0, 1, "'b', first line"),
+            (14.0, 24.0, 3, "'c', second line"),
+            (22.0, 24.0, 4, "'d', second line"),
+        ] {
+            let position = element.text_position_at_point(accesskit::Point::new(x, y));
+            assert_eq!(position.to_global_usv_index(), expected, "{what}");
+        }
+    }
+
+    /// **Not a defect, and the reason this test exists.** A point inside the
+    /// element but past its last character resolves to the end of the document,
+    /// because there is no character there. A probe aimed at the centre of a
+    /// tall, mostly empty text view therefore reports the final offset for
+    /// every point tried — which reads as a broken hit test from outside and is
+    /// the consumer behaving as designed.
+    #[test]
+    fn a_point_in_the_empty_space_below_the_text_is_the_end_of_the_document() {
+        let tree = accesskit_consumer::Tree::new(two_line_text_element(), true);
+        let state = tree.state();
+        let element = state
+            .node_by_tree_local_id(NodeId(2), accesskit::TreeId::ROOT)
+            .unwrap();
+
+        // The centre of the element — well below two lines of text.
+        let position = element.text_position_at_point(accesskit::Point::new(200.0, 150.0));
+        assert!(position.is_document_end(), "past the last character");
+
+        // Above and left of the first character is the other end.
+        let position = element.text_position_at_point(accesskit::Point::new(0.0, -5.0));
+        assert!(position.is_document_start());
+    }
 }

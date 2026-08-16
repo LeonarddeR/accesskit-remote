@@ -610,10 +610,31 @@ window** — vindicating the revert. The badge row announces its full label.
   Without geometry only hard lines can be known, which is the right
   degradation: the text and caret are still correct, and there were no
   rectangles to misplace anyway.
-- Still open from that pass: **`RangeFromPoint` maps every point to the end of
-  the document**, so hit-testing — mouse review, touch exploration — reports
-  nothing wherever the user points. Worth re-measuring now that runs are one
-  line each, since the single-line collapse may have been its cause.
+- **`RangeFromPoint` reporting the end of the document for every point is not a
+  defect** — closed, having been the pass's lead open item. A UIA probe from
+  Windows found every point mapping to offset 126 of 126; that is the correct
+  answer for a point that is inside the element but past its last character,
+  and the centre of a TextEdit window holding 126 characters is exactly such a
+  point. `accesskit_consumer`'s `text_position_at_point` hit-tests the `TextRun`
+  children and, on a miss, falls back to the document start or end depending on
+  which side of the text the point lies (`text.rs:1485-1520`), so a probe aimed
+  at the middle of a mostly empty text view can only ever report the end.
+
+  Settled with `hit_probe`, which walks real windows, feeds the trees to the
+  real consumer, and asks it which character sits at the centre of every
+  rectangle this crate emitted. Against TextEdit, Safari and System Settings:
+  **168 of 168 character rectangles resolve to their own character**, and the
+  same run reproduces the end-of-document answer at those elements' centres, so
+  the two are no longer confusable. Two unit tests pin the coordinate-space
+  contract without needing a live desktop: a point handed to
+  `text_position_at_point` is in the *same* space the node's bounds are in —
+  window-relative here, **not** offset by the element's origin first.
+
+  The general lesson is the one this crate keeps relearning: a text defect
+  reported from the far side of the wire may be a property of the probe, and
+  the only way to tell is to run the consumer's own code against real
+  provider output. It is a pure Rust crate and runs on macOS, so that costs a
+  dev-dependency and nothing else.
 - A degenerate (caret-width) range returns an empty rectangle at every offset
   while the one-character range at the same place returns a real one. Possibly
   intended `accesskit_consumer` behaviour — a zero-length range bounds no
