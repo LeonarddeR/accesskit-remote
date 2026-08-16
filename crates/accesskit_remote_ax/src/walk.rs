@@ -224,6 +224,7 @@ mod tests {
             states: NodeStates::default(),
             children,
             selected_range: None,
+            name_from_contents: None,
             actions: Vec::new(),
         }
     }

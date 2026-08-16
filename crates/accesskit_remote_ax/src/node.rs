@@ -98,6 +98,9 @@ pub struct AxNode {
     pub children: Vec<ElementKey>,
     /// The UTF-16 selection range, read only for elements that carry text.
     pub selected_range: Option<(usize, usize)>,
+    /// A name recovered from the element's own contents, for roles whose label
+    /// lives in a descendant rather than on themselves.
+    pub name_from_contents: Option<String>,
 }
 
 impl AxNode {
@@ -115,12 +118,47 @@ impl AxNode {
     /// description — so neither alone is sufficient.
     pub fn name(&self) -> &str {
         if !self.title.is_empty() {
-            &self.title
-        } else {
-            &self.description
+            return &self.title;
         }
+        if !self.description.is_empty() {
+            return &self.description;
+        }
+        self.name_from_contents.as_deref().unwrap_or_default()
     }
 }
+
+/// Whether a nameless element of this role should take its name from the text
+/// inside it.
+///
+/// System Settings' sidebar is the case that forces this: a `TreeItem` holds a
+/// `DataItem` holding a `Text` carrying the actual label, and nothing bridges
+/// them, so a reader lands on 40 sidebar rows and announces nothing for any of
+/// them. ARIA calls this "name from contents" and applies it to exactly this
+/// kind of role — a thing you select, whose label is its content.
+///
+/// Deliberately not applied to containers like `List` or `Toolbar`: they have
+/// no name of their own legitimately, and concatenating their contents into
+/// one would be worse than silence.
+fn takes_name_from_contents(role: Role) -> bool {
+    matches!(
+        role,
+        Role::TreeItem
+            | Role::ListItem
+            | Role::ListBoxOption
+            | Role::MenuItem
+            | Role::Row
+            | Role::Cell
+            | Role::Tab
+            | Role::Button
+            | Role::Link
+    )
+}
+
+/// How deep to look for that text.
+///
+/// Two levels covers the observed `TreeItem > DataItem > Text` nesting without
+/// turning every nameless row into a subtree walk.
+const NAME_SEARCH_DEPTH: usize = 2;
 
 /// Whether this role's text should be exposed as `TextRun` children.
 ///
@@ -182,6 +220,7 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
             value_settable: attr::is_settable(key.element(), &names.value).unwrap_or(false),
         },
         selected_range: None,
+        name_from_contents: None,
         actions: attr::action_names(key.element()).unwrap_or_default(),
         children: attr::elements(key.element(), &names.children)
             .unwrap_or_default()
@@ -190,6 +229,16 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
             .collect(),
         key,
     };
+    // Recovered here rather than while building the tree, so that a
+    // single-node refresh produces the same name as the walk did. Deriving it
+    // from descendants at tree-build time would mean a refreshed node silently
+    // lost its label and emitted a spurious delta doing so.
+    if node.title.is_empty()
+        && node.description.is_empty()
+        && takes_name_from_contents(node.accesskit_role())
+    {
+        node.name_from_contents = text_within(&node.children, names, NAME_SEARCH_DEPTH);
+    }
     // Only text elements pay for the selection read.
     if has_text_runs(node.accesskit_role()) {
         node.selected_range = attr::value(node.key.element(), &names.selected_text_range)
@@ -199,6 +248,57 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
             .and_then(attr::as_range);
     }
     Ok(node)
+}
+
+/// The first static text found within these elements, searched breadth-first.
+///
+/// Stops at the first hit: a row with several text descendants is named by the
+/// first, which is the one a reader would read first anyway.
+fn text_within(children: &[ElementKey], names: &Names, depth: usize) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    // Role, value and title in one crossing per child rather than three. This
+    // is the difference between a System Settings walk costing 1s and 4s: the
+    // sidebar has 40 nameless rows, each searched two levels deep, so the
+    // per-child call count is multiplied by 80 before anything else happens.
+    let batch = [names.role.clone(), names.value.clone(), names.title.clone()];
+    for child in children {
+        let Ok(values) = attr::multiple(child.element(), &batch) else {
+            continue;
+        };
+        let role = values
+            .first()
+            .and_then(|v| v.as_deref())
+            .and_then(attr::as_string)
+            .unwrap_or_default();
+        if role != "AXStaticText" {
+            continue;
+        }
+        let text = values
+            .get(1)
+            .and_then(|v| v.as_deref())
+            .and_then(attr::as_string)
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                values.get(2).and_then(|v| v.as_deref()).and_then(attr::as_string)
+            });
+        if let Some(text) = text.filter(|t| !t.is_empty()) {
+            return Some(text);
+        }
+    }
+    // Breadth first: a sibling's text beats a grandchild's.
+    for child in children {
+        let grandchildren: Vec<ElementKey> = attr::elements(child.element(), &names.children)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|element| ElementKey::new(child.pid(), element))
+            .collect();
+        if let Some(text) = text_within(&grandchildren, names, depth - 1) {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// Builds everything about a node that comes from its own read: role, name,
@@ -353,6 +453,7 @@ mod tests {
             states: NodeStates::default(),
             children: Vec::new(),
             selected_range: None,
+            name_from_contents: None,
             actions: Vec::new(),
         }
     }
@@ -489,6 +590,37 @@ mod tests {
         assert!(!build_container(&n, None).supports_action(accesskit::Action::SetValue));
         n.states.value_settable = true;
         assert!(build_container(&n, None).supports_action(accesskit::Action::SetValue));
+    }
+
+    /// **Regression.** All 40 System Settings sidebar rows announced nothing: a
+    /// `TreeItem` holds a `DataItem` holds a `Text`, and nothing bridged them.
+    #[test]
+    fn a_selectable_row_can_take_its_name_from_its_contents() {
+        let mut n = node("AXRow");
+        assert_eq!(n.name(), "", "nothing to take it from yet");
+        n.name_from_contents = Some("Software-update beschikbaar".into());
+        assert_eq!(n.name(), "Software-update beschikbaar");
+        assert_eq!(
+            build_container(&n, None).label(),
+            Some("Software-update beschikbaar")
+        );
+
+        // A real name always wins over a derived one.
+        n.title = "Updates".into();
+        assert_eq!(n.name(), "Updates");
+    }
+
+    /// Containers legitimately have no name of their own, and concatenating
+    /// their contents into one would be worse than silence.
+    #[test]
+    fn only_content_bearing_roles_take_a_name_from_within() {
+        assert!(takes_name_from_contents(Role::TreeItem));
+        assert!(takes_name_from_contents(Role::Row));
+        assert!(takes_name_from_contents(Role::Button));
+        assert!(!takes_name_from_contents(Role::List));
+        assert!(!takes_name_from_contents(Role::Toolbar));
+        assert!(!takes_name_from_contents(Role::GenericContainer));
+        assert!(!takes_name_from_contents(Role::Window));
     }
 
     #[test]

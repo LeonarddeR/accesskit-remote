@@ -66,7 +66,17 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(3);
 ///
 /// Covers the gap between an AX write being accepted and the application
 /// actually updating, for controls that report nothing when driven.
-const SETTLE_AFTER_ACTION: Duration = Duration::from_millis(1500);
+///
+/// Measured through a UIA client toggling an `NSSegmentedControl` segment:
+/// with a 1500ms window, three of four activations reported their new state in
+/// 0.9-1.7s and the fourth took 3.24s — it had missed the window and fallen
+/// back to the reconcile tick. 3500ms covers that tail, which matters because
+/// the failure is a screen reader announcing the *old* state after the user
+/// pressed something.
+///
+/// The cost is bounded and only paid after an action: re-walks are still
+/// debounced at 250ms, so this is a handful of extra walks of one window.
+const SETTLE_AFTER_ACTION: Duration = Duration::from_millis(3500);
 
 type Snapshot = (Vec<(WindowDescriptor, accesskit::TreeUpdate)>, Option<WindowId>);
 

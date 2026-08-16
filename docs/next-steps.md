@@ -501,6 +501,31 @@ Unnamed elements fell from **65% to 5.4%**. Two further findings:
   after the write, before the application had updated, and nothing looked
   again. Now a window is re-walked repeatedly for 1.5s after an action.
 
+**Third UIA pass (2026-08-16), after the reachability fix.** The crash is gone:
+**18 minutes with NVDA attached, ten consecutive full UIA walks of 3626
+elements, zero panics** — against 1-2s originally and a 211s panic at
+`c465e6d`. The provider's own "3626 visible" matched the UIA walk's 3626
+exactly, so nothing is lost between the Mac and the Windows client. Toggle
+latency fell from 3.1-4.2s to 0.9-1.7s, with one trial in four at 3.24s having
+missed the 1500ms post-action window; it is now 3500ms to cover that tail.
+
+Acted on since:
+
+- **Names from contents.** All 40 System Settings sidebar rows announced
+  nothing, because a `TreeItem` holds a `DataItem` holds a `Text` and nothing
+  bridged them. A nameless element whose role takes its name from its contents
+  (`TreeItem`, `Row`, `Cell`, `ListItem`, `MenuItem`, `Tab`, `Button`, `Link`)
+  now searches two levels for static text. Deliberately **not** applied to
+  containers — a `List` or `Toolbar` legitimately has no name, and
+  concatenating its contents would be worse than silence.
+  Derived during the *read*, not while building the tree, so a single-node
+  refresh produces the same name; deriving at build time would make a refreshed
+  node silently lose its label and emit a spurious delta doing so.
+- That costs reads. System Settings went 1s -> 4s per walk before the lookups
+  were batched into one `AXUIElementCopyMultipleAttributeValues` per candidate,
+  which brought it to 3s. Bounded in practice: reconcile only re-walks the
+  *active* window, so a background Catalyst window pays it once.
+
 Still open from that report, not yet addressed:
 
 - 32 of 272 elements report an empty rect, and some bounds fall outside their
