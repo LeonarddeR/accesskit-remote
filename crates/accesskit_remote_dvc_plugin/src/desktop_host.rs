@@ -126,14 +126,16 @@ pub fn start(
     label: impl Into<String>,
 ) -> DesktopHost {
     let target = crate::session_window::find();
-    let shared = Arc::new(HostShared {
+    // Not named `shared`: that is the accessor the hook proc and the heartbeat
+    // reach the same state through, and a local of that name shadows it.
+    let state = Arc::new(HostShared {
         client,
         actions,
         label: label.into(),
         target: AtomicIsize::new(target.as_ref().map_or(0, |c| c.hwnd)),
         installed: AtomicBool::new(false),
     });
-    *shared_slot().lock().unwrap() = Some(shared.clone());
+    *shared_slot().lock().unwrap() = Some(state);
 
     let (tid_tx, tid_rx) = std::sync::mpsc::channel();
     let hook_join = std::thread::spawn(move || {
