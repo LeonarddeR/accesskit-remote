@@ -194,6 +194,12 @@ fn pump(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
         write_or_explain(host.pump(), writer)?;
+        // Without this the daemon can be held by a client that no longer
+        // exists: a dropped tunnel leaves a socket that accepts writes and
+        // delivers nothing, and an idle desktop gives nothing to write, so
+        // nothing ever fails. Serving one client at a time, that is a daemon
+        // that refuses every later client while the port still accepts TCP.
+        write_or_explain(host.heartbeat(std::time::Instant::now()), writer)?;
         if let Some(reason) = host.peer_goodbye() {
             eprintln!("accesskit_remoted: peer said goodbye: {reason}");
         }

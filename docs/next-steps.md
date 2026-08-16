@@ -690,15 +690,37 @@ composition.
   against 0.89–1.34s measured without one. That interval is time the reader
   spends saying the wrong thing, and it was not visible in any instrument-only
   measurement.
-- **Desktop mode aborted intermittently** — `Focused ID #142 is not in the node
-  list`, raised from `update_host_focus_state`, i.e. inside the adapter's
-  window procedure. That is `extern "system"` and cannot unwind, so it aborts
-  the process rather than panicking catchably: **in desktop mode any
-  consumer-side invariant violation is fatal, not diagnosable.** Fixed in
-  `3c082f1`; the cause was in the client store and had always been there.
-  `snapshot()` prunes nodes orphaned by a child-list change but repeated the
-  recorded focus unchecked. Window mode snapshots one window once and never hit
-  it; desktop mode snapshots every window on every adapter activation.
+- **Desktop mode aborted** — `Focused ID #142 is not in the node list`, raised
+  from `update_host_focus_state`, i.e. inside the adapter's window procedure.
+  That is `extern "system"` and cannot unwind, so it aborts the process rather
+  than panicking catchably: **in desktop mode any consumer-side invariant
+  violation is fatal, not diagnosable.** Fixed in `3c082f1`; the cause was in
+  the client store and had always been there. `snapshot()` prunes nodes
+  orphaned by a child-list change but repeated the recorded focus unchecked.
+  Window mode snapshots one window once and never hit it; desktop mode
+  snapshots every window on every adapter activation.
+
+  **The reported frequency was wrong, and the reason is worth keeping.** The
+  eighth pass established that every observed abort happened while **the Mac
+  was locked** — the condition the first bullet of `macos-e2e.md` warns about,
+  which makes every application report zero windows and so churns focus through
+  trees that have just emptied. With lock state verified, 11 valid runs gave 0
+  aborts. So the bug is real (reproduced in a test, checked by falsification)
+  and a locked screen is what kept triggering it; "intermittent" was measuring
+  the lock, not the code. A run whose log does not begin with
+  `viewer: connected` is void, not a survival.
+- **Focus descends through the graft, measured.** The globally focused UIA
+  element resolves seven levels deep — desktop root → Mac window → tab →
+  document → group → list → `Hyperlink 'Course of the war'` — so focus crosses
+  the graft boundary and lands where the Mac has it.
+- **A dropped transport used to wedge the daemon, and looked like a provider
+  fault.** After an SSH tunnel dropped, the daemon held its single client slot
+  forever: the socket still accepted writes and delivered nothing, and an idle
+  desktop gives nothing to write, so nothing ever failed. The port kept
+  accepting TCP, so every later client timed out against a daemon that looked
+  healthy. Fixed by pinging a quiet peer and giving up after 20s of silence
+  (`SourceHost::heartbeat`) — the session layer already answered pings on both
+  sides, so nothing but the asking was missing.
 - **Invoking a control is silent.** Invoking Calculator's `5` moved the real
   display from `7` to `75`, and NVDA said nothing — the display is a `Text` node
   that is neither focused nor a live region, so nothing prompts an

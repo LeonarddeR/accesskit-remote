@@ -23,6 +23,21 @@
 //! separate call sites.
 
 use crate::{apply_source_event, ServerConnection, ServerError, ServerEvent, TreeSource};
+use std::time::{Duration, Instant};
+
+/// How often a quiet connection is pinged.
+///
+/// Both sides answer a `Ping` inside the session layer without the application
+/// seeing it, so a live peer always answers promptly and this is pure
+/// liveness — it carries no data and means nothing else.
+pub const PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a peer may go without answering before it is presumed gone.
+///
+/// Four missed pings. Generous, because the cost of being wrong is dropping a
+/// working session, and cheap, because the cost of being slow is only that a
+/// dead slot is held a few seconds longer.
+pub const PEER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A failed step, carrying the bytes that must still reach the consumer.
 ///
@@ -52,6 +67,12 @@ pub struct SourceHost<S> {
     server: ServerConnection,
     source: S,
     peer_goodbye: Option<String>,
+    /// When the peer last proved it was there, and the next ping's number.
+    /// `None` until the session is established, because there is nobody to
+    /// ping before that.
+    heard_from: Option<Instant>,
+    pinged: Option<Instant>,
+    seq: u64,
 }
 
 impl<S: TreeSource> SourceHost<S> {
@@ -61,6 +82,9 @@ impl<S: TreeSource> SourceHost<S> {
             server: ServerConnection::new(name),
             source,
             peer_goodbye: None,
+            heard_from: None,
+            pinged: None,
+            seq: 0,
         }
     }
 
@@ -70,6 +94,9 @@ impl<S: TreeSource> SourceHost<S> {
     /// messages from arbitrary splits, which is what makes a DVC, a socket and
     /// a test all equivalent here.
     pub fn handle_input(&mut self, chunk: &[u8]) -> Result<Vec<u8>, HostError> {
+        // Bytes arriving at all are proof of life — a pong is only the kind we
+        // ask for when there is nothing else.
+        self.heard_from = Some(Instant::now());
         let events = self.server.handle_input(chunk).map_err(|error| self.fail(error))?;
         for event in events {
             match event {
@@ -113,6 +140,42 @@ impl<S: TreeSource> SourceHost<S> {
                 apply_source_event(&mut self.server, event).map_err(|error| self.fail(error))?;
             }
         }
+        Ok(self.server.take_output())
+    }
+
+    /// Pings a quiet peer, and gives up on one that has stopped answering.
+    ///
+    /// **Without this a connection can never end.** A transport that dies
+    /// without saying so — an SSH tunnel dropped, a client killed, a laptop
+    /// closed — leaves a socket that accepts writes and delivers nothing, and a
+    /// provider with nothing to say writes nothing, so nothing ever fails. The
+    /// connection is then held open forever; against a server that serves one
+    /// client at a time, that is a daemon that refuses every later client while
+    /// looking perfectly healthy. Observed exactly that way: the port still
+    /// accepted TCP, and every subsequent client timed out.
+    ///
+    /// On timeout the session is closed, so the caller's `is_closed` becomes
+    /// true and its loop ends the way it would for any other goodbye. Takes the
+    /// time rather than reading a clock, so the behaviour is testable.
+    pub fn heartbeat(&mut self, now: Instant) -> Result<Vec<u8>, HostError> {
+        if !self.server.is_established() {
+            return Ok(Vec::new());
+        }
+        let heard_from = *self.heard_from.get_or_insert(now);
+        if now.duration_since(heard_from) >= PEER_TIMEOUT {
+            self.server.close("peer stopped answering");
+            return Ok(self.server.take_output());
+        }
+        let due = self
+            .pinged
+            .is_none_or(|pinged| now.duration_since(pinged) >= PING_INTERVAL);
+        if !due {
+            return Ok(Vec::new());
+        }
+        self.pinged = Some(now);
+        self.seq = self.seq.wrapping_add(1);
+        let seq = self.seq;
+        self.server.send_ping(seq).map_err(|error| self.fail(error))?;
         Ok(self.server.take_output())
     }
 
@@ -293,6 +356,64 @@ mod tests {
             announced,
             "the window the source already had is announced without being asked for again",
         );
+    }
+
+    /// Establishes both sides and hands back the consumer.
+    fn established() -> (SourceHost<StubSource>, Session) {
+        let mut host = SourceHost::new("test", StubSource::default());
+        let mut consumer = consumer();
+        let reply = host.handle_input(&consumer.take_output()).unwrap();
+        consumer.handle_input(&reply).unwrap();
+        assert!(host.is_established());
+        (host, consumer)
+    }
+
+    #[test]
+    fn nothing_is_pinged_before_the_handshake() {
+        let mut host = SourceHost::new("test", StubSource::default());
+        let _hello = host.pump().unwrap();
+        assert!(host.heartbeat(Instant::now()).unwrap().is_empty());
+        assert!(!host.is_closed(), "and an unestablished session never times out");
+    }
+
+    /// **The wedge.** A transport that dies without saying so leaves a socket
+    /// that accepts writes and delivers nothing. A provider with nothing to say
+    /// writes nothing, so nothing ever fails, and the connection is held
+    /// forever — which, against a one-client-at-a-time server, is a daemon that
+    /// refuses every later client while looking healthy.
+    #[test]
+    fn a_peer_that_stops_answering_is_given_up_on() {
+        let (mut host, _consumer) = established();
+        let start = Instant::now();
+
+        // It is pinged first, and the ping is not mistaken for an answer.
+        let ping = host.heartbeat(start + PING_INTERVAL).unwrap();
+        assert!(!ping.is_empty(), "a quiet peer is asked whether it is there");
+        assert!(!host.is_closed());
+
+        let farewell = host.heartbeat(start + PEER_TIMEOUT).unwrap();
+        assert!(host.is_closed(), "silence for the whole timeout ends the session");
+        assert!(!farewell.is_empty(), "and the peer is told why, in case it is listening");
+    }
+
+    /// A peer that answers keeps its session, however little it has to say —
+    /// an idle desktop is the normal case, not a symptom.
+    #[test]
+    fn a_quiet_but_answering_peer_keeps_its_session() {
+        let (mut host, mut consumer) = established();
+        let start = Instant::now();
+
+        let ping = host.heartbeat(start + PING_INTERVAL).unwrap();
+        assert!(!ping.is_empty());
+        // The session layer answers a ping without the application seeing it,
+        // so this is what any conforming consumer does.
+        consumer.handle_input(&ping).unwrap();
+        let pong = consumer.take_output();
+        assert!(!pong.is_empty(), "the consumer answers by itself");
+        host.handle_input(&pong).unwrap();
+
+        let _ = host.heartbeat(start + PEER_TIMEOUT).unwrap();
+        assert!(!host.is_closed(), "it answered, so the clock started again");
     }
 
     #[test]
