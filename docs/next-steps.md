@@ -635,11 +635,16 @@ window** — vindicating the revert. The badge row announces its full label.
   the only way to tell is to run the consumer's own code against real
   provider output. It is a pure Rust crate and runs on macOS, so that costs a
   dev-dependency and nothing else.
-- A degenerate (caret-width) range returns an empty rectangle at every offset
-  while the one-character range at the same place returns a real one. Possibly
-  intended `accesskit_consumer` behaviour — a zero-length range bounds no
-  characters — but a client following the caret must expand by a character
-  first, and the naive query answers nothing.
+- **A degenerate (caret-width) range returning an empty rectangle is intended
+  consumer behaviour** — also closed, by reading the code the same pass
+  questioned. `Range::bounding_boxes` collapses `x1` onto `x0` when a range's
+  start and end indices coincide (`text.rs:783-790`), so a caret gets a real
+  position with no extent rather than no rectangle; a UIA probe reporting width
+  zero is reading it correctly. A client that wants something to draw must
+  expand the range by a character first, which is not a provider concern.
+  Pinned by a test that checks both halves: the caret before a character sits at
+  that character's left edge with zero width, and the same range expanded by one
+  character has the character's width.
 
 Still open from that report, not yet addressed:
 

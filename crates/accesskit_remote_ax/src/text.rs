@@ -671,4 +671,32 @@ mod tests {
         let position = element.text_position_at_point(accesskit::Point::new(0.0, -5.0));
         assert!(position.is_document_start());
     }
+
+    /// **Also not a defect.** A caret-width range reports a zero-width
+    /// rectangle, which a UIA probe reads as "no rectangle". That is what a
+    /// caret is: `bounding_boxes` collapses `x1` onto `x0` when a range's start
+    /// and end indices coincide, so the answer is a real position with no
+    /// extent, not a missing one. A client that wants something to draw must
+    /// expand the range by a character first; the naive query is answering
+    /// correctly.
+    #[test]
+    fn a_caret_width_range_has_a_position_but_no_width() {
+        let tree = accesskit_consumer::Tree::new(two_line_text_element(), true);
+        let state = tree.state();
+        let element = state
+            .node_by_tree_local_id(NodeId(2), accesskit::TreeId::ROOT)
+            .unwrap();
+
+        // A caret sitting before 'b', whose rectangle starts at x=18.
+        let caret = element.text_position_at_point(accesskit::Point::new(22.0, 8.0));
+        let boxes = caret.to_degenerate_range().bounding_boxes();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].x0, 18.0, "the caret is where the character begins");
+        assert_eq!(boxes[0].x1, 18.0, "and has no width, as a caret does not");
+
+        // Expanded by one character it has one, so a client is not stuck.
+        let mut one_character = caret.to_degenerate_range();
+        one_character.set_end(caret.forward_to_character_end());
+        assert_eq!(one_character.bounding_boxes()[0].x1, 26.0);
+    }
 }
