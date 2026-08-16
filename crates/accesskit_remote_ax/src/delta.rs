@@ -55,6 +55,18 @@ impl EmittedTree {
         self.announced
     }
 
+    /// Whether the consumer currently holds this node.
+    ///
+    /// A delta may only name children the consumer already has, or that the
+    /// same delta carries. Referencing anything else panics
+    /// `accesskit_consumer` with "children ids which are neither in the current
+    /// tree nor the ID of another node from the update" — observed live from
+    /// the refresh path, which was rebuilding a child list from element keys
+    /// recorded at the last walk without checking they had survived it.
+    pub fn holds(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+
     /// Compares one re-read node against what the consumer holds.
     ///
     /// Unlike [`reduce`](Self::reduce) this must **not** prune the cache: a

@@ -68,6 +68,9 @@ pub struct NodeStates {
     pub focusable: bool,
     pub focused: bool,
     pub selected: Option<bool>,
+    /// Whether `AXValue` can be written, which is what makes `SetValue`
+    /// worth advertising to a consumer.
+    pub value_settable: bool,
 }
 
 /// One element, flattened.
@@ -87,6 +90,11 @@ pub struct AxNode {
     /// is the only place that knows the window origin.
     pub frame: Option<CGRect>,
     pub states: NodeStates,
+    /// The AX action names the element reports. Declaring an action a consumer
+    /// can request is separate from being able to carry it out, and both are
+    /// needed: AccessKit's Windows adapter gates `InvokePattern` on the node
+    /// declaring `Action::Click`.
+    pub actions: Vec<String>,
     pub children: Vec<ElementKey>,
     /// The UTF-16 selection range, read only for elements that carry text.
     pub selected_range: Option<(usize, usize)>,
@@ -171,8 +179,10 @@ pub fn read(key: ElementKey, names: &Names) -> Result<AxNode, AxError> {
             focusable: attr::is_settable(key.element(), &names.focused).unwrap_or(false),
             focused: flag(I_FOCUSED).unwrap_or(false),
             selected: flag(I_SELECTED),
+            value_settable: attr::is_settable(key.element(), &names.value).unwrap_or(false),
         },
         selected_range: None,
+        actions: attr::action_names(key.element()).unwrap_or_default(),
         children: attr::elements(key.element(), &names.children)
             .unwrap_or_default()
             .into_iter()
@@ -208,6 +218,15 @@ pub fn build_container(node: &AxNode, window_origin: Option<(f64, f64)>) -> Node
             container.set_value(name);
         } else {
             container.set_label(name);
+        }
+    } else if role == Role::Label {
+        // `AXStaticText` carries its text in `AXValue`, not `AXTitle` — which
+        // is why Calculator's display and most of System Settings' sidebar
+        // arrived empty, and a large part of why 65% of elements had no name.
+        if let Some(text) = node.value.as_deref().and_then(attr::as_string) {
+            if !text.is_empty() {
+                container.set_value(text);
+            }
         }
     }
     // Only worth carrying when it says something the name did not.
@@ -267,6 +286,27 @@ pub fn build_container(node: &AxNode, window_origin: Option<(f64, f64)>) -> Node
     if node.states.focusable {
         container.add_action(accesskit::Action::Focus);
     }
+    // Declaring is separate from executing, and the executor having landed
+    // first is why no button in the mirror was pressable: `drive.rs` could
+    // carry out seven actions while `Action::Focus` was the only one any node
+    // advertised, so AccessKit's Windows adapter offered `InvokePattern`
+    // nowhere. Declare exactly what this element can actually do.
+    for action in &node.actions {
+        match action.as_str() {
+            "AXPress" | "AXPick" | "AXConfirm" => container.add_action(accesskit::Action::Click),
+            "AXShowMenu" => {
+                container.add_action(accesskit::Action::Expand);
+                container.add_action(accesskit::Action::Collapse);
+            }
+            "AXIncrement" => container.add_action(accesskit::Action::Increment),
+            "AXDecrement" => container.add_action(accesskit::Action::Decrement),
+            _ => {}
+        }
+    }
+    // A writable value is a settable one, whatever route reaches it.
+    if node.states.value_settable {
+        container.add_action(accesskit::Action::SetValue);
+    }
 
     if let Some(frame) = node.frame {
         // AX reports screen coordinates with a top-left origin; AccessKit wants
@@ -313,6 +353,7 @@ mod tests {
             states: NodeStates::default(),
             children: Vec::new(),
             selected_range: None,
+            actions: Vec::new(),
         }
     }
 
@@ -396,6 +437,58 @@ mod tests {
         assert_eq!(built.role(), Role::Label);
         assert_eq!(built.value(), Some("Total"));
         assert_eq!(built.label(), None);
+    }
+
+    /// **Regression.** `AXStaticText` keeps its text in `AXValue`, not
+    /// `AXTitle`. Reading only the title left Calculator's display and most of
+    /// System Settings' sidebar empty, and was a large part of why 65% of
+    /// mirrored elements had no name at all.
+    #[test]
+    fn a_static_text_takes_its_content_from_the_value() {
+        let mut n = node("AXStaticText");
+        assert_eq!(build_container(&n, None).value(), None);
+        n.value = Some(CFString::from_static_str("1,234").into());
+        assert_eq!(build_container(&n, None).value(), Some("1,234"));
+
+        // A title still wins where one exists.
+        n.title = "Total".into();
+        assert_eq!(build_container(&n, None).value(), Some("Total"));
+    }
+
+    /// **Regression.** Executing an action and *declaring* it are separate, and
+    /// only the executor had landed: every node advertised `Focus` and nothing
+    /// else, so AccessKit's Windows adapter offered `InvokePattern` on none of
+    /// the 89 buttons in a live mirror.
+    #[test]
+    fn an_element_declares_the_actions_it_can_actually_perform() {
+        let mut n = node("AXButton");
+        assert!(!build_container(&n, None).supports_action(accesskit::Action::Click));
+
+        n.actions = vec!["AXPress".into()];
+        assert!(build_container(&n, None).supports_action(accesskit::Action::Click));
+
+        // A menu button opens rather than activates.
+        n.actions = vec!["AXShowMenu".into()];
+        let built = build_container(&n, None);
+        assert!(built.supports_action(accesskit::Action::Expand));
+        assert!(built.supports_action(accesskit::Action::Collapse));
+
+        n.actions = vec!["AXIncrement".into(), "AXDecrement".into()];
+        let built = build_container(&n, None);
+        assert!(built.supports_action(accesskit::Action::Increment));
+        assert!(built.supports_action(accesskit::Action::Decrement));
+
+        // Nothing is claimed that the element did not report.
+        n.actions = vec!["AXSomethingElse".into()];
+        assert!(!build_container(&n, None).supports_action(accesskit::Action::Click));
+    }
+
+    #[test]
+    fn a_writable_value_advertises_set_value() {
+        let mut n = node("AXTextArea");
+        assert!(!build_container(&n, None).supports_action(accesskit::Action::SetValue));
+        n.states.value_settable = true;
+        assert!(build_container(&n, None).supports_action(accesskit::Action::SetValue));
     }
 
     #[test]

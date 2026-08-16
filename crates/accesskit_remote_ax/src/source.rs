@@ -375,8 +375,15 @@ fn emit_refresh(
     };
     let mut built = node::build_container(&read, window.origin);
     if let Some(children) = window.children.get(key) {
-        let ids: Vec<accesskit::NodeId> =
-            children.iter().filter_map(|child| window.ids.get(child)).collect();
+        let ids: Vec<accesskit::NodeId> = children
+            .iter()
+            .filter_map(|child| window.ids.get(child))
+            // Only children the consumer actually holds. A node id can outlive
+            // the node: `ids` is append-only by design, so an element removed
+            // by a later walk still resolves here, and naming it in a delta
+            // panics the consumer.
+            .filter(|id| window.emitted.holds(*id))
+            .collect();
         if !ids.is_empty() {
             built.set_children(ids);
         }

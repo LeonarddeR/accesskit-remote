@@ -437,6 +437,57 @@ below is from that run; nothing here is inherited from the AT-SPI findings.
   apply), and soft-wrapped visual lines via `kAXRangeForLineParameterizedAttribute`
   rather than splitting on hard newlines.
 
+### macOS / AX — findings from the first UIA end-to-end (2026-08-16)
+
+A Windows UIA client read the Mac over an SSH tunnel via the standalone
+`viewer`, with NVDA running. The mirror proved real and readable — correct
+roles, correct text, a correctly placed caret — and four provider defects came
+out of it that no amount of local testing had surfaced.
+
+- **A cell claimed by two parents panics the consumer.** macOS exposes a table
+  cell under both `AXRows` and `AXColumns`, so a walk that trusts `AXChildren`
+  emits it twice. `accesskit_consumer` requires a strict tree and aborts:
+  *"TreeUpdate includes duplicate child #1796"* — killing the viewer and every
+  other mirrored window with it. Measured on a Wikipedia table: 12 such cells,
+  one parent even listing the same child twice. Fixed by a single-parent rule,
+  first parent in walk order; `emitted_children` applies the same rule, or a
+  refresh would hand back the children the walk removed.
+- **The truncated walk is worse than "the tail is missing".** The 5000-node cap
+  cuts a tree mid-structure, which is how a parent comes to name a child that
+  was never sent. What was recorded as truncation is really a route to an
+  invalid update.
+- **A delta can name a node the consumer has dropped.** *"children ids which
+  are neither in the current tree nor the ID of another node from the update"*.
+  The refresh path rebuilt child lists from element keys recorded at the last
+  walk; ids are append-only, so a removed element still resolved. Deltas now
+  name only children the consumer is known to hold.
+- **Executing an action and declaring it are separate, and only the executor
+  had landed.** `drive.rs` could carry out seven actions while `Action::Focus`
+  was the only one any node advertised — so AccessKit's Windows adapter offered
+  `InvokePattern` on **none of the 89 buttons** in the live mirror. A UIA client
+  could not press anything. Nodes now declare what the element reports.
+- **`AXStaticText` keeps its text in `AXValue`, not `AXTitle`.** Reading only
+  the title left Calculator's display empty and was a large part of why **65% of
+  mirrored elements had no name**.
+
+Still open from that report, not yet addressed:
+
+- Toggling works but the state never comes back: `TogglePattern.Toggle()` did
+  flip Bold in TextEdit, yet UIA still read `Off` afterwards. The checkbox
+  arrives with `value=None`, so its toggle state is never populated — needs a
+  measurement of where AppKit actually puts it.
+- 32 of 272 elements report an empty rect, and some bounds fall outside their
+  own window (Calculator's display starts 99px left of the window's left edge).
+- Names on `TreeItem`/`DataItem` sit on a nested `Text` descendant with no
+  `LabelledBy` bridging it, so a reader lands on them and announces nothing.
+- Window-level focus crosses the wire correctly and within a second, then the
+  `viewer` example prints it to stderr and never hands it to the adapter
+  (`viewer.rs:141`). A consumer-side gap, not a provider one.
+- The daemon serves one client at a time; a second connects and receives
+  silence rather than a refusal.
+- `viewer` exits 0 printing nothing when nothing is listening, which is
+  indistinguishable from a clean shutdown.
+
 ### macOS / AX at scale
 
 Measured 2026-08-16 against a long Wikipedia article ("World War II") in Safari,

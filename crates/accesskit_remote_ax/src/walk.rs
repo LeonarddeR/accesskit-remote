@@ -81,6 +81,19 @@ pub fn build_window_update(nodes: &[AxNode], ids: &mut NodeIdMap) -> Option<acce
     // an id for a node that is not in the update would dangle on the consumer.
     let walked: HashSet<&ElementKey> = nodes.iter().map(|node| &node.key).collect();
 
+    // AccessKit requires a strict tree: every node has at most one parent and
+    // appears in exactly one child list, once. AX does not guarantee that.
+    // macOS exposes a table cell under both `AXRows` and `AXColumns`, so a
+    // walk that trusts `AXChildren` emits the same cell under several parents —
+    // and `accesskit_consumer` does not tolerate it, it panics the consumer
+    // outright with "TreeUpdate includes duplicate child". Measured on a
+    // Wikipedia table: 12 cells with a Row parent and one or more
+    // GenericContainer parents, one of which listed the same child twice.
+    //
+    // First parent in walk order keeps the child. That is the row, since rows
+    // are reached before columns, which is also the hierarchy a reader wants.
+    let mut claimed: HashSet<ElementKey> = HashSet::new();
+
     let mut focus = root_id;
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -90,6 +103,9 @@ pub fn build_window_update(nodes: &[AxNode], ids: &mut NodeIdMap) -> Option<acce
             .children
             .iter()
             .filter(|child| walked.contains(child))
+            // `insert` returns false for a child another parent already took,
+            // and also for one this same parent listed twice.
+            .filter(|child| claimed.insert((*child).clone()))
             .filter_map(|child| ids.get(child))
             .collect();
         // A text element's content becomes TextRun children, which is the only
@@ -132,13 +148,18 @@ pub fn build_window_update(nodes: &[AxNode], ids: &mut NodeIdMap) -> Option<acce
 /// node's semantics can never change the tree's structure.
 pub fn emitted_children(nodes: &[AxNode]) -> HashMap<ElementKey, Vec<ElementKey>> {
     let walked: HashSet<&ElementKey> = nodes.iter().map(|node| &node.key).collect();
+    // Must apply the same single-parent rule as `build_window_update`, in the
+    // same order. If it did not, a refresh would hand a node back the children
+    // the walk had deliberately taken from it, reintroducing the duplicate.
+    let mut claimed: HashSet<ElementKey> = HashSet::new();
     nodes
         .iter()
         .map(|node| {
-            let children = node
+            let children: Vec<ElementKey> = node
                 .children
                 .iter()
                 .filter(|child| walked.contains(child))
+                .filter(|child| claimed.insert((*child).clone()))
                 .cloned()
                 .collect();
             (node.key.clone(), children)
@@ -172,6 +193,7 @@ mod tests {
             states: NodeStates::default(),
             children,
             selected_range: None,
+            actions: Vec::new(),
         }
     }
 
@@ -269,6 +291,70 @@ mod tests {
         );
         // And the role map would place it wrongly if it ever did get through.
         assert_eq!(nodes[1].accesskit_role(), accesskit::Role::Application);
+    }
+
+    /// **Regression: this panicked the consumer.** macOS exposes a table cell
+    /// under both `AXRows` and `AXColumns`, so two parents claim it. AccessKit
+    /// requires a strict tree and aborts with "TreeUpdate includes duplicate
+    /// child" — taking down every other mirrored window with it.
+    #[test]
+    fn a_child_claimed_by_two_parents_is_emitted_under_only_one() {
+        let cell = key(9);
+        let nodes = [
+            window(1, vec![key(2), key(3)]),
+            // A row and a column, both listing the same cell.
+            node(2, "AXRow", vec![cell.clone()]),
+            node(3, "AXColumn", vec![cell.clone()]),
+            node(9, "AXCell", vec![]),
+        ];
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&nodes, &mut ids).unwrap();
+        let cell_id = ids.get(&cell).unwrap();
+        let claims = update
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.children().contains(&cell_id))
+            .count();
+        assert_eq!(claims, 1, "exactly one parent may list the cell");
+
+        // The first parent in walk order keeps it — the row, which is also the
+        // hierarchy a reader wants.
+        let row_id = ids.get(&key(2)).unwrap();
+        let (_, row) = update.nodes.iter().find(|(id, _)| *id == row_id).unwrap();
+        assert_eq!(row.children(), &[cell_id]);
+    }
+
+    /// The same list naming a child twice is the other half of the live
+    /// failure: one parent had `children=[1796, 1796]`.
+    #[test]
+    fn a_parent_listing_one_child_twice_emits_it_once() {
+        let child = key(2);
+        let nodes = [
+            window(1, vec![child.clone(), child.clone()]),
+            node(2, "AXButton", vec![]),
+        ];
+        let mut ids = NodeIdMap::new();
+        let update = build_window_update(&nodes, &mut ids).unwrap();
+        let root_id = ids.get(&key(1)).unwrap();
+        let (_, root) = update.nodes.iter().find(|(id, _)| *id == root_id).unwrap();
+        assert_eq!(root.children().len(), 1);
+    }
+
+    /// The refresh path reads structure from `emitted_children`, so it must
+    /// apply the same rule — otherwise a refresh hands a node back the children
+    /// the walk had deliberately taken away, reintroducing the duplicate.
+    #[test]
+    fn emitted_children_applies_the_same_single_parent_rule() {
+        let cell = key(9);
+        let nodes = [
+            window(1, vec![key(2), key(3)]),
+            node(2, "AXRow", vec![cell.clone()]),
+            node(3, "AXColumn", vec![cell.clone()]),
+            node(9, "AXCell", vec![]),
+        ];
+        let children = emitted_children(&nodes);
+        let claims = children.values().filter(|kids| kids.contains(&cell)).count();
+        assert_eq!(claims, 1, "the refresh path must agree with the walk");
     }
 
     #[test]
