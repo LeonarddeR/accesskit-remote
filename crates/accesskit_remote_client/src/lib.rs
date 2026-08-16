@@ -7,6 +7,10 @@
 //! `TreeUpdate` for adapters that attach late (e.g. after window
 //! association completes on the platform side).
 
+mod desktop;
+
+pub use desktop::DesktopTree;
+
 use accesskit_remote::{
     AppInfo, Message, PeerRole, Session, SessionConfig, SessionError, SessionEvent, WindowId,
 };

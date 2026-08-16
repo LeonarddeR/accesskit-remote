@@ -62,6 +62,28 @@ The viewer creates one ordinary top-level window per Mac window, each carrying
 the remote tree as its UIA provider. It prints nothing useful; the windows are
 the output.
 
+### Or: one window for the whole desktop
+
+```
+cargo run -p accesskit_remote_windows --example viewer -- --desktop --tcp 4750
+```
+
+**This is the shape macrdp needs**, and worth testing on its own. A window per
+remote window is what RAIL gives you — the RDP client really does create a local
+HWND for each remote window. A full-desktop session does not: there is one
+session window showing a picture of everything, so every Mac window has to reach
+the reader through a single host.
+
+`--desktop` does that here, with no RDP involved: one window whose UIA tree is
+the whole Mac, each Mac window grafted into it as an AccessKit subtree. Node ids
+are namespaced per subtree, so the trees cross the wire and are grafted
+unchanged — nothing is renumbered.
+
+What to check, beyond "it reads": that every Mac window is reachable under the
+one desktop node, that opening and closing windows on the Mac adds and removes
+them live, and that activating a control still drives the real Mac application
+(actions are routed by the subtree the request names).
+
 ## 3. Read it
 
 **With a screen reader.** Alt-Tab to a viewer window and navigate it. This is

@@ -1,11 +1,23 @@
-//! Standalone viewer: connects to a provider and gives every remote window
-//! a native window whose UIA tree is the remote AccessKit tree. Lets a
-//! Windows screen reader read a provider (e.g. the accesskit_remoted demo,
-//! or later real Linux apps) without the RDP client.
+//! Standalone viewer: connects to a provider and shows its trees to a Windows
+//! screen reader without involving the RDP client at all.
+//!
+//! Two shapes, matching the two arrangements this project has to serve:
+//!
+//! - **Window mode** (default): one native window per remote window, each
+//!   carrying that window's tree. This mirrors RAIL, where the RDP client
+//!   really does give every remote window a local HWND.
+//! - **Desktop mode** (`--desktop`): *one* window carrying the whole remote
+//!   desktop, every remote window grafted into it as a subtree. This mirrors a
+//!   full-desktop RDP session — macrdp — where there is one session window and
+//!   nothing per-window to attach to.
+//!
+//! Desktop mode exists to be testable here: the composition it exercises is the
+//! same one the DVC plug-in uses, minus RDP, so it can be read with a real
+//! screen reader over nothing but an SSH tunnel.
 //!
 //! Usage:
-//!   viewer --tcp [PORT]
-//!   viewer --hvsocket <vm-id> [PORT]
+//!   viewer [--desktop] --tcp [PORT]
+//!   viewer [--desktop] --hvsocket <vm-id> [PORT]
 
 #[cfg(windows)]
 fn main() -> std::io::Result<()> {
@@ -21,7 +33,9 @@ fn main() {
 mod viewer {
     use accesskit_remote::WindowId;
     use accesskit_remote_client::{ClientConnection, ClientEvent};
-    use accesskit_remote_windows::{OutgoingAction, RemoteWindowBinding, SharedClient};
+    use accesskit_remote_windows::{
+        DesktopBinding, OutgoingAction, RemoteWindowBinding, SharedClient,
+    };
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::sync::mpsc;
@@ -42,9 +56,14 @@ mod viewer {
     const MSG_TREE_UPDATED: u32 = WM_APP + 2;
     const MSG_WINDOW_REMOVED: u32 = WM_APP + 3;
     const MSG_CONNECTION_CLOSED: u32 = WM_APP + 4;
+    /// Desktop mode's heartbeat: the composed tree is rebuilt on activation,
+    /// which can happen at any moment with no client event to notice it.
+    const MSG_SYNC: u32 = WM_APP + 5;
 
     pub fn run() -> std::io::Result<()> {
-        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut args: Vec<String> = std::env::args().skip(1).collect();
+        let desktop = args.iter().any(|a| a == "--desktop");
+        args.retain(|a| a != "--desktop");
         let (stream, hvsocket) = connect(&args)?;
         stream.set_read_timeout(Some(Duration::from_millis(50)))?;
 
@@ -55,7 +74,11 @@ mod viewer {
         let pump_client = client.clone();
         std::thread::spawn(move || pump(stream, pump_client, action_rx, ui_thread, hvsocket));
 
-        run_message_loop(client, action_tx);
+        if desktop {
+            run_desktop_loop(client, action_tx);
+        } else {
+            run_message_loop(client, action_tx);
+        }
         Ok(())
     }
 
@@ -114,6 +137,9 @@ mod viewer {
                     break;
                 }
             }
+            // Cheap and idempotent; desktop mode needs it because a screen
+            // reader can activate the adapter with no client event in sight.
+            post(MSG_SYNC, 0, 0);
             let events = match stream.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => match client.lock().unwrap().handle_input(&buf[..n]) {
@@ -150,6 +176,81 @@ mod viewer {
             }
         }
         post(MSG_CONNECTION_CLOSED, 0, 0);
+    }
+
+    /// One window for the whole desktop, as a full-desktop RDP session has.
+    ///
+    /// The window is created and shown before the binding attaches, matching
+    /// the plug-in's situation: there, the session window already exists and
+    /// belongs to the RDP client. Everything after that — composition,
+    /// activation, action routing — is the code path the plug-in runs.
+    fn run_desktop_loop(client: SharedClient, action_tx: mpsc::Sender<OutgoingAction>) {
+        let class_name: Vec<u16> = "AccessKitRemoteDesktopWindow\0".encode_utf16().collect();
+        let hinstance = unsafe { GetModuleHandleW(None) }.expect("module handle");
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wndproc),
+            hInstance: hinstance.into(),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            hbrBackground: HBRUSH((COLOR_WINDOW.0 as isize + 1) as *mut core::ffi::c_void),
+            ..Default::default()
+        };
+        assert_ne!(unsafe { RegisterClassW(&class) }, 0, "class registration failed");
+
+        let title_w: Vec<u16> = "Remote desktop\0".encode_utf16().collect();
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(title_w.as_ptr()),
+                WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                800,
+                600,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+        }
+        .expect("window creation failed");
+
+        let mut binding =
+            DesktopBinding::attach(hwnd, "Remote desktop", client, action_tx);
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) };
+        eprintln!("viewer: desktop mode; one window carries every remote window");
+
+        let mut msg = MSG::default();
+        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.as_bool() {
+            if msg.hwnd.is_invalid() {
+                match msg.message {
+                    // Window arrivals and departures change the composition, so
+                    // both are just a sync.
+                    MSG_WINDOW_ADDED | MSG_WINDOW_REMOVED | MSG_SYNC => binding.sync(),
+                    MSG_TREE_UPDATED => {
+                        let id = msg.wParam.0 as u64;
+                        let update = *unsafe {
+                            Box::from_raw(msg.lParam.0 as *mut accesskit::TreeUpdate)
+                        };
+                        // A window's first tree makes it graftable, so take the
+                        // delta first and let the sync that follows pick up any
+                        // window this was the first update for.
+                        binding.delta(WindowId(id), update);
+                        binding.sync();
+                    }
+                    MSG_CONNECTION_CLOSED => break,
+                    _ => {}
+                }
+                continue;
+            }
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        // Remove the subclass before the window it is attached to goes away.
+        drop(binding);
+        let _ = unsafe { DestroyWindow(hwnd) };
     }
 
     extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

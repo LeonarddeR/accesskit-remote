@@ -7,6 +7,21 @@
 //! threads via a registered window message, and frees the state when the
 //! window is destroyed. Serves RDP RAIL windows, which are visible before the
 //! plugin ever sees them.
+//!
+//! It serves both arrangements. **One window per remote window** is RAIL:
+//! [`install_visible_adapter`] binds a `RAIL_WINDOW` to one remote window, and
+//! [`post_delta`] carries that window's tree. **One window for the whole
+//! desktop** is a full-desktop session, where there is no per-window HWND to
+//! bind: [`install_visible_desktop_adapter`] hosts every remote window as a
+//! grafted subtree, [`post_desktop_delta`] names which window a delta belongs
+//! to, and [`post_sync`] is the heartbeat that composition needs — an adapter
+//! activates on demand, so the tree has to be rebuilt at a moment no client
+//! event announces.
+//!
+//! The two differ only in what they park in the window property; the subclass,
+//! the message plumbing and the teardown are one implementation deliberately,
+//! because they are the parts that are hard to get right and impossible to test
+//! off Windows.
 
 use accesskit_remote::WindowId;
 use std::cell::{Cell, RefCell};
@@ -23,6 +38,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::w;
 
+use crate::desktop::{desktop_parts, DesktopShared};
 use crate::{ForwardActions, OutgoingAction, SharedClient, SnapshotActivation};
 
 type LongPtr = isize;
@@ -71,12 +87,46 @@ pub fn post_focus(hwnd: HWND, is_focused: bool) -> bool {
     .is_ok()
 }
 
+/// The registered window message asking a desktop-hosted window to bring its
+/// composed tree in line with the client.
+pub fn sync_message() -> u32 {
+    static MSG: OnceLock<u32> = OnceLock::new();
+    *MSG.get_or_init(|| unsafe { RegisterWindowMessageW(w!("AccessKitRemoteSync")) })
+}
+
+/// Ask a window bound with [`install_visible_desktop_adapter`] to re-compose.
+///
+/// Callable from any thread. Post it on every client event **and** on a timer:
+/// the adapter activates when an assistive technology asks, which no client
+/// event announces, and the composition has to be rebuilt at that moment.
+pub fn post_sync(hwnd: HWND) -> bool {
+    unsafe { PostMessageW(Some(hwnd), sync_message(), WPARAM(0), LPARAM(0)) }.is_ok()
+}
+
+/// Post a tree delta for one remote window to a window bound with
+/// [`install_visible_desktop_adapter`], which hosts many.
+///
+/// Follow it with [`post_sync`]: a window's first tree is what makes it
+/// graftable, and until it is grafted its deltas are withheld.
+pub fn post_desktop_delta(
+    hwnd: HWND,
+    window: WindowId,
+    update: accesskit::TreeUpdate,
+) -> bool {
+    post_delta_for(hwnd, window.0 as usize, update)
+}
+
 /// Post a tree delta to a window bound with [`install_visible_adapter`].
 /// Callable from any thread; the delta is applied on the window's own thread.
 pub fn post_delta(hwnd: HWND, update: accesskit::TreeUpdate) -> bool {
+    post_delta_for(hwnd, 0, update)
+}
+
+fn post_delta_for(hwnd: HWND, wparam: usize, update: accesskit::TreeUpdate) -> bool {
     let raw = Box::into_raw(Box::new(update));
-    let posted =
-        unsafe { PostMessageW(Some(hwnd), delta_message(), WPARAM(0), LPARAM(raw as isize)) };
+    let posted = unsafe {
+        PostMessageW(Some(hwnd), delta_message(), WPARAM(wparam), LPARAM(raw as isize))
+    };
     if posted.is_err() {
         drop(unsafe { Box::from_raw(raw) });
         return false;
@@ -86,13 +136,26 @@ pub fn post_delta(hwnd: HWND, update: accesskit::TreeUpdate) -> bool {
 
 struct VisibleState {
     adapter: accesskit_windows::Adapter,
-    activation: SnapshotActivation,
+    activation: BoxedActivation,
+}
+
+/// The activation handler is boxed so one wndproc serves both a single remote
+/// window and a whole composed desktop.
+struct BoxedActivation(Box<dyn accesskit::ActivationHandler>);
+
+impl accesskit::ActivationHandler for BoxedActivation {
+    fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
+        self.0.request_initial_tree()
+    }
 }
 
 struct VisibleImpl {
     state: RefCell<VisibleState>,
     prev_wnd_proc: WNDPROC,
     window_destroyed: Cell<bool>,
+    /// Present only for a desktop-hosted window; `None` means this window
+    /// carries exactly one remote window and needs no composition.
+    desktop: Option<DesktopShared>,
 }
 
 extern "system" fn wnd_proc(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -103,12 +166,26 @@ extern "system" fn wnd_proc(window: HWND, message: u32, wparam: WPARAM, lparam: 
     }
     let r#impl = unsafe { &*impl_ptr };
     if message == delta_message() {
-        let update = unsafe { Box::from_raw(lparam.0 as *mut accesskit::TreeUpdate) };
-        let mut state = r#impl.state.borrow_mut();
-        let events = state.adapter.update_if_active(|| *update);
-        drop(state);
-        if let Some(events) = events {
-            events.raise();
+        let update = *unsafe { Box::from_raw(lparam.0 as *mut accesskit::TreeUpdate) };
+        // In desktop mode the delta belongs to one of many remote windows, named
+        // by wParam, and must be retagged into that window's subtree — or
+        // withheld, if that window has not been grafted yet.
+        let update = match &r#impl.desktop {
+            Some(shared) => shared.retag(WindowId(wparam.0 as u64), update),
+            None => Some(update),
+        };
+        if let Some(update) = update {
+            r#impl.apply(update);
+        }
+        return LRESULT(0);
+    }
+    if message == sync_message() {
+        if let Some(shared) = &r#impl.desktop {
+            // Taken before touching the adapter: sync_updates locks the client,
+            // and the adapter's activation handler locks it too.
+            for update in shared.sync_updates() {
+                r#impl.apply(update);
+            }
         }
         return LRESULT(0);
     }
@@ -156,6 +233,17 @@ extern "system" fn wnd_proc(window: HWND, message: u32, wparam: WPARAM, lparam: 
 }
 
 impl VisibleImpl {
+    /// Applies one update, holding the state borrow only across the update
+    /// itself — raising events re-enters the wndproc.
+    fn apply(&self, update: accesskit::TreeUpdate) {
+        let mut state = self.state.borrow_mut();
+        let events = state.adapter.update_if_active(|| update);
+        drop(state);
+        if let Some(events) = events {
+            events.raise();
+        }
+    }
+
     fn update_window_focus_state(&self, is_focused: bool) {
         let mut state = self.state.borrow_mut();
         if let Some(events) = state.adapter.update_window_focus_state(is_focused) {
@@ -186,13 +274,62 @@ pub fn install_visible_adapter(
     }
     let action = ForwardActions { window, actions };
     let adapter = accesskit_windows::Adapter::new(hwnd, is_focused, action);
-    let activation = SnapshotActivation { window, client };
+    let activation = BoxedActivation(Box::new(SnapshotActivation { window, client }));
     let r#impl = Box::new(VisibleImpl {
         state: RefCell::new(VisibleState { adapter, activation }),
         prev_wnd_proc: None,
         window_destroyed: Cell::new(false),
+        desktop: None,
     });
     let impl_ptr = Box::into_raw(r#impl);
+    subclass(hwnd, impl_ptr)?;
+    debug!("visible adapter installed on {hwnd:?} for remote window {}", window.0);
+    Ok(())
+}
+
+/// Host a UIA provider for the **whole remote desktop** on `hwnd`, which may
+/// already be visible — the RDP client's session window, which shows a picture
+/// of every remote window and has no per-window HWND to bind.
+///
+/// Every remote window becomes a grafted subtree of one composed tree. Deltas
+/// arrive via [`post_desktop_delta`] and the composition is rebuilt by
+/// [`post_sync`], which must also run on a timer because a UIA client can
+/// activate the adapter at a moment nothing else announces.
+///
+/// Must be called on the thread that owns `hwnd`. `label` is what a reader
+/// announces for the desktop as a whole — name the machine, not a window.
+pub fn install_visible_desktop_adapter(
+    hwnd: HWND,
+    label: impl Into<String>,
+    client: SharedClient,
+    actions: Sender<OutgoingAction>,
+) -> windows::core::Result<()> {
+    if !unsafe { GetPropW(hwnd, PROP_NAME) }.0.is_null() {
+        return Err(windows::core::Error::from_hresult(
+            windows::Win32::Foundation::E_UNEXPECTED,
+        ));
+    }
+    let parts = desktop_parts(label, client, actions);
+    // The session window really does hold the host focus while the user is in
+    // the session, and unlike a RAIL window it receives its own WM_SETFOCUS,
+    // so the initial guess is corrected by the wndproc either way.
+    let adapter = accesskit_windows::Adapter::new(hwnd, true, parts.action);
+    let activation = BoxedActivation(Box::new(parts.activation));
+    let r#impl = Box::new(VisibleImpl {
+        state: RefCell::new(VisibleState { adapter, activation }),
+        prev_wnd_proc: None,
+        window_destroyed: Cell::new(false),
+        desktop: Some(parts.shared),
+    });
+    let impl_ptr = Box::into_raw(r#impl);
+    subclass(hwnd, impl_ptr)?;
+    debug!("visible desktop adapter installed on {hwnd:?}");
+    Ok(())
+}
+
+/// Parks the state on the window and swaps in our wndproc, undoing both if the
+/// swap fails.
+fn subclass(hwnd: HWND, impl_ptr: *mut VisibleImpl) -> windows::core::Result<()> {
     unsafe { SetPropW(hwnd, PROP_NAME, Some(HANDLE(impl_ptr as *mut c_void))) }?;
     let result = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wnd_proc as *const c_void as _) };
     if result == 0 {
@@ -204,7 +341,6 @@ pub fn install_visible_adapter(
         return Err(err);
     }
     unsafe { (*impl_ptr).prev_wnd_proc = transmute::<LongPtr, WNDPROC>(result) };
-    debug!("visible adapter installed on {hwnd:?} for remote window {}", window.0);
     Ok(())
 }
 

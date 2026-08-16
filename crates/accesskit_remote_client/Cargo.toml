@@ -12,6 +12,9 @@ accesskit.workspace = true
 accesskit_remote.workspace = true
 
 [dev-dependencies]
+# The real consumer, so the desktop composition is checked against the code that
+# enforces its rules — with panics, inside the screen reader's process.
+accesskit_consumer = "0.38"
 accesskit_remote_server.workspace = true
 accesskit_remote_transport.workspace = true
 serde_json.workspace = true

@@ -7,8 +7,17 @@
 //! actions are forwarded through an mpsc channel to whatever thread pumps
 //! the connection. The same binding serves a standalone viewer window and
 //! a RAIL window inside the RDP client.
+//!
+//! **That shape assumes one local window per remote window, which only RAIL
+//! provides.** A full-desktop RDP session — macrdp — has a single session
+//! window showing a picture of everything, and nothing per-window to bind to.
+//! [`DesktopBinding`] and [`install_visible_desktop_adapter`] serve that case
+//! instead, hosting every remote window as a grafted subtree of one composed
+//! tree; the composition itself is platform-independent and lives in
+//! `accesskit_remote_client::DesktopTree`.
 #![cfg(target_os = "windows")]
 
+mod desktop;
 mod visible;
 
 use accesskit_remote::WindowId;
@@ -17,9 +26,11 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
 pub use accesskit_windows::HWND;
+pub use desktop::DesktopBinding;
 pub use visible::{
-    delta_message, detach_message, focus_message, install_visible_adapter, post_delta, post_detach,
-    post_focus, uninstall_visible_adapter,
+    delta_message, detach_message, focus_message, install_visible_adapter,
+    install_visible_desktop_adapter, post_delta, post_desktop_delta, post_detach, post_focus,
+    post_sync, sync_message, uninstall_visible_adapter,
 };
 
 pub type SharedClient = Arc<Mutex<ClientConnection>>;
