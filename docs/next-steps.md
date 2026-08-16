@@ -665,6 +665,52 @@ Still open from that report, not yet addressed:
 - `viewer` exits 0 printing nothing when nothing is listening, which is
   indistinguishable from a clean shutdown.
 
+### macOS / AX — the first screen-reader pass, both modes (2026-08-16)
+
+Measured from Windows 11 with NVDA running throughout, against the macOS
+provider over the SSH tunnel. **The first time a screen reader has read this
+project's output on any platform**, and the first test of the desktop
+composition.
+
+- **The Windows crates compiled clean.** ~1000 lines of Windows-only code had
+  been written on a machine with no Windows target (Homebrew Rust, no
+  cross-target std), so compile errors were expected; there were none, and 75
+  tests passed across the four buildable crates.
+- **NVDA reads the composed desktop.** Verbatim, focusing the single host
+  window: `'Remote desktop', 'window'` → `'World War II - Wikipedia', 'window'`
+  → `'tab control'` → `'document'` → `'Contents', 'grouping'` → `'Course of the
+  war', 'link'`. Braille shows the same ancestry independently. All five Mac
+  windows appear as children of the desktop root, 3644 elements reachable
+  through one HWND, every one reporting `FrameworkId` `AccessKit`.
+- **A state change caused from Windows is announced on Windows.** Toggling a
+  checkbox through UIA drives the real AppKit control, the provider re-walks,
+  the delta arrives, and NVDA says `'not checked'`. That is the whole round
+  trip, spoken.
+- **Latency is much worse with a reader attached**: 5.49s for that toggle,
+  against 0.89–1.34s measured without one. That interval is time the reader
+  spends saying the wrong thing, and it was not visible in any instrument-only
+  measurement.
+- **Desktop mode aborted intermittently** — `Focused ID #142 is not in the node
+  list`, raised from `update_host_focus_state`, i.e. inside the adapter's
+  window procedure. That is `extern "system"` and cannot unwind, so it aborts
+  the process rather than panicking catchably: **in desktop mode any
+  consumer-side invariant violation is fatal, not diagnosable.** Fixed in
+  `3c082f1`; the cause was in the client store and had always been there.
+  `snapshot()` prunes nodes orphaned by a child-list change but repeated the
+  recorded focus unchecked. Window mode snapshots one window once and never hit
+  it; desktop mode snapshots every window on every adapter activation.
+- **Invoking a control is silent.** Invoking Calculator's `5` moved the real
+  display from `7` to `75`, and NVDA said nothing — the display is a `Text` node
+  that is neither focused nor a live region, so nothing prompts an
+  announcement. A user pressing calculator keys hears silence and must review
+  the display explicitly. Unfixed, and the first finding that is about what a
+  reader *does* rather than what the tree contains.
+- Focus in the Calculator window lands on an unnamed container, announced as a
+  bare `'grouping'`.
+
+Still open from this pass: the silent display (a live-region mapping question,
+not a defect in anything built), and re-verifying the abort fix.
+
 ### macOS / AX at scale
 
 Measured 2026-08-16 against a long Wikipedia article ("World War II") in Safari,
