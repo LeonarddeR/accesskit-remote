@@ -470,6 +470,14 @@ out of it that no amount of local testing had surfaced.
   the title left Calculator's display empty and was a large part of why **65% of
   mirrored elements had no name**.
 
+Re-verified live after the fixes (2026-08-16): the same 5002-node Wikipedia
+page now walks clean, and `dump_tree --validate` reports every window on the
+desktop satisfying the consumer's structural invariants. Calculator's buttons
+declare `<Click,Focus>` and its display carries text where both were previously
+absent. `dump_tree --validate` is now the standing check — it asserts exactly
+what `accesskit_consumer` asserts, which is the difference between a
+diagnosable provider bug and a crashed screen reader.
+
 Still open from that report, not yet addressed:
 
 - Toggling works but the state never comes back: `TogglePattern.Toggle()` did

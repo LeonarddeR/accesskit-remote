@@ -9,7 +9,12 @@
 //! `TextRun`, so it is what a screen reader actually encounters, and it is the
 //! number to watch whenever the role map is broadened.
 //!
-//! Usage: dump_tree [--app <substr>] [--tree]
+//! `--validate` checks the invariants `accesskit_consumer` enforces before it
+//! will accept an update. It panics rather than complains when they are
+//! violated, taking the whole consumer process with it, so checking here is the
+//! difference between a diagnosable provider bug and a crashed screen reader.
+//!
+//! Usage: dump_tree [--app <substr>] [--tree] [--validate]
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -32,11 +37,13 @@ fn main() {
 
     let mut filter = None;
     let mut show_tree = false;
+    let mut validate = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--app" => filter = args.next().map(|f| f.to_lowercase()),
             "--tree" => show_tree = true,
+            "--validate" => validate = true,
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -54,6 +61,7 @@ fn main() {
     }
 
     let (mut total_nodes, mut total_visible, mut windows_seen) = (0usize, 0usize, 0usize);
+    let mut invalid = 0usize;
     for app in &apps {
         for window in ax::windows_of(app, &names).unwrap_or_default() {
             let walk_started = Instant::now();
@@ -109,6 +117,17 @@ fn main() {
             if show_tree {
                 print_tree(&update);
             }
+            if validate {
+                let problems = validate_update(&update);
+                if problems.is_empty() {
+                    println!("  validate: OK");
+                } else {
+                    for problem in &problems {
+                        println!("  INVALID: {problem}");
+                    }
+                    invalid += problems.len();
+                }
+            }
         }
     }
 
@@ -118,6 +137,68 @@ fn main() {
         apps.len(),
         started.elapsed(),
     );
+    if validate {
+        if invalid == 0 {
+            println!("every tree satisfies the consumer's structural invariants");
+        } else {
+            println!("{invalid} structural problem(s) — a consumer would panic on these");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The invariants `accesskit_consumer` asserts when it accepts an update.
+///
+/// Violating any of them aborts the consumer process rather than returning an
+/// error, so a provider that can produce one has a crash, not a glitch. Both
+/// checked here were observed live before being fixed.
+#[cfg(target_os = "macos")]
+fn validate_update(update: &accesskit::TreeUpdate) -> Vec<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut problems = Vec::new();
+    let present: HashSet<accesskit::NodeId> = update.nodes.iter().map(|(id, _)| *id).collect();
+
+    // "TreeUpdate includes duplicate child": one node named by two parents, or
+    // twice by one.
+    let mut claimed: HashMap<accesskit::NodeId, Vec<accesskit::NodeId>> = HashMap::new();
+    for (parent, node) in &update.nodes {
+        let mut seen_here = HashSet::new();
+        for child in node.children() {
+            if !seen_here.insert(*child) {
+                problems.push(format!("node {} lists child {} twice", parent.0, child.0));
+            }
+            claimed.entry(*child).or_default().push(*parent);
+        }
+    }
+    for (child, parents) in &claimed {
+        if parents.len() > 1 {
+            let names: Vec<String> = parents.iter().map(|p| p.0.to_string()).collect();
+            problems.push(format!("child {} claimed by parents [{}]", child.0, names.join(", ")));
+        }
+    }
+
+    // "children ids which are neither in the current tree nor the ID of
+    // another node from the update".
+    for (parent, node) in &update.nodes {
+        for child in node.children() {
+            if !present.contains(child) {
+                problems.push(format!(
+                    "node {} names child {}, which is not in the update",
+                    parent.0, child.0
+                ));
+            }
+        }
+    }
+
+    if let Some(tree) = &update.tree {
+        if !present.contains(&tree.root) {
+            problems.push(format!("root {} is not in the update", tree.root.0));
+        }
+    }
+    if !present.contains(&update.focus) {
+        problems.push(format!("focus {} is not in the update", update.focus.0));
+    }
+    problems
 }
 
 /// Prints the update as a tree, in the shape the consumer will hold it.
@@ -139,10 +220,25 @@ fn print_tree(update: &accesskit::TreeUpdate) {
             .or_else(|| node.value())
             .map(|text| format!(" {:?}", truncate(text, 40)))
             .unwrap_or_default();
+        // The actions a node *declares* are what a consumer can offer: the
+        // Windows adapter gates InvokePattern on Action::Click, and a mirror
+        // that executes actions while declaring none is unpressable.
+        let actions: Vec<String> = [
+            accesskit::Action::Click,
+            accesskit::Action::Focus,
+            accesskit::Action::Expand,
+            accesskit::Action::Increment,
+            accesskit::Action::SetValue,
+        ]
+        .iter()
+        .filter(|a| node.supports_action(**a))
+        .map(|a| format!("{a:?}"))
+        .collect();
         println!(
-            "{}{:?}{name}{}{}",
+            "{}{:?}{name}{}{}{}",
             "  ".repeat(depth),
             node.role(),
+            if actions.is_empty() { String::new() } else { format!(" <{}>", actions.join(",")) },
             if node.is_disabled() { " [disabled]" } else { "" },
             if id == update.focus { " <- focus" } else { "" },
         );
