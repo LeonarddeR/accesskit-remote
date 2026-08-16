@@ -16,7 +16,8 @@
 
 use accesskit_remote::WindowId;
 use accesskit_remote_windows::{
-    install_visible_desktop_adapter, post_desktop_delta, post_sync, OutgoingAction, SharedClient,
+    install_visible_desktop_adapter, post_desktop_delta, post_detach, post_sync, OutgoingAction,
+    SharedClient,
 };
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -104,6 +105,28 @@ impl DesktopHost {
         let beat = self.beat_join.lock().unwrap().take();
         if let Some(join) = beat {
             let _ = join.join();
+        }
+        // Take the adapter back off the session window. It is installed on a
+        // window this process does not own, so it outlives the channel that
+        // put it there, and the client reuses that same HWND when it
+        // reconnects. `install_visible_desktop_adapter` refuses a window that
+        // already carries one, so leaving it behind means every later session
+        // fails with `E_UNEXPECTED` until the client exits — measured against
+        // mstsc as 3 successful hosts against 30 failures over 20 connects.
+        //
+        // Before the slot is cleared, because the target is read through it.
+        if let Some(shared) = shared() {
+            if shared.installed.swap(false, Ordering::AcqRel) {
+                let raw = shared.target.load(Ordering::Acquire);
+                if raw != 0 {
+                    let hwnd = HWND(raw as *mut core::ffi::c_void);
+                    if post_detach(hwnd) {
+                        debug!("asked {hwnd:?} to drop the desktop adapter");
+                    } else {
+                        warn!("could not post detach to {hwnd:?}");
+                    }
+                }
+            }
         }
         if let Ok(mut slot) = shared_slot().lock() {
             *slot = None;
@@ -272,5 +295,157 @@ unsafe extern "system" fn win_event_proc(
             warn!("could not host the remote desktop on {hwnd:?}: {e}");
             shared.installed.store(false, Ordering::Release);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accesskit_remote_client::ClientConnection;
+    use accesskit_remote_windows::detach_message;
+    use serial_test::serial;
+    use std::sync::atomic::AtomicU32;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::LRESULT;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, PeekMessageW, RegisterClassW, PM_REMOVE,
+        WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    };
+
+    /// How many detach requests the stand-in session window has seen.
+    static DETACHES: AtomicU32 = AtomicU32::new(0);
+
+    extern "system" fn test_wnd_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == detach_message() {
+            DETACHES.fetch_add(1, Ordering::AcqRel);
+            return LRESULT(0);
+        }
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    /// A real window standing in for the client's session window. Real because
+    /// the detach travels as a posted window message, which needs a queue and a
+    /// window procedure to arrive at.
+    fn session_window() -> HWND {
+        static CLASS: OnceLock<Vec<u16>> = OnceLock::new();
+        let class = CLASS.get_or_init(|| {
+            let name: Vec<u16> = "AccessKitDetachTestWindow\0".encode_utf16().collect();
+            let hinstance = unsafe { GetModuleHandleW(None) }.expect("module handle");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(test_wnd_proc),
+                hInstance: hinstance.into(),
+                lpszClassName: PCWSTR(name.as_ptr()),
+                ..Default::default()
+            };
+            assert_ne!(unsafe { RegisterClassW(&wc) }, 0, "class registration failed");
+            name
+        });
+        let hinstance = unsafe { GetModuleHandleW(None) }.expect("module handle");
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class.as_ptr()),
+                PCWSTR(class.as_ptr()),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+        }
+        .expect("window creation failed")
+    }
+
+    /// Drain the queue, since the detach is posted rather than sent.
+    fn pump() {
+        let mut msg = MSG::default();
+        while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+            unsafe {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    fn host_with(target: HWND, installed: bool) -> (DesktopHost, Arc<HostShared>) {
+        let (actions, _rx) = std::sync::mpsc::channel();
+        let shared = Arc::new(HostShared {
+            client: Arc::new(Mutex::new(ClientConnection::new("test"))),
+            actions,
+            label: "test desktop".to_owned(),
+            target: AtomicIsize::new(target.0 as isize),
+            installed: AtomicBool::new(installed),
+        });
+        *shared_slot().lock().unwrap() = Some(shared.clone());
+        let host = DesktopHost {
+            // No threads: this exercises the teardown, not the hook.
+            hook_thread: 0,
+            hook_join: Mutex::new(None),
+            beat_stop: Arc::new(AtomicBool::new(false)),
+            beat_join: Mutex::new(None),
+        };
+        (host, shared)
+    }
+
+    /// **Regression.** The adapter is installed on a window this process does
+    /// not own, so it outlives the channel that installed it. A client
+    /// reconnecting reuses the same HWND, and the install refuses a window that
+    /// already carries an adapter — so a session that ends without detaching
+    /// poisons every later one. Measured against mstsc before the fix as three
+    /// successful hosts against thirty `E_UNEXPECTED` failures over twenty
+    /// connects.
+    #[test]
+    #[serial]
+    fn stop_takes_the_adapter_off_the_session_window() {
+        let hwnd = session_window();
+        let (host, shared) = host_with(hwnd, true);
+        DETACHES.store(0, Ordering::Release);
+
+        host.stop();
+        pump();
+
+        assert_eq!(
+            DETACHES.load(Ordering::Acquire),
+            1,
+            "stop() must ask the session window to drop the adapter"
+        );
+        assert!(
+            !shared.installed.load(Ordering::Acquire),
+            "the host must no longer believe it is installed"
+        );
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        pump();
+    }
+
+    /// And it must not pester a window it never hosted on: the session window
+    /// belongs to the client, and an unasked-for message to it is not ours to
+    /// send.
+    #[test]
+    #[serial]
+    fn stop_without_a_host_asks_nothing() {
+        let hwnd = session_window();
+        let (host, _shared) = host_with(hwnd, false);
+        DETACHES.store(0, Ordering::Release);
+
+        host.stop();
+        pump();
+
+        assert_eq!(DETACHES.load(Ordering::Acquire), 0);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+        pump();
     }
 }
