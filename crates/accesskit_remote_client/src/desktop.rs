@@ -229,7 +229,12 @@ impl DesktopTree {
                 continue;
             };
             snapshot.tree_id = Self::tree_id(window);
-            self.held.entry(window).or_default().apply(&snapshot);
+            let held = self.held.entry(window).or_default();
+            held.apply(&snapshot);
+            // Same rule as on the delta path: the store guarantees the focus is
+            // *present*, which is not the same as reachable, and the consumer
+            // keeps only what it can reach.
+            Self::land_focus(held, &mut snapshot);
             updates.push(snapshot);
             self.live.insert(window);
         }
@@ -269,14 +274,36 @@ impl DesktopTree {
         }
         update.tree_id = Self::tree_id(window);
         let held = self.held.entry(window).or_default();
-        let arriving = update.nodes.iter().any(|(id, _)| *id == update.focus);
-        if !arriving && !held.holds(update.focus) {
-            if let Some(root) = held.root {
-                update.focus = root;
-            }
-        }
         held.apply(&update);
+        Self::land_focus(held, &mut update);
         Some(update)
+    }
+
+    /// Points a subtree's focus at something the consumer will still hold once
+    /// this update has been applied.
+    ///
+    /// **Checked after applying, never before, and that ordering is the whole
+    /// of it.** A subtree's focus persists in the consumer until another update
+    /// for *that* subtree changes it, and the consumer re-validates the
+    /// effective focus continuously — so it is not enough for the focus to be
+    /// valid when it is set. The lethal case is quiet: a delta that changes
+    /// some node's children, orphaning the node focus already rests on, while
+    /// carrying that same focus forward unchanged. Checked first, the node is
+    /// still there and the focus passes; the same update then prunes it, and
+    /// the consumer aborts seconds later with nothing in between to blame.
+    ///
+    /// Observed twice that way — `Focused ID #15 is not in the node list` after
+    /// 22 s of ordinary reading, `#14` after 46 s, with no window change and no
+    /// focus change in either. Applying first collapses both cases, and the
+    /// arriving-node case too: a node can arrive in an update and still be
+    /// unreachable, and the consumer prunes it just the same.
+    fn land_focus(held: &Held, update: &mut TreeUpdate) {
+        if held.holds(update.focus) {
+            return;
+        }
+        if let Some(root) = held.root {
+            update.focus = root;
+        }
     }
 
     /// The root tree: the desktop node and one graft per window.
@@ -543,6 +570,65 @@ mod tests {
 
         // And the consumer agrees, which is the check that actually matters.
         stream.push(pruned);
+        stream.push(corrected);
+        feed(stream);
+    }
+
+    /// **The quiet one.** A delta need not touch focus to invalidate it: it can
+    /// change some node's children, orphaning the node focus already rests on,
+    /// and carry that same focus forward unchanged. Nothing about the update
+    /// looks like a focus event, and no window opened or closed — but the
+    /// consumer prunes the orphan and its effective focus now names a node it
+    /// does not hold, so the next validation aborts the reader.
+    ///
+    /// Twice live: `#15` after 22 s of ordinary reading, `#14` after 46 s, both
+    /// with no window change and no focus change logged. This is why the focus
+    /// is checked *after* the update is applied, not before — checked before,
+    /// the node is still there and the delta sails through.
+    #[test]
+    fn a_delta_that_orphans_the_focus_it_carries_forward_is_corrected() {
+        let mut harness = Harness::new();
+        harness.add_window(1, "a window");
+        let mut desktop = DesktopTree::new("a mac");
+        let mut stream = desktop.sync(&mut harness.client);
+
+        // Focus settles on the button, legitimately: it is there and reachable.
+        let focused = desktop
+            .delta(
+                WindowId(1),
+                TreeUpdate {
+                    nodes: Vec::new(),
+                    tree: None,
+                    tree_id: TreeId::ROOT,
+                    focus: NodeId(2),
+                },
+            )
+            .expect("grafted");
+        assert_eq!(focused.focus, NodeId(2), "a reachable focus is left alone");
+
+        // The window drops that child while still reporting it as focused —
+        // one update, no focus change, no structural event above it.
+        let mut orphaning = Node::new(Role::Window);
+        orphaning.set_label("a window");
+        orphaning.set_children(Vec::<NodeId>::new());
+        let corrected = desktop
+            .delta(
+                WindowId(1),
+                TreeUpdate {
+                    nodes: vec![(NodeId(1), orphaning)],
+                    tree: None,
+                    tree_id: TreeId::ROOT,
+                    focus: NodeId(2),
+                },
+            )
+            .expect("grafted");
+        assert_eq!(
+            corrected.focus,
+            NodeId(1),
+            "the update that orphans the focused node must move the focus off it",
+        );
+
+        stream.push(focused);
         stream.push(corrected);
         feed(stream);
     }
