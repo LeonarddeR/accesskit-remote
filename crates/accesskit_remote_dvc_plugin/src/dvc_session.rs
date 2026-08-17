@@ -97,11 +97,15 @@ impl DvcSession {
             // write from inside OnNewChannelConnection lands on a channel the
             // server has not finished creating, and takes the session with it.
             let opened_at = Instant::now();
+            let mut greeted = false;
             while !pump_session.shutdown.load(Ordering::Acquire) {
-                // Past the settle, an unprompted flush is safe and is how the
-                // handshake finally goes out; before it, only an action forces
-                // one, and an action cannot arrive before the channel is live.
-                let mut should_flush = opened_at.elapsed() >= OPEN_SETTLE;
+                // The greeting, once the channel has had time to open — and
+                // once only. Flushing unprompted on every turn would take the
+                // connection's lock fifty times a second for the life of the
+                // session, contending with the RDP client's own thread, which
+                // is the one that must never be held up.
+                let mut should_flush = !greeted && opened_at.elapsed() >= OPEN_SETTLE;
+                greeted |= should_flush;
                 while let Ok((window, request)) = actions.try_recv() {
                     info!(
                         action = ?request.action,
