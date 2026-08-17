@@ -38,7 +38,7 @@
 use crate::ClientConnection;
 use accesskit::{Node, NodeId, Role, Tree, TreeId, TreeUpdate, Uuid};
 use accesskit_remote::WindowId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The desktop root: the node every remote window hangs under.
 const ROOT: NodeId = NodeId(0);
@@ -61,6 +61,52 @@ pub struct DesktopTree {
     focus: Option<WindowId>,
     /// Whether the root tree has been published at least once.
     started: bool,
+    /// What each window's subtree actually holds, mirrored the way a consumer
+    /// holds it: only what its root can reach.
+    held: HashMap<WindowId, Held>,
+}
+
+/// One subtree as the consumer has it, so this side can tell what the consumer
+/// still holds from what it was merely once sent.
+///
+/// **They are not the same set, and the difference aborts a screen reader.** A
+/// consumer keeps only what the root reaches and discards the rest, so a node
+/// orphaned by an earlier delta is gone from the consumer while the client
+/// store — which never prunes — still has it. Naming such a node is a panic
+/// inside the consumer, in a function that cannot unwind.
+#[derive(Debug, Default)]
+struct Held {
+    children: HashMap<NodeId, Vec<NodeId>>,
+    root: Option<NodeId>,
+}
+
+impl Held {
+    /// Applies an update and prunes to what the root reaches, exactly as a
+    /// consumer would.
+    fn apply(&mut self, update: &TreeUpdate) {
+        for (id, node) in &update.nodes {
+            self.children.insert(*id, node.children().to_vec());
+        }
+        if let Some(tree) = update.tree.as_ref() {
+            self.root = Some(tree.root);
+        }
+        let Some(root) = self.root else { return };
+        let mut reachable = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            if let Some(children) = self.children.get(&id) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        self.children.retain(|id, _| reachable.contains(id));
+    }
+
+    fn holds(&self, id: NodeId) -> bool {
+        self.children.contains_key(&id)
+    }
 }
 
 impl DesktopTree {
@@ -73,6 +119,7 @@ impl DesktopTree {
             live: HashSet::new(),
             focus: None,
             started: false,
+            held: HashMap::new(),
         }
     }
 
@@ -125,6 +172,10 @@ impl DesktopTree {
         self.live.clear();
         self.focus = None;
         self.started = false;
+        // The adapter is starting an empty tree, so it holds nothing — and a
+        // stale idea of what it holds is what lets a focus land on a node that
+        // is no longer there.
+        self.held.clear();
     }
 
     /// Brings the composed tree in line with the client's state.
@@ -178,6 +229,7 @@ impl DesktopTree {
                 continue;
             };
             snapshot.tree_id = Self::tree_id(window);
+            self.held.entry(window).or_default().apply(&snapshot);
             updates.push(snapshot);
             self.live.insert(window);
         }
@@ -196,11 +248,34 @@ impl DesktopTree {
     /// Returns `None` when that window has no subtree yet — pushing a delta
     /// then would panic (rule 2), and the snapshot [`sync`](Self::sync) takes
     /// afterwards carries the same content anyway.
-    pub fn delta(&self, window: WindowId, mut update: TreeUpdate) -> Option<TreeUpdate> {
+    /// # Focus is checked against what the consumer holds, not what was sent
+    ///
+    /// A delta names a focused node, and the consumer validates it: if that
+    /// node is neither in the delta nor still in its tree, it panics — inside a
+    /// function that cannot unwind, so the screen reader's process aborts.
+    /// Observed exactly that way, as `Focused ID #14 is not in the node list`,
+    /// the moment a reader started delivering focus events.
+    ///
+    /// The client store cannot answer this, and 3c082f1's guard is not enough
+    /// here: the store never prunes, so it happily reports a node the consumer
+    /// threw away as unreachable. Only a mirror of the consumer's own pruning
+    /// can tell, which is what [`Held`] is for. When the focus is not provably
+    /// held, it falls back to the subtree root — a node that is held by
+    /// definition, and a reader landing on the window itself rather than
+    /// nothing.
+    pub fn delta(&mut self, window: WindowId, mut update: TreeUpdate) -> Option<TreeUpdate> {
         if !self.live.contains(&window) {
             return None;
         }
         update.tree_id = Self::tree_id(window);
+        let held = self.held.entry(window).or_default();
+        let arriving = update.nodes.iter().any(|(id, _)| *id == update.focus);
+        if !arriving && !held.holds(update.focus) {
+            if let Some(root) = held.root {
+                update.focus = root;
+            }
+        }
+        held.apply(&update);
         Some(update)
     }
 
@@ -391,7 +466,7 @@ mod tests {
     /// withheld — the snapshot that follows carries the same content.
     #[test]
     fn a_delta_for_an_ungrafted_window_is_withheld() {
-        let desktop = DesktopTree::new("a mac");
+        let mut desktop = DesktopTree::new("a mac");
         assert!(
             desktop.delta(WindowId(1), tree_of("early")).is_none(),
             "a subtree's first update must be a snapshot, not a delta",
@@ -412,6 +487,64 @@ mod tests {
         assert_eq!(retagged.tree_id, DesktopTree::tree_id(WindowId(1)));
         assert_eq!(retagged.nodes, original.nodes, "nothing else is touched");
         assert_eq!(retagged.focus, original.focus);
+    }
+
+    /// **The abort.** A node the consumer has *pruned* is not the same as a
+    /// node it never had, and the client store cannot tell them apart: it never
+    /// prunes, so it reports an orphan as present and the focus guard on that
+    /// path waves it through. The consumer then panics — in a function that
+    /// cannot unwind, so the reader's process dies rather than misbehaves.
+    ///
+    /// Seen live as `Focused ID #14 is not in the node list`, the moment a
+    /// reader began delivering focus events into a composed desktop.
+    #[test]
+    fn a_focus_on_a_node_the_consumer_has_pruned_is_corrected() {
+        let mut harness = Harness::new();
+        harness.add_window(1, "a window");
+        let mut desktop = DesktopTree::new("a mac");
+        // Collected rather than fed piecemeal: the consumer must see the whole
+        // stream from its root tree onwards, as a real host applies it.
+        let mut stream = desktop.sync(&mut harness.client);
+
+        // The window drops its only child, so #2 is unreachable and every
+        // consumer throws it away — while the client store still holds it.
+        let mut orphaning = Node::new(Role::Window);
+        orphaning.set_label("a window");
+        orphaning.set_children(Vec::<NodeId>::new());
+        let pruned = desktop
+            .delta(
+                WindowId(1),
+                TreeUpdate {
+                    nodes: vec![(NodeId(1), orphaning)],
+                    tree: None,
+                    tree_id: TreeId::ROOT,
+                    focus: NodeId(1),
+                },
+            )
+            .expect("grafted");
+
+        // Now focus lands on the orphan.
+        let corrected = desktop
+            .delta(
+                WindowId(1),
+                TreeUpdate {
+                    nodes: Vec::new(),
+                    tree: None,
+                    tree_id: TreeId::ROOT,
+                    focus: NodeId(2),
+                },
+            )
+            .expect("grafted");
+        assert_eq!(
+            corrected.focus,
+            NodeId(1),
+            "focus must fall back to the subtree root, which the consumer certainly holds",
+        );
+
+        // And the consumer agrees, which is the check that actually matters.
+        stream.push(pruned);
+        stream.push(corrected);
+        feed(stream);
     }
 
     /// A window closing takes its subtree with it, and the survivors keep their
