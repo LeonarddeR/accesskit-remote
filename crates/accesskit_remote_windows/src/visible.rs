@@ -170,12 +170,16 @@ extern "system" fn wnd_proc(window: HWND, message: u32, wparam: WPARAM, lparam: 
         // In desktop mode the delta belongs to one of many remote windows, named
         // by wParam, and must be retagged into that window's subtree — or
         // withheld, if that window has not been grafted yet.
-        let update = match &r#impl.desktop {
-            Some(shared) => shared.retag(WindowId(wparam.0 as u64), update),
-            None => Some(update),
-        };
-        if let Some(update) = update {
-            r#impl.apply(update);
+        match &r#impl.desktop {
+            // Not just retagged: any subtree snapshot the composition still
+            // owes the adapter has to go first, or this delta names nodes the
+            // consumer was never given. See `DesktopShared::delta_updates`.
+            Some(shared) => {
+                for update in shared.delta_updates(WindowId(wparam.0 as u64), update) {
+                    r#impl.apply(update);
+                }
+            }
+            None => r#impl.apply(update),
         }
         return LRESULT(0);
     }

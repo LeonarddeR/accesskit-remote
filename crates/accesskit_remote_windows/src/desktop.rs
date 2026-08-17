@@ -96,6 +96,31 @@ impl DesktopShared {
     pub(crate) fn retag(&self, window: WindowId, update: TreeUpdate) -> Option<TreeUpdate> {
         self.desktop.lock().unwrap().delta(window, update)
     }
+
+    /// Everything to apply for one arriving delta, in order.
+    ///
+    /// **A delta may not overtake the snapshot it belongs to.** Activation
+    /// resets the composition and syncs it, but hands the adapter only the root
+    /// update — every window's subtree goes into `pending` for the next sync.
+    /// In that gap the composition already believes each window is grafted, so
+    /// `retag` happily tags a delta for a subtree the consumer has not been
+    /// given a single node of. Applying it names children that do not exist,
+    /// which is a panic inside the consumer, inside `wnd_proc`, which cannot
+    /// unwind: the screen reader's process aborts.
+    ///
+    /// Measured, against a real client: a session that composed perfectly for
+    /// seconds died the moment a UIA client first attached, with hundreds of
+    /// dangling children carrying ordinary per-window ids. A viewer never saw
+    /// it because it activates before any delta is in flight.
+    ///
+    /// So the owed snapshots go first, and the delta is retagged only
+    /// afterwards — by which time the sync may have grafted its window anyway.
+    pub(crate) fn delta_updates(&self, window: WindowId, update: TreeUpdate) -> Vec<TreeUpdate> {
+        let owed = !self.pending.lock().unwrap().is_empty();
+        let mut updates = if owed { self.sync_updates() } else { Vec::new() };
+        updates.extend(self.retag(window, update));
+        updates
+    }
 }
 
 /// One local window carrying every remote window, subclassed before it is
@@ -196,5 +221,110 @@ impl accesskit::ActionHandler for RouteActions {
         if let Some(window) = window {
             let _ = self.actions.send((window, request));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accesskit::{ActivationHandler, Node, NodeId, Role, Tree, TreeId};
+    use accesskit_remote::{AppInfo, Message, PeerRole, Session, SessionConfig};
+
+    fn app() -> AppInfo {
+        AppInfo {
+            name: "test".into(),
+            app_id: None,
+            pid: None,
+            toolkit: None,
+            toolkit_version: None,
+        }
+    }
+
+    fn tree_of(label: &str) -> TreeUpdate {
+        let root = NodeId(1);
+        let mut window = Node::new(Role::Window);
+        window.set_label(label);
+        window.set_children(vec![NodeId(2)]);
+        let mut button = Node::new(Role::Button);
+        button.set_label("press me");
+        TreeUpdate {
+            nodes: vec![(root, window), (NodeId(2), button)],
+            tree: Some(Tree::new(root)),
+            tree_id: TreeId::ROOT,
+            focus: root,
+        }
+    }
+
+    /// An established client holding one remote window with a tree.
+    fn established() -> (SharedClient, Session) {
+        let mut client = accesskit_remote_client::ClientConnection::new("test-client");
+        let mut provider = Session::new(SessionConfig::new(PeerRole::Provider, "test-provider"));
+        provider.handle_input(&client.take_output()).unwrap();
+        client.handle_input(&provider.take_output()).unwrap();
+        provider
+            .send(&Message::WindowAdded {
+                window: WindowId(1),
+                title: "a window".into(),
+                app: app(),
+                native_window_id: None,
+            })
+            .unwrap();
+        provider
+            .send(&Message::TreeUpdate {
+                window: WindowId(1),
+                update: tree_of("a window"),
+            })
+            .unwrap();
+        let out = provider.take_output();
+        client.handle_input(&out).unwrap();
+        (Arc::new(Mutex::new(client)), provider)
+    }
+
+    /// **The abort.** Activation returns the root tree and queues every
+    /// window's subtree for the next sync — but marks those windows grafted
+    /// immediately. A delta arriving in that gap is retagged into a subtree the
+    /// consumer has not been given a single node of, and naming children that
+    /// do not exist panics inside the consumer, inside `wnd_proc`, which cannot
+    /// unwind: the process aborts rather than fails.
+    ///
+    /// Observed against a real client as hundreds of dangling children with
+    /// ordinary per-window ids, seconds after a UIA client first attached.
+    #[test]
+    fn a_delta_never_overtakes_the_snapshot_it_belongs_to() {
+        let (client, _provider) = established();
+        let (actions, _rx) = std::sync::mpsc::channel();
+        let mut parts = desktop_parts("desk", client, actions);
+
+        // A reader attaches: the adapter takes the root tree, and the window's
+        // own subtree is only queued.
+        let root = parts.activation.request_initial_tree().unwrap();
+        assert_eq!(root.tree_id, TreeId::ROOT, "activation hands back the desktop root");
+        assert!(
+            !parts.shared.pending.lock().unwrap().is_empty(),
+            "the window's subtree is owed, not yet given",
+        );
+
+        // The composition nonetheless considers the window grafted, which is
+        // exactly the trap: retagging alone would emit this delta on its own.
+        assert!(
+            parts.shared.retag(WindowId(1), tree_of("a window")).is_some(),
+            "retag alone would hand the adapter a delta for an empty subtree",
+        );
+
+        let updates = parts.shared.delta_updates(WindowId(1), tree_of("a window"));
+        let delta_tree = accesskit_remote_client::DesktopTree::tree_id(WindowId(1));
+        let first_for_window = updates
+            .iter()
+            .position(|update| update.tree_id == delta_tree)
+            .expect("the window's subtree is among the updates");
+        assert!(
+            updates[first_for_window].tree.is_some(),
+            "the first thing the adapter sees for this subtree must be a snapshot, \
+             not a delta — a snapshot is what carries tree data",
+        );
+        assert!(
+            parts.shared.pending.lock().unwrap().is_empty(),
+            "and nothing stays owed once a delta has forced the flush",
+        );
     }
 }
