@@ -212,6 +212,10 @@ impl DesktopTree {
         let structure_changed = order != self.grafted;
         if structure_changed || !self.started {
             self.live.retain(|window| current.contains(window));
+            // A closed window's subtree is gone from the consumer too, and its
+            // mirror is otherwise kept for the life of the session — a window's
+            // worth of nodes each time one closes.
+            self.held.retain(|window, _| current.contains(window));
             self.grafted = order;
             updates.push(self.root_update(None));
             self.started = true;
