@@ -49,11 +49,22 @@ fn new_channel_connection_returns_callback() {
     let _callback = trigger_new_channel(&listener_cb, &channel);
 }
 
-/// **The consumer speaks first.** Opening the channel must put the protocol's
-/// opening `Hello` on the wire without being asked: the provider is waiting for
-/// it, and a plug-in that waited too would deadlock the handshake.
+/// **The greeting must not go out from inside the accept callback, and must
+/// still go out.**
+///
+/// The RDP client calls `OnNewChannelConnection` while processing the server's
+/// Create Request and only sends the Create Response after it returns, so a
+/// write issued from inside it reaches a channel the server still has in
+/// `Creation` — which MS-RDPEDYC has no state for. The server rejects the data
+/// PDU and the whole RDP session goes down with it, which is exactly what
+/// happened against a real mstsc: every session died within milliseconds,
+/// presenting as the server closing the socket.
+///
+/// So: nothing on accept, and the handshake shortly afterwards regardless —
+/// the provider is waiting for it, and a plug-in that waited forever would
+/// deadlock instead.
 #[test]
-fn opening_the_channel_greets_the_provider() {
+fn the_greeting_waits_for_the_channel_but_still_arrives() {
     let dll = DllHandle::load();
     let plugin = create_plugin(dll);
     let (mgr, state): (IWTSVirtualChannelManager, _) = FakeChannelMgr::new();
@@ -63,10 +74,20 @@ fn opening_the_channel_greets_the_provider() {
     let (channel, chan_state) = FakeVirtualChannel::new();
     let callback = trigger_new_channel(&listener_cb, &channel);
 
+    assert!(
+        chan_state.flat_writes().is_empty(),
+        "nothing may be written from inside the accept callback — the channel is not open yet",
+    );
+
+    // It still has to arrive, or the provider waits forever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while chan_state.flat_writes().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     let greeting = chan_state.flat_writes();
     assert!(
         !greeting.is_empty(),
-        "the plug-in must open the conversation, not wait to be spoken to",
+        "the handshake must follow once the channel has had time to open",
     );
     // Length-prefixed JSON, and the handshake codec is readable, so this is
     // checkable without decoding the protocol. `Message` is tagged `t`, so a

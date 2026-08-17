@@ -23,6 +23,22 @@
 //! when the object is already agile, correct marshalling when it is not. Doing
 //! it directly appears to work until it is tried under an apartment that cares,
 //! and then fails as `RPC_E_WRONG_THREAD` in the field.
+//!
+//! # Nothing is written until the channel is really open
+//!
+//! `OnNewChannelConnection` is not that moment. The RDP client calls it while
+//! it is processing the server's **Create Request**, and only sends the
+//! **Create Response** once the callback has returned and accepted. A write
+//! issued from inside it therefore reaches the server on a channel the server
+//! still has in `Creation`, and MS-RDPEDYC has no state for that: the server
+//! rejects the data PDU, the error comes out of its channel processor, and the
+//! whole RDP connection goes down with it.
+//!
+//! That is not hypothetical — it killed every session within milliseconds of
+//! the channel opening, presenting as the *server* closing the socket
+//! (`Reason= 2308`) with nothing wrong in either log. So the greeting waits for
+//! proof the channel is live: the first bytes from the provider, or failing
+//! that a short delay, by which time the callback has long returned.
 
 use accesskit_remote_client::{ClientConnection, ClientEvent};
 use accesskit_remote_windows::{OutgoingAction, SharedClient};
@@ -30,7 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use windows::Win32::System::RemoteDesktop::IWTSVirtualChannel;
 use windows_core::AgileReference;
@@ -41,6 +57,14 @@ use windows_core::AgileReference;
 /// reader and the remote application being told, so it is short; the loop does
 /// nothing but a `try_recv` when idle.
 const ACTION_POLL: Duration = Duration::from_millis(20);
+
+/// How long to wait before writing anything the provider did not ask for.
+///
+/// Only a floor on the *unprompted* handshake; anything answering inbound bytes
+/// goes out at once, because bytes arriving are themselves proof the channel is
+/// open. Generous, since it costs a fraction of a second once per session and
+/// the alternative is losing the session outright.
+const OPEN_SETTLE: Duration = Duration::from_millis(250);
 
 /// One open `AccessKit` channel.
 pub struct DvcSession {
@@ -67,14 +91,17 @@ impl DvcSession {
             pump: Mutex::new(None),
         });
 
-        // The consumer speaks first: its Hello is queued the moment the
-        // connection is constructed, and the provider is waiting for it.
-        session.flush();
-
         let pump_session = session.clone();
         let join = std::thread::spawn(move || {
+            // The earliest the handshake may go out. See the module docs: a
+            // write from inside OnNewChannelConnection lands on a channel the
+            // server has not finished creating, and takes the session with it.
+            let opened_at = Instant::now();
             while !pump_session.shutdown.load(Ordering::Acquire) {
-                let mut sent = false;
+                // Past the settle, an unprompted flush is safe and is how the
+                // handshake finally goes out; before it, only an action forces
+                // one, and an action cannot arrive before the channel is live.
+                let mut should_flush = opened_at.elapsed() >= OPEN_SETTLE;
                 while let Ok((window, request)) = actions.try_recv() {
                     info!(
                         action = ?request.action,
@@ -88,11 +115,11 @@ impl DvcSession {
                         .unwrap()
                         .request_action(window, request)
                     {
-                        Ok(()) => sent = true,
+                        Ok(()) => should_flush = true,
                         Err(e) => warn!("action rejected: {e}"),
                     }
                 }
-                if sent {
+                if should_flush {
                     pump_session.flush();
                 }
                 std::thread::sleep(ACTION_POLL);
