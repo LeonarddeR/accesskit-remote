@@ -73,6 +73,8 @@ pub struct SourceHost<S> {
     heard_from: Option<Instant>,
     pinged: Option<Instant>,
     seq: u64,
+    /// Whether the session ended because [`heartbeat`](Self::heartbeat) gave up.
+    gave_up: bool,
 }
 
 impl<S: TreeSource> SourceHost<S> {
@@ -85,6 +87,7 @@ impl<S: TreeSource> SourceHost<S> {
             heard_from: None,
             pinged: None,
             seq: 0,
+            gave_up: false,
         }
     }
 
@@ -164,6 +167,7 @@ impl<S: TreeSource> SourceHost<S> {
         let heard_from = *self.heard_from.get_or_insert(now);
         if now.duration_since(heard_from) >= PEER_TIMEOUT {
             self.server.close("peer stopped answering");
+            self.gave_up = true;
             return Ok(self.server.take_output());
         }
         let due = self
@@ -197,6 +201,19 @@ impl<S: TreeSource> SourceHost<S> {
     /// simply vanishing.
     pub fn peer_goodbye(&self) -> Option<&str> {
         self.peer_goodbye.as_deref()
+    }
+
+    /// Whether this session ended because the peer stopped answering.
+    ///
+    /// A caller's loop sees only [`is_closed`](Self::is_closed), and every way
+    /// a session can end looks identical there. It is not identical to
+    /// diagnose: a peer that said goodbye is a normal shutdown, while a peer
+    /// that went silent is a hung or crashed consumer, and the difference is
+    /// the first thing worth knowing. Cost of not distinguishing them, measured
+    /// once: a tree source that vanished mid-session with nothing in any log to
+    /// say why.
+    pub fn gave_up_on_peer(&self) -> bool {
+        self.gave_up
     }
 
     pub fn source_mut(&mut self) -> &mut S {
@@ -394,6 +411,11 @@ mod tests {
         let farewell = host.heartbeat(start + PEER_TIMEOUT).unwrap();
         assert!(host.is_closed(), "silence for the whole timeout ends the session");
         assert!(!farewell.is_empty(), "and the peer is told why, in case it is listening");
+        assert!(
+            host.gave_up_on_peer(),
+            "and the host says so, or its caller has no way to tell this from a normal goodbye",
+        );
+        assert!(host.peer_goodbye().is_none(), "the peer said nothing — that is the point");
     }
 
     /// A peer that answers keeps its session, however little it has to say —
@@ -414,6 +436,7 @@ mod tests {
 
         let _ = host.heartbeat(start + PEER_TIMEOUT).unwrap();
         assert!(!host.is_closed(), "it answered, so the clock started again");
+        assert!(!host.gave_up_on_peer());
     }
 
     #[test]

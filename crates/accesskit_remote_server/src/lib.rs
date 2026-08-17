@@ -16,7 +16,7 @@
 
 mod host;
 
-pub use host::{HostError, SourceHost};
+pub use host::{HostError, SourceHost, PEER_TIMEOUT, PING_INTERVAL};
 
 use accesskit_remote::{
     AppInfo, Message, PeerRole, Session, SessionConfig, SessionError, SessionEvent, WindowId,
