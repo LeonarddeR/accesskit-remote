@@ -25,7 +25,7 @@ because the VM is on the same machine.)
 
 ## Before starting
 
-Two things fail silently and look like bugs:
+Three things fail silently and look like bugs:
 
 - **The Mac must be unlocked and the Accessibility grant live.** A locked screen
   makes every application report zero windows, which is indistinguishable from
@@ -35,12 +35,22 @@ Two things fail silently and look like bugs:
   binary; a fresh `cargo build` in a different location is a different binary as
   far as TCC is concerned. Build through the usual helper script and replace the
   binary in place.
+- **Start it through LaunchServices, not from a shell.** Run from a terminal,
+  the same granted binary is refused Screen Recording — TCC attributes the
+  request to the responsible parent process, which is the terminal or the SSH
+  session, not the app. It presents identically to a stale grant, so it is easy
+  to spend an afternoon re-toggling switches that were never the problem.
 
 ## 1. On the Mac
 
 ```
-macrdp --enable-accesskit [your usual flags]
+open -a /Applications/macrdp.app --args --enable-accesskit --log-dir <dir> \
+  [your usual flags]
 ```
+
+`--log-dir` because a LaunchServices-started process has no terminal to write
+to. Started by hand from a shell, `macrdp --enable-accesskit` is the same
+command minus both.
 
 Off by default, deliberately: the tree exposes the text and structure of every
 window on the desktop, which is strictly more than the screen shows. Nothing
