@@ -79,7 +79,27 @@ fn init_tracing() {
             .with_max_level(log_level)
             .try_init();
         panic::set_hook(Box::new(|info| {
-            error!("{info:?}");
+            // The payload, not just the location. A `PanicHookInfo` formats its
+            // payload as `Any { .. }`, and inside a client process there is no
+            // stderr to fall back on — so the message is lost exactly when it
+            // matters. The consumer's tree assertions carry the offending node
+            // id in that message and nowhere else, which is the whole of what a
+            // provider needs to find the bug.
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+            match info.location() {
+                Some(at) => error!(
+                    "panic at {}:{}:{}: {payload}",
+                    at.file(),
+                    at.line(),
+                    at.column()
+                ),
+                None => error!("panic: {payload}"),
+            }
         }));
     });
 }
